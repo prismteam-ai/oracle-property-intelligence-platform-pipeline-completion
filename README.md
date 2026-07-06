@@ -10,7 +10,7 @@ Complete the Oracle pipeline by loading all available county property, permit, o
 
 ## Acceptance Criteria
 - Run the Oracle pipeline until all available county data is uploaded.
-- Confirm the pipeline covers the county that includes Palo Alto.
+- Confirm the pipeline covers the county that includes Palo Alto, CA.
 - Load available property records into the database.
 - Load available permit records into the database.
 - Load available ownership records into the database.
