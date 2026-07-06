@@ -40,7 +40,6 @@ Complete the Oracle pipeline by loading all available county property, permit, o
 - Demonstrate that Oracle can operate without carrying the infrastructure cost.
 - Confirm the candidate fulfilled both Oracle and builder responsibilities for this milestone.
 - Pass the demo using real uploaded county records.
-- Exclude NEO rewiring and unrelated UI expansion from this milestone.
 
 ## Demo Transcript
 - Presenter: “I will demonstrate that the Oracle pipeline has loaded the full available dataset for the county that includes Palo Alto, that the data is queryable through DuckDB, that eligible artifacts are stored through IPFS, and that both the UI and agent can answer property intelligence questions.”
