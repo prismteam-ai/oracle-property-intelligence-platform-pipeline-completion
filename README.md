@@ -67,11 +67,11 @@ Complete the Oracle pipeline by loading all available county property, permit, o
   - Expected Result: The system uses property coordinates and nearby place data to return properties near Starbucks locations and shows the distance calculation basis.
 - Presenter: “Now I am asking the same type of questions through the agent.”
   - Agent Prompt: “Which properties have roofs older than 15 years and have not exchanged ownership in more than 10 years?”
-  - Expected Result: The agent returns matching properties, explains the reasoning, and includes source-backed evidence.
+    - Expected Result: The agent returns matching properties, explains the reasoning, and includes source-backed evidence.
   - Agent Prompt: “Which properties are near public transportation and also have regional owners?”
-  - Expected Result: The agent returns matching properties with coordinate-based distance logic and ownership evidence.
+    - Expected Result: The agent returns matching properties with coordinate-based distance logic and ownership evidence.
   - Agent Prompt: “Which properties appear to be strong candidates for further review based on ownership age, roof age, and location signals?”
-  - Expected Result: The agent returns a ranked or filtered list using available data and clearly identifies any assumptions or missing data.
+    - Expected Result: The agent returns a ranked or filtered list using available data and clearly identifies any assumptions or missing data.
 - Presenter: “Finally, I will show that the system is MCP-ready.”
   - Expected Result: The system demonstrates an MCP-ready interface or documented MCP-compatible query structure that agents can use without changing the data model.
 
