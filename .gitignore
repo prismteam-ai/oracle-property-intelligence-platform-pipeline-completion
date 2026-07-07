@@ -1,0 +1,26 @@
+# env (never commit keys)
+.env
+.env.local
+.env.*.local
+
+# local data — reality lives here, not in git
+*.duckdb
+*.duckdb.wal
+data/raw/
+pipeline-checks/
+
+# local-only claude config
+.claude/settings.local.json
+
+# machine-local spawn doc, not part of the submission
+SPAWN.md
+
+# logs / editor / OS
+logs
+*.log
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+__pycache__/
+.venv/
