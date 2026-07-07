@@ -62,10 +62,17 @@ apply these, do not rediscover them):
 - roof_covering_material and county_name are 100% NULL in the current
   extract. Roof-age questions must use the labeled proxy (built_year age +
   has_permits flag) and say so.
-- Some parcels appear in multiple rows. For per-property lists, dedupe:
-  SELECT DISTINCT ON-style via QUALIFY row_number() OVER
-  (PARTITION BY parcel_identifier ORDER BY property_id) = 1, and mention
-  when duplicates were collapsed.
+- Some parcels appear in multiple rows (~30k dup rows). For per-property
+  lists, dedupe via QUALIFY row_number() OVER (PARTITION BY
+  parcel_identifier ORDER BY property_id) = 1, and mention when duplicates
+  were collapsed.
+- CANONICAL METHOD for "no ownership change in more than 10 years": a
+  parcel qualifies when its MOST RECENT parseable sale is older than 10
+  years — GROUP BY parcel_identifier (excluding NULL parcels),
+  HAVING MAX(parsed_sale_date) IS NOT NULL AND
+  MAX(parsed_sale_date) < current_date - INTERVAL 10 YEAR.
+  Current verified answer on this extract: 139,104 parcels. Always state
+  the method (latest-sale-per-parcel) alongside the number.
 - If a query tool returns an HTTP 429 (gateway rate limit), wait briefly and
   retry once; if it persists, say the gateway rate-limited the query rather
   than reporting empty results as facts.

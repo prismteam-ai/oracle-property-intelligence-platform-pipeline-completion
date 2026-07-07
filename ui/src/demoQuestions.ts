@@ -137,20 +137,29 @@ LIMIT 25`,
       'tenure cannot be verified for them. Dates are stored as JS-style strings ' +
       'and parsed in SQL. Counted by distinct parcel (duplicate rows collapsed).',
     summaryLabel:
-      'properties (distinct parcels) with no ownership change in over 10 years',
-    summarySql: `SELECT COUNT(DISTINCT parcel_identifier)
-FROM ${TABLE}
-WHERE try_strptime(substr(last_sale_date, 1, 15), '%a %b %d %Y')
-      < current_date - INTERVAL 10 YEAR`,
-    rowsSql: `SELECT parcel_identifier, address_street, address_city,
-       strftime(try_strptime(substr(last_sale_date, 1, 15), '%a %b %d %Y'),
-                '%Y-%m-%d') AS last_sale,
-       owner_name, source_system
-FROM ${TABLE}
-WHERE try_strptime(substr(last_sale_date, 1, 15), '%a %b %d %Y')
-      < current_date - INTERVAL 10 YEAR
-QUALIFY row_number() OVER (PARTITION BY parcel_identifier ORDER BY property_id) = 1
-ORDER BY last_sale
+      'parcels whose most recent recorded sale is over 10 years ago',
+    summarySql: `SELECT COUNT(*) FROM (
+  SELECT parcel_identifier,
+         MAX(try_strptime(substr(last_sale_date, 1, 15), '%a %b %d %Y')) AS latest_sale
+  FROM ${TABLE}
+  WHERE parcel_identifier IS NOT NULL
+  GROUP BY parcel_identifier
+  HAVING latest_sale IS NOT NULL
+     AND latest_sale < current_date - INTERVAL 10 YEAR
+)`,
+    rowsSql: `SELECT t.parcel_identifier, any_value(t.address_street) AS address_street,
+       any_value(t.address_city) AS address_city,
+       strftime(MAX(try_strptime(substr(t.last_sale_date, 1, 15), '%a %b %d %Y')),
+                '%Y-%m-%d') AS latest_sale,
+       any_value(t.owner_name) AS owner_name,
+       any_value(t.source_system) AS source_system
+FROM ${TABLE} t
+WHERE t.parcel_identifier IS NOT NULL
+GROUP BY t.parcel_identifier
+HAVING MAX(try_strptime(substr(t.last_sale_date, 1, 15), '%a %b %d %Y')) IS NOT NULL
+   AND MAX(try_strptime(substr(t.last_sale_date, 1, 15), '%a %b %d %Y'))
+       < current_date - INTERVAL 10 YEAR
+ORDER BY latest_sale
 LIMIT 25`,
   },
   {
