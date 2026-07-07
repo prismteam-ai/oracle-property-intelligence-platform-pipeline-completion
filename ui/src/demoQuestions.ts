@@ -52,12 +52,13 @@ near AS (
 )`;
   return {
     summary: `${near}
-SELECT COUNT(DISTINCT property_id) FROM near WHERE distance_m <= ${radiusMeters}`,
+SELECT COUNT(DISTINCT parcel_identifier) FROM near WHERE distance_m <= ${radiusMeters}`,
     rows: `${near}
 SELECT parcel_identifier, address_street, address_city, property_type,
        poi_name AS nearest_sample_poi, distance_m, source_system
 FROM near
 WHERE distance_m <= ${radiusMeters}
+QUALIFY row_number() OVER (PARTITION BY parcel_identifier ORDER BY distance_m) = 1
 ORDER BY distance_m
 LIMIT 25`,
   };
@@ -93,8 +94,9 @@ export const DEMO_QUESTIONS: DemoQuestion[] = [
       'built 15+ years ago with no permit on record (has_permits = FALSE), so ' +
       'the roof is presumed original. Direct roof-age answers land with the ' +
       'permit/enrichment phase.',
-    summaryLabel: 'properties with a presumed-original roof aged 15+ years',
-    summarySql: `SELECT COUNT(*)
+    summaryLabel:
+      'properties (distinct parcels) with a presumed-original roof aged 15+ years',
+    summarySql: `SELECT COUNT(DISTINCT parcel_identifier)
 FROM ${TABLE}
 WHERE built_year IS NOT NULL AND built_year > 0
   AND built_year <= year(current_date) - 15
@@ -108,6 +110,7 @@ WHERE built_year IS NOT NULL AND built_year > 0
   AND built_year <= year(current_date) - 15
   AND has_permits = FALSE
   AND property_type IN ('Building', 'ManufacturedHome')
+QUALIFY row_number() OVER (PARTITION BY parcel_identifier ORDER BY property_id) = 1
 ORDER BY built_year
 LIMIT 25`,
   },
@@ -132,9 +135,10 @@ LIMIT 25`,
       'Computed directly from last_sale_date (recorded for 510,934 of 511,695 ' +
       'rows). Rows with no recorded sale are excluded rather than assumed - ' +
       'tenure cannot be verified for them. Dates are stored as JS-style strings ' +
-      'and parsed in SQL.',
-    summaryLabel: 'properties with no ownership change in over 10 years',
-    summarySql: `SELECT COUNT(*)
+      'and parsed in SQL. Counted by distinct parcel (duplicate rows collapsed).',
+    summaryLabel:
+      'properties (distinct parcels) with no ownership change in over 10 years',
+    summarySql: `SELECT COUNT(DISTINCT parcel_identifier)
 FROM ${TABLE}
 WHERE try_strptime(substr(last_sale_date, 1, 15), '%a %b %d %Y')
       < current_date - INTERVAL 10 YEAR`,
@@ -145,6 +149,7 @@ WHERE try_strptime(substr(last_sale_date, 1, 15), '%a %b %d %Y')
 FROM ${TABLE}
 WHERE try_strptime(substr(last_sale_date, 1, 15), '%a %b %d %Y')
       < current_date - INTERVAL 10 YEAR
+QUALIFY row_number() OVER (PARTITION BY parcel_identifier ORDER BY property_id) = 1
 ORDER BY last_sale
 LIMIT 25`,
   },
