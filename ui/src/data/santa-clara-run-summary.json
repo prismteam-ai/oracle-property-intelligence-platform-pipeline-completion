@@ -1,0 +1,57 @@
+{
+  "run_started": "2026-07-08T21:02:55",
+  "run_finished": "2026-07-08T21:03:22",
+  "county": "Santa Clara",
+  "state": "CA",
+  "output_parquet": "data/santa-clara/santa-clara-query-table.parquet",
+  "sources": [
+    {
+      "name": "scc_parcels",
+      "description": "Santa Clara County parcels (Socrata ubcd-cewv), GeoJSON with geometry",
+      "url": "https://data.sccgov.org/resource/ubcd-cewv.geojson",
+      "records_fetched": 502789,
+      "records_loaded": 495231,
+      "fetched_at": "2026-07-08T21:02:55"
+    },
+    {
+      "name": "san_jose_permits",
+      "description": "San Jose Building Permits (data.sanjoseca.gov) — local file sj-permits.csv",
+      "url": "https://data.sanjoseca.gov/",
+      "records_fetched": 17824,
+      "records_loaded": 11032,
+      "distinct_apns_joined": 8667,
+      "fetched_at": "2026-07-08T21:02:55"
+    }
+  ],
+  "totals": {
+    "total_parcels": 495231,
+    "parcels_with_permits": 7771,
+    "parcels_with_reroof_permit": 762,
+    "distinct_cities": 21,
+    "top_cities": [
+      { "city": "SAN JOSE", "parcels": 251916 },
+      { "city": "SUNNYVALE", "parcels": 33729 },
+      { "city": "SANTA CLARA", "parcels": 30037 },
+      { "city": "PALO ALTO", "parcels": 20933 },
+      { "city": "MILPITAS", "parcels": 20245 },
+      { "city": "MOUNTAIN VIEW", "parcels": 20100 },
+      { "city": "GILROY", "parcels": 17792 },
+      { "city": "CUPERTINO", "parcels": 16974 },
+      { "city": "MORGAN HILL", "parcels": 16544 },
+      { "city": "LOS GATOS", "parcels": 15025 },
+      { "city": "LOS ALTOS", "parcels": 12656 },
+      { "city": "CAMPBELL", "parcels": 12337 },
+      { "city": "SARATOGA", "parcels": 11608 },
+      { "city": "LOS ALTOS HILLS", "parcels": 3261 },
+      { "city": "SAN MARTIN", "parcels": 1865 }
+    ]
+  },
+  "constraints": [
+    "Assessor owner names, assessed/market/land values, year built, livable area, and last sale date/price are a PAID offline bulk order from the Santa Clara County Assessor — left 100% NULL in v1 (honest gap).",
+    "Permits cover the City of San Jose only. Sunnyvale, Santa Clara city, Mountain View, Palo Alto and other city permit portals offer no bulk export and are not yet ingested — has_permits is a San-Jose-only signal in v1.",
+    "has_bbb_contractor is derived from a non-empty CONTRACTOR-on-record in the San Jose permit (a real contractor signal), NOT the national BBB harvest.",
+    "has_sunbiz_tenant is NULL: CA SOS bizfile bulk business data is a paid order; the FL Sunbiz stage has no free CA equivalent.",
+    "lot_area_sqft/total_area use shape_area_stateplane (verified real sqft via UTM reprojection); the raw `shape_area` field is NOT square feet.",
+    "latitude/longitude are parcel MultiPolygon centroids (no point field exists)."
+  ]
+}
