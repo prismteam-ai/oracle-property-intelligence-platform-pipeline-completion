@@ -18,7 +18,7 @@ export default function Provenance({
       Source: <span className="font-mono text-slate-600">{sources}</span>
       {' · '}
       {COUNTY_LABEL}
-      {' · '}queried live from the on-chain-addressed Parquet table
+      {' · '}queried live from the content-addressed Parquet table
     </p>
   );
 }

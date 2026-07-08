@@ -1,4 +1,4 @@
-import { DEMO_QUESTIONS, DemoQuestion, QuestionStatus } from '../demoQuestions';
+import { DemoQuestion, QuestionStatus } from '../demoQuestions';
 import type { QueryResult } from '../lib/duckdb';
 import Provenance, { ErrorBox, Spinner } from '../components/Provenance';
 import DataTable from '../components/DataTable';
@@ -25,7 +25,7 @@ const STATUS_STYLE: Record<QuestionStatus, { label: string; cls: string }> = {
   },
 };
 
-function QuestionCard({
+export function QuestionCard({
   q,
   run,
   onRun,
@@ -53,10 +53,20 @@ function QuestionCard({
       </div>
 
       {q.status === 'deferred' ? (
-        <p className="text-sm text-slate-500 italic">
-          No query is run for this question — the current schema cannot answer
-          it honestly, and this app does not fabricate results.
-        </p>
+        <div className="space-y-2">
+          <button
+            type="button"
+            disabled
+            aria-disabled="true"
+            className="px-3 py-1.5 text-sm font-medium border border-slate-200 rounded bg-slate-50 text-slate-400 cursor-not-allowed"
+          >
+            Not available — requires geo enrichment
+          </button>
+          <p className="text-sm text-slate-500 italic">
+            No query is run for this question — the current schema cannot answer
+            it honestly, and this app does not fabricate results.
+          </p>
+        </div>
       ) : (
         <>
           <details className="text-xs">
@@ -117,28 +127,3 @@ function QuestionCard({
   );
 }
 
-export default function DemoQuestionsPage({
-  runs,
-  onRun,
-}: {
-  runs: Record<string, QuestionRun>;
-  onRun: (id: string) => void;
-}) {
-  return (
-    <div className="space-y-4">
-      <p className="text-sm text-slate-600 max-w-3xl">
-        The six assignment questions, graded honestly against the 37 columns
-        that actually exist in the live query table. Each card shows the SQL,
-        the results, and exactly what the data can and cannot say.
-      </p>
-      {DEMO_QUESTIONS.map((q) => (
-        <QuestionCard
-          key={q.id}
-          q={q}
-          run={runs[q.id] ?? { status: 'idle' }}
-          onRun={() => onRun(q.id)}
-        />
-      ))}
-    </div>
-  );
-}

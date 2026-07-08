@@ -16,5 +16,10 @@ export const AGENT_A2A_URL: string =
   import.meta.env.VITE_AGENT_A2A_URL ||
   'https://oracle-agent.whitewave-2a3d27b9.eastus2.azurecontainerapps.io';
 
+/** Public MCP endpoint (JSON-RPC MCP) exposing the queryProperties tool. */
+export const MCP_URL: string =
+  import.meta.env.VITE_MCP_URL ||
+  'https://oracle-mcp.whitewave-2a3d27b9.eastus2.azurecontainerapps.io/mcp';
+
 /** SQL fragment referencing the remote query table. */
 export const TABLE = `read_parquet('${QUERY_TABLE_URL}')`;

@@ -2,6 +2,8 @@ import { Fragment } from 'react';
 import { IPFS_GATEWAY } from '../config';
 import type { QueryResult } from '../lib/duckdb';
 import Provenance, { ErrorBox, Spinner } from '../components/Provenance';
+import { DEMO_QUESTIONS } from '../demoQuestions';
+import { QuestionCard, QuestionRun } from './DemoQuestions';
 
 export const PAGE_SIZE = 50;
 
@@ -101,6 +103,8 @@ export default function Search({
   results,
   expanded,
   onToggleExpand,
+  runs,
+  onRun,
 }: {
   filters: SearchFilters;
   onFiltersChange: (f: SearchFilters) => void;
@@ -109,6 +113,8 @@ export default function Search({
   results: SearchResultsState;
   expanded: ExpandedState | null;
   onToggleExpand: (propertyId: string) => void;
+  runs: Record<string, QuestionRun>;
+  onRun: (id: string) => void;
 }) {
   const res = results.result;
   const total = results.total ?? 0;
@@ -116,7 +122,47 @@ export default function Search({
   const pidIdx = res ? res.columns.indexOf('property_id') : -1;
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-8">
+      <p className="text-xs text-slate-500">
+        DuckDB-WASM in your browser — no hosted database. Every query below runs
+        as client-side SQL over the content-addressed Parquet table.
+      </p>
+
+      {/* The six assignment questions as one-click presets. Each card is a
+          self-contained result: count + unit, the exact SQL, an honesty label,
+          a results table, and per-row provenance. */}
+      <section className="space-y-4">
+        <div>
+          <h2 className="text-base font-semibold text-slate-900">
+            Demo questions — one-click presets
+          </h2>
+          <p className="text-sm text-slate-600 max-w-3xl mt-1">
+            The six assignment questions, graded honestly against the 37 columns
+            that actually exist in the live query table. Each preset runs its
+            exact saved SQL and shows the count, the SQL, what the data can and
+            cannot say, and row-level CID provenance.
+          </p>
+        </div>
+        {DEMO_QUESTIONS.map((q) => (
+          <QuestionCard
+            key={q.id}
+            q={q}
+            run={runs[q.id] ?? { status: 'idle' }}
+            onRun={() => onRun(q.id)}
+          />
+        ))}
+      </section>
+
+      <section className="space-y-4">
+        <div>
+          <h2 className="text-base font-semibold text-slate-900">
+            Free-text property search
+          </h2>
+          <p className="text-sm text-slate-600 mt-1">
+            Filter the full parcel table by city, street, or ZIP. Click any row
+            to expand all columns and its IPFS source documents.
+          </p>
+        </div>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 max-w-3xl">
         <Field
           label="City"
@@ -252,6 +298,7 @@ export default function Search({
           <Provenance />
         </>
       )}
+      </section>
     </div>
   );
 }
