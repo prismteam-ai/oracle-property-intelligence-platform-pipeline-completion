@@ -4,7 +4,7 @@
  */
 export const QUERY_TABLE_URL: string =
   import.meta.env.VITE_QUERY_TABLE_URL ||
-  'https://ipfs.filebase.io/ipns/k51qzi5uqu5djd4ohcf3qm87dhlt0e270xw8ejhkyia62edr76uj0u05hrf7m5';
+  'https://oracle-parquet-host.netlify.app/lee-query-table.parquet';
 
 export const COUNTY_LABEL: string =
   import.meta.env.VITE_COUNTY_LABEL || 'Lee County, FL';

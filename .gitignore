@@ -38,3 +38,11 @@ pilot/production-rows.json
 
 # playwright screenshots (local test artifacts)
 .playwright-mcp/
+
+# deploy artifacts
+deploy/parquet-host/*.parquet
+deploy/mcp/node_modules/
+
+# netlify CLI local link state
+.netlify/
+ui/.netlify/

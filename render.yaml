@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: oracle-mcp
+    runtime: node
+    rootDir: deploy/mcp
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: "22.18.0"
+      - key: PROPERTY_QUERY_TABLE_MAP
+        value: '{"lee":"https://oracle-parquet-host.netlify.app/lee-query-table.parquet"}'
+      - key: ORACLE_OPEN_DATA_DEFAULT_COUNTY
+        value: lee
+
+  - type: web
+    name: oracle-agent
+    runtime: python
+    rootDir: agent
+    plan: free
+    buildCommand: pip install uv && uv sync --frozen
+    startCommand: uv run uvicorn a2a_server:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ORACLE_MCP_URL
+        value: https://oracle-mcp.onrender.com/mcp
+      - key: ORACLE_COUNTY
+        value: lee
+      - key: AZURE_OPENAI_DEPLOYMENT
+        value: gpt-5.4
+      - key: AZURE_OPENAI_KEY
+        sync: false
+      - key: AZURE_OPENAI_ENDPOINT
+        sync: false
+      - key: AZURE_OPENAI_API_VERSION
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
