@@ -6,6 +6,6 @@
     "@elephant-xyz/mcp": "github:elephant-xyz/elephant-mcp#main"
   },
   "scripts": {
-    "start": "node node_modules/@elephant-xyz/mcp/dist/server-http.js"
+    "start": "node start.mjs"
   }
 }

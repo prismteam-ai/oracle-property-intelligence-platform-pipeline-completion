@@ -4,11 +4,14 @@ services:
     runtime: node
     rootDir: deploy/mcp
     plan: free
-    buildCommand: npm install
+    # Download the query-table parquet to a LOCAL file at build time so DuckDB
+    # reads it off local disk (fast + reliable), never over the network per query.
+    buildCommand: npm install && curl -fSL --retry 3 -o data.parquet https://oracle-parquet-host.netlify.app/lee-query-table.parquet && ls -lh data.parquet
     startCommand: npm start
     envVars:
       - key: NODE_VERSION
         value: "22.18.0"
+      # Fallback only — start.mjs prefers the local data.parquet when present.
       - key: PROPERTY_QUERY_TABLE_MAP
         value: '{"lee":"https://oracle-parquet-host.netlify.app/lee-query-table.parquet"}'
       - key: ORACLE_OPEN_DATA_DEFAULT_COUNTY
