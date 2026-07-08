@@ -11,10 +11,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends git curl ca-cer
 COPY package.json start.mjs ./
 RUN npm install
 
-# Bake the parquet into the image so queries never touch the network.
-RUN curl -fSL --retry 3 -o data.parquet \
+# Bake BOTH counties' parquets into the image so queries never touch the
+# network. santa-clara = the correct county (Palo Alto); lee = reference.
+RUN curl -fSL --retry 3 -o santa-clara.parquet \
+      https://oracle-parquet-host.netlify.app/santa-clara-query-table.parquet \
+    && curl -fSL --retry 3 -o lee.parquet \
       https://oracle-parquet-host.netlify.app/lee-query-table.parquet \
-    && ls -lh data.parquet
+    && ls -lh santa-clara.parquet lee.parquet
 
 ENV PORT=8787
 EXPOSE 8787
