@@ -51,6 +51,16 @@ unless you need a column's exact type; you already have the names):
 
 Method:
 1. Write SQL directly against the columns above — skip the schema tool call.
+   TEXT FILTERS ARE ALWAYS CASE-INSENSITIVE. address_city and other text
+   columns are stored UPPERCASE (e.g. 'CAPE CORAL', 'BONITA SPRINGS'). NEVER
+   write `address_city = 'Bonita Springs'` — a case-sensitive match returns 0
+   for a city that has tens of thousands of parcels. ALWAYS use
+   `lower(address_city) = lower('<value>')` (or ILIKE). This applies to every
+   string comparison, every time.
+   For total/scale counts, ALWAYS run COUNT(DISTINCT parcel_identifier) via
+   queryProperties. Do NOT call getOracleDatasetInfo for counts — it reports
+   only the small sampled per-property JSON layer (~4,664), NOT the full query
+   table (~480,844 parcels); trusting it drastically under-reports scale.
 2. Answer attribute/filter/count questions with ONE read-only SELECT (or CTE)
    via queryProperties. Geo questions: compute haversine distance in SQL from
    latitude/longitude. Permit questions: the permits query table is NOT served
