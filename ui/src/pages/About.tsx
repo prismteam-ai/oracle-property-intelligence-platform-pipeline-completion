@@ -1,4 +1,5 @@
-import { AGENT_A2A_URL, COUNTY_LABEL, IPFS_GATEWAY, MCP_URL, QUERY_TABLE_URL } from '../config';
+import { AGENT_A2A_URL, IPFS_GATEWAY, MCP_URL } from '../config';
+import type { CountyConfig } from '../counties';
 
 /**
  * Static reference page. No DuckDB engine required — App renders /about
@@ -25,7 +26,8 @@ const SAMPLE_CIDS: { cid: string; label: string }[] = [
   { cid: 'QmNLfPwxJVbHmniFAusEGDVHfhHMUou2Sv8HyCwj8aAowJ', label: '314 NW 9th Terrace, Cape Coral (built 2004)' },
 ];
 
-const MCP_REQUEST = `POST ${MCP_URL}
+function mcpRequest(agentCounty: string): string {
+  return `POST ${MCP_URL}
 Content-Type: application/json
 
 {
@@ -35,19 +37,41 @@ Content-Type: application/json
   "params": {
     "name": "queryProperties",
     "arguments": {
-      "county": "lee",
-      "sql": "SELECT parcel_identifier, address_city, built_year, property_cid FROM properties WHERE built_year > 0 AND built_year <= 2010 LIMIT 5"
+      "county": "${agentCounty}",
+      "sql": "SELECT parcel_identifier, address_city, latitude, longitude, property_cid FROM properties LIMIT 5"
     }
   }
 }`;
+}
 
 const MCP_RESPONSE = `{
   "jsonrpc": "2.0",
   "id": 1,
   "result": {
     "content": [
-      { "type": "text", "text": "[{\\"parcel_identifier\\":\\"...\\",\\"address_city\\":\\"CAPE CORAL\\",\\"built_year\\":2004,\\"property_cid\\":\\"QmNLfPwxJ...\\"}, ...]" }
+      { "type": "text", "text": "[{\\"parcel_identifier\\":\\"...\\",\\"address_city\\":\\"PALO ALTO\\",\\"latitude\\":37.44,\\"longitude\\":-122.16,\\"property_cid\\":\\"Qm...\\"}, ...]" }
     ]
+  }
+}`;
+
+// Drop-in configs so any MCP client can query the public Oracle endpoint.
+// Claude Desktop speaks stdio → bridge via the `mcp-remote` npx proxy (verified
+// 2026-07-08: "Proxy established … StreamableHTTPClientTransport"). Cursor
+// connects to the HTTP endpoint natively via `url`.
+const CLAUDE_DESKTOP_CONFIG = `{
+  "mcpServers": {
+    "oracle-property-intelligence": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "${MCP_URL}"]
+    }
+  }
+}`;
+
+const CURSOR_CONFIG = `{
+  "mcpServers": {
+    "oracle-property-intelligence": {
+      "url": "${MCP_URL}"
+    }
   }
 }`;
 
@@ -79,7 +103,7 @@ function CodeBlock({ children }: { children: string }) {
   );
 }
 
-export default function About() {
+export default function About({ county }: { county: CountyConfig }) {
   return (
     <div className="space-y-5 max-w-4xl">
       <div>
@@ -87,15 +111,25 @@ export default function About() {
           About the Oracle Property Intelligence platform
         </h1>
         <p className="text-sm text-slate-600 mt-1">
-          A zero-standing-infrastructure property-intelligence Oracle. Currently
-          serving {COUNTY_LABEL} open data while the Santa Clara County ingest
-          completes.
+          A zero-standing-infrastructure property-intelligence Oracle. The
+          deliverable county is <span className="font-medium">Santa Clara
+          County, CA</span> (which contains Palo Alto); its open parcel + geo
+          data makes the distance questions real. <span className="font-medium">
+          Lee County, FL</span> is kept selectable as the reference
+          implementation — its full assessor field set (owner, value, year
+          built, sales) demonstrates the underwriting questions while the paid
+          Santa Clara Assessor bulk order is outstanding. Both counties are
+          served by the same MCP query layer via its{' '}
+          <code className="font-mono text-xs bg-slate-100 px-1 py-0.5 rounded">
+            PROPERTY_QUERY_TABLE_MAP
+          </code>
+          . Currently viewing: <span className="font-medium">{county.label}</span>.
         </p>
       </div>
 
       <Section
         title="IPFS artifacts & content-addressing"
-        subtitle="Per-property source-document records are content-addressed on IPFS — addressed by their content hash (CID), not by a server location. Below are live, resolvable sample CIDs."
+        subtitle="Per-property source-document records are content-addressed on IPFS — addressed by their content hash (CID), not by a server location. Below are live, resolvable sample CIDs from the Lee reference county."
       >
         <ul className="space-y-1.5">
           {SAMPLE_CIDS.map((s) => (
@@ -127,7 +161,7 @@ export default function About() {
             is the query index; the CIDs are the verifiable provenance layer.
           </p>
           <p className="break-all">
-            Query table: <span className="font-mono">{QUERY_TABLE_URL}</span>
+            Active query table: <span className="font-mono">{county.parquetUrl}</span>
           </p>
         </div>
       </Section>
@@ -149,8 +183,9 @@ export default function About() {
           <ul className="list-disc pl-5 text-sm text-slate-600 space-y-0.5">
             <li>
               <span className="font-mono text-xs">county</span> — the county key
-              (e.g. <span className="font-mono text-xs">lee</span>), mapped to the
-              backing Parquet.
+              (<span className="font-mono text-xs">santa-clara</span> or{' '}
+              <span className="font-mono text-xs">lee</span>), mapped to the
+              backing Parquet via PROPERTY_QUERY_TABLE_MAP.
             </li>
             <li>
               <span className="font-mono text-xs">sql</span> — a read-only
@@ -164,11 +199,55 @@ export default function About() {
         <div className="grid md:grid-cols-2 gap-3">
           <div className="space-y-1">
             <p className="text-xs font-medium text-slate-600">Example request</p>
-            <CodeBlock>{MCP_REQUEST}</CodeBlock>
+            <CodeBlock>{mcpRequest(county.agentCounty)}</CodeBlock>
           </div>
           <div className="space-y-1">
             <p className="text-xs font-medium text-slate-600">Example response shape</p>
             <CodeBlock>{MCP_RESPONSE}</CodeBlock>
+          </div>
+        </div>
+
+        <div className="pt-2 border-t border-slate-100 space-y-3">
+          <div>
+            <h3 className="text-sm font-semibold text-slate-800">
+              Connect your own agent
+            </h3>
+            <p className="text-sm text-slate-600 mt-1">
+              The endpoint is a standard streamable-HTTP MCP server, so any MCP
+              client can query the Oracle as a peer — no key, no account. Add it
+              to Claude Desktop or Cursor, then ask property questions in your own
+              agent and it will call{' '}
+              <span className="font-mono text-xs">queryProperties</span> against
+              this data.
+            </p>
+          </div>
+          <div className="grid md:grid-cols-2 gap-3">
+            <div className="space-y-1">
+              <p className="text-xs font-medium text-slate-600">
+                Claude Desktop —{' '}
+                <span className="font-mono">claude_desktop_config.json</span>
+              </p>
+              <CodeBlock>{CLAUDE_DESKTOP_CONFIG}</CodeBlock>
+              <p className="text-xs text-slate-500">
+                Uses the <span className="font-mono">mcp-remote</span> bridge
+                (Claude Desktop speaks stdio; the bridge proxies to our HTTP
+                endpoint). Restart Claude Desktop, then ask e.g.{' '}
+                <span className="italic">
+                  "Using the oracle tools, how many parcels are in Palo Alto?"
+                </span>
+              </p>
+            </div>
+            <div className="space-y-1">
+              <p className="text-xs font-medium text-slate-600">
+                Cursor — <span className="font-mono">.cursor/mcp.json</span>
+              </p>
+              <CodeBlock>{CURSOR_CONFIG}</CodeBlock>
+              <p className="text-xs text-slate-500">
+                Cursor connects to the HTTP endpoint natively via{' '}
+                <span className="font-mono">url</span>. Enable the server in
+                Settings → MCP, then ask the same questions in Composer.
+              </p>
+            </div>
           </div>
         </div>
       </Section>
@@ -260,22 +339,30 @@ export default function About() {
             <dd>
               <ul className="list-disc pl-5 space-y-0.5">
                 <li>
-                  Interim data is {COUNTY_LABEL} (Lee County, FL) — the Santa
-                  Clara County ingest is still pending.
+                  <span className="font-medium">Santa Clara (default):</span>{' '}
+                  parcels + geo are real (495,231 parcels, 100% lat/lon), so
+                  transit / Starbucks distance answers are real. Owner, value,
+                  year-built and sale date are a{' '}
+                  <span className="font-medium">paid offline Assessor bulk order</span>{' '}
+                  — 100% NULL in v1 — so roof-age, ownership-tenure and
+                  regional-owner questions are honestly deferred.
                 </li>
                 <li>
-                  Roof-age and regional-owner answers are{' '}
-                  <span className="font-medium">labeled proxies</span> (structure age /
-                  portfolio size), not direct measurements.
+                  <span className="font-medium">Lee (reference):</span> full
+                  assessor field set present. Roof-age and regional-owner answers
+                  are <span className="font-medium">labeled proxies</span>{' '}
+                  (structure age / portfolio size), not direct measurements.
                 </li>
                 <li>
                   Transit and Starbucks proximity use a small{' '}
-                  <span className="font-medium">sample POI set</span>, not the full
-                  place / GTFS network.
+                  <span className="font-medium">sample POI set</span> (real
+                  Caltrain/VTA stations for Santa Clara), not the full place /
+                  GTFS network.
                 </li>
                 <li>
-                  Water-view is <span className="font-medium">deferred</span> — it requires
-                  geo enrichment not yet in the schema; no results are fabricated.
+                  Water-view is <span className="font-medium">deferred</span> for
+                  both counties — it requires geo/shoreline enrichment not yet in
+                  the schema; no results are fabricated.
                 </li>
                 <li>
                   Permits, business, and contractor signals are currently{' '}
