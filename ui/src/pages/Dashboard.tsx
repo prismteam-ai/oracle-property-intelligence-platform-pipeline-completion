@@ -121,21 +121,22 @@ export default function Dashboard({
         <StatCard
           label={`Properties · ${COUNTY_LABEL}`}
           value={s.total.toLocaleString('en-US')}
+          sub="distinct parcels"
         />
         <StatCard
           label="Coordinate coverage"
           value={pct(s.withCoords, s.total)}
-          sub={`${s.withCoords.toLocaleString('en-US')} rows with lat/lon`}
+          sub={`${s.withCoords.toLocaleString('en-US')} parcels with lat/lon`}
         />
         <StatCard
           label="Known build year"
           value={pct(s.withBuiltYear, s.total)}
-          sub={`${s.withBuiltYear.toLocaleString('en-US')} rows`}
+          sub={`${s.withBuiltYear.toLocaleString('en-US')} parcels`}
         />
         <StatCard
           label="Recorded last sale"
           value={pct(s.withSaleDate, s.total)}
-          sub={`${s.withSaleDate.toLocaleString('en-US')} rows`}
+          sub={`${s.withSaleDate.toLocaleString('en-US')} parcels`}
         />
       </div>
 
@@ -151,7 +152,7 @@ export default function Dashboard({
         <h3 className="text-sm font-medium text-slate-700">Provenance</h3>
         <p className="text-sm text-slate-600">
           {s.withCid.toLocaleString('en-US')} of {s.total.toLocaleString('en-US')}{' '}
-          rows ({pct(s.withCid, s.total)}) carry a{' '}
+          parcels ({pct(s.withCid, s.total)}) carry a{' '}
           <code className="font-mono text-xs bg-slate-100 px-1 py-0.5 rounded">
             property_cid
           </code>{' '}

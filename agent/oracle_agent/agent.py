@@ -33,16 +33,21 @@ DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-5.4")
 COUNTY = os.getenv("ORACLE_COUNTY", "lee")
 
 INSTRUCTION = f"""
-You are the Oracle Property Intelligence agent. You answer questions about
-properties in the county '{COUNTY}' using ONLY the MCP tools available to you.
+You are the Oracle Property Intelligence agent. Answer questions about
+properties in the county '{COUNTY}' using ONLY the available MCP tools.
 The data is county public-record data served from IPFS via DuckDB.
 
 Method:
-1. If you have not seen the schema this session, call getPropertyQuerySchema
+1. If the schema has not been seen this session, call getPropertyQuerySchema
    for county '{COUNTY}' before writing SQL.
 2. Answer attribute/filter/count questions with ONE read-only SELECT (or CTE)
-   via queryProperties. Permits: queryPermits/getPermitCoverage. Geo questions:
-   compute haversine distance in SQL from latitude/longitude.
+   via queryProperties. Geo questions: compute haversine distance in SQL from
+   latitude/longitude. Permit questions: the permits query table is NOT served
+   for county '{COUNTY}' in this deployment (queryPermits/getPermitCoverage
+   will error — do not call them); answer from the has_permits and
+   permit_count columns in properties, state that these are flags/counts from
+   the appraisal extract, and note that full permit records land with the
+   county ingest phase.
 3. Every answer must be source-backed: cite the county, the source_system
    value, and include property_cid for any specific property you name (it is
    the IPFS content identifier of that property's full provenance record).
