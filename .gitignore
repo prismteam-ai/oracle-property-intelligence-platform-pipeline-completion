@@ -24,3 +24,14 @@ logs
 .DS_Store
 __pycache__/
 .venv/
+
+# pilot runtime artifacts (binaries, object store data, caches, derived exports)
+pilot/bin/
+pilot/minio-data/
+pilot/consolidated/
+pilot/state/
+pilot/query-table-export/
+pilot/*.zip
+pilot/loader.env
+pilot/zips/
+pilot/production-rows.json
