@@ -16,6 +16,7 @@ import duckdb_wasm from '@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url';
 import mvp_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url';
 import duckdb_wasm_eh from '@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url';
 import eh_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url';
+import { QUERY_TABLE_URL } from '../config';
 
 export interface QueryResult {
   columns: string[];
@@ -68,6 +69,12 @@ async function doInit(): Promise<duckdb.AsyncDuckDBConnection> {
   await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
   setPhase('connecting', 'Opening connection');
   const conn = await db.connect();
+  // Register a `properties` view over the remote Parquet so the agent's SQL
+  // (which says `FROM properties`) runs verbatim in-browser. CREATE VIEW is
+  // lazy — it stores the definition and triggers no fetch until first query.
+  await conn.query(
+    `CREATE OR REPLACE VIEW properties AS SELECT * FROM read_parquet('${QUERY_TABLE_URL}')`,
+  );
   setPhase('ready');
   return conn;
 }

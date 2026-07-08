@@ -273,6 +273,7 @@ export default function App() {
                 status: 'done',
                 answer: res.text ?? undefined,
                 raw: res.text === null ? res.raw : undefined,
+                sql: res.sql ?? undefined,
                 elapsedMs: Date.now() - t.startedAt,
               }
             : t,

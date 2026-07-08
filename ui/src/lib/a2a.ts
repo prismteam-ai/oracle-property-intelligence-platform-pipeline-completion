@@ -19,6 +19,13 @@ export interface AskResult {
   raw: unknown;
   /** A2A context id to send with the next turn (conversation memory). */
   contextId: string | null;
+  /**
+   * The exact SQL the agent ran via its `queryProperties` tool call, taken
+   * from the structured `function_call` part in history (NOT parsed out of the
+   * prose). Null when the turn ran no query (clarification / refusal / chat).
+   * When a turn ran multiple queries, this is the last (primary) one.
+   */
+  sql: string | null;
 }
 
 /** Agent turns run live SQL over IPFS and take 20s–3min; allow up to 6min. */
@@ -69,6 +76,38 @@ function extractText(result: Record<string, unknown>): string | null {
       if (isRecord(m) && m.role === 'agent') {
         const texts = textFromParts(m.parts);
         if (texts.length) return texts.join('\n\n');
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Extract the SQL from the agent's `queryProperties` tool call.
+ *
+ * Empirical history shape (verified against the live endpoint 2026-07-08):
+ * an agent-role message whose part is
+ *   { kind: 'data', metadata: { adk_type: 'function_call' },
+ *     data: { name: 'queryProperties', args: { county, sql, limit } } }
+ * We scan history newest-first and return the last queryProperties `sql`.
+ * Returns null when no such call exists (agent answered without querying).
+ */
+function extractSql(result: Record<string, unknown>): string | null {
+  if (!Array.isArray(result.history)) return null;
+  for (let i = result.history.length - 1; i >= 0; i--) {
+    const m = result.history[i];
+    if (!isRecord(m) || !Array.isArray(m.parts)) continue;
+    for (const part of m.parts) {
+      if (!isRecord(part)) continue;
+      const meta = part.metadata;
+      const isFnCall =
+        isRecord(meta) && meta.adk_type === 'function_call';
+      const data = part.data;
+      if (!isFnCall || !isRecord(data)) continue;
+      if (data.name !== 'queryProperties') continue;
+      const args = data.args;
+      if (isRecord(args) && typeof args.sql === 'string' && args.sql.trim()) {
+        return args.sql;
       }
     }
   }
@@ -145,10 +184,11 @@ export async function askOracle(
 
   const result = json.result;
   if (!isRecord(result)) {
-    return { text: null, raw: json, contextId: null };
+    return { text: null, raw: json, contextId: null, sql: null };
   }
 
   const text = extractText(result);
+  const sql = extractSql(result);
   const newContextId =
     typeof result.contextId === 'string' ? result.contextId : null;
 
@@ -160,5 +200,5 @@ export async function askOracle(
     );
   }
 
-  return { text, raw: json, contextId: newContextId };
+  return { text, raw: json, contextId: newContextId, sql };
 }
