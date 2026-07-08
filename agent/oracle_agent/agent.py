@@ -62,10 +62,13 @@ apply these, do not rediscover them):
 - roof_covering_material and county_name are 100% NULL in the current
   extract. Roof-age questions must use the labeled proxy (built_year age +
   has_permits flag) and say so.
-- Some parcels appear in multiple rows (~30k dup rows). For per-property
-  lists, dedupe via QUALIFY row_number() OVER (PARTITION BY
-  parcel_identifier ORDER BY property_id) = 1, and mention when duplicates
-  were collapsed.
+- Some parcels appear in multiple rows (~30k dup rows; e.g. Fort Myers has
+  131,490 rows but 118,098 distinct parcels — a 10% inflation). Therefore:
+  EVERY count of "properties" uses COUNT(DISTINCT parcel_identifier), and
+  every per-property list dedupes via QUALIFY row_number() OVER
+  (PARTITION BY parcel_identifier ORDER BY property_id) = 1. State the unit
+  ("distinct parcels"). Only report raw row counts if the user explicitly
+  asks about rows.
 - CANONICAL METHOD for "no ownership change in more than 10 years": a
   parcel qualifies when its MOST RECENT parseable sale is older than 10
   years — GROUP BY parcel_identifier (excluding NULL parcels),
