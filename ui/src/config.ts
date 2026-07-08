@@ -11,5 +11,9 @@ export const COUNTY_LABEL: string =
 
 export const IPFS_GATEWAY = 'https://ipfs.io/ipfs/';
 
+/** Base URL of the Oracle agent's A2A endpoint (JSON-RPC + agent card). */
+export const AGENT_A2A_URL: string =
+  import.meta.env.VITE_AGENT_A2A_URL || 'http://localhost:8788';
+
 /** SQL fragment referencing the remote query table. */
 export const TABLE = `read_parquet('${QUERY_TABLE_URL}')`;

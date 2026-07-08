@@ -132,10 +132,12 @@ LIMIT 25`,
     question: 'Which properties have not changed ownership in more than 10 years?',
     status: 'supported',
     dataBasis:
-      'Computed directly from last_sale_date (recorded for 510,934 of 511,695 ' +
-      'rows). Rows with no recorded sale are excluded rather than assumed - ' +
-      'tenure cannot be verified for them. Dates are stored as JS-style strings ' +
-      'and parsed in SQL. Counted by distinct parcel (duplicate rows collapsed).',
+      'Computed from last_sale_date, taking the most recent recorded sale per ' +
+      'parcel. Placeholder dates (1900-01-01 and earlier) are source-record ' +
+      'sentinels, not real sales, so those parcels are treated as "no recorded ' +
+      'sale" and excluded rather than counted as ~126-year tenure. Rows with no ' +
+      'parseable sale are likewise excluded — tenure cannot be verified for them. ' +
+      'Counted by distinct parcel (duplicate rows collapsed).',
     summaryLabel:
       'parcels whose most recent recorded sale is over 10 years ago',
     summarySql: `SELECT COUNT(*) FROM (
@@ -145,6 +147,7 @@ LIMIT 25`,
   WHERE parcel_identifier IS NOT NULL
   GROUP BY parcel_identifier
   HAVING latest_sale IS NOT NULL
+     AND latest_sale >= DATE '1902-01-01'
      AND latest_sale < current_date - INTERVAL 10 YEAR
 )`,
     rowsSql: `SELECT t.parcel_identifier, any_value(t.address_street) AS address_street,
@@ -156,7 +159,7 @@ LIMIT 25`,
 FROM ${TABLE} t
 WHERE t.parcel_identifier IS NOT NULL
 GROUP BY t.parcel_identifier
-HAVING MAX(try_strptime(substr(t.last_sale_date, 1, 15), '%a %b %d %Y')) IS NOT NULL
+HAVING MAX(try_strptime(substr(t.last_sale_date, 1, 15), '%a %b %d %Y')) >= DATE '1902-01-01'
    AND MAX(try_strptime(substr(t.last_sale_date, 1, 15), '%a %b %d %Y'))
        < current_date - INTERVAL 10 YEAR
 ORDER BY latest_sale

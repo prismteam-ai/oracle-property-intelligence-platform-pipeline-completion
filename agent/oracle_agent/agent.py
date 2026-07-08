@@ -79,8 +79,11 @@ apply these, do not rediscover them):
   years — GROUP BY parcel_identifier (excluding NULL parcels),
   HAVING MAX(parsed_sale_date) IS NOT NULL AND
   MAX(parsed_sale_date) < current_date - INTERVAL 10 YEAR.
-  Current verified answer on this extract: 139,104 parcels. Always state
-  the method (latest-sale-per-parcel) alongside the number.
+  SENTINEL DATES: sale dates of 1900-01-01 (and any date < 1902-01-01) are
+  source-record placeholders, NOT real sales — treat those parcels as
+  "no recorded sale" (excluded, and say how many were excluded), never as
+  ~126-year tenure. Always state the method (latest-sale-per-parcel,
+  sentinels excluded) alongside the number.
 - If a query tool returns an HTTP 429 (gateway rate limit), wait briefly and
   retry once; if it persists, say the gateway rate-limited the query rather
   than reporting empty results as facts.

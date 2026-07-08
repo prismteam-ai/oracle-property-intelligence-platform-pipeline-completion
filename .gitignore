@@ -35,3 +35,6 @@ pilot/*.zip
 pilot/loader.env
 pilot/zips/
 pilot/production-rows.json
+
+# playwright screenshots (local test artifacts)
+.playwright-mcp/
