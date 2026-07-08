@@ -8,6 +8,7 @@
  * - 'deferred'   -- the schema genuinely cannot answer it yet; no fake results
  */
 import { TABLE } from './config';
+import { sqlString } from './lib/duckdb';
 
 export type QuestionStatus = 'supported' | 'partial' | 'deferred';
 
@@ -26,17 +27,36 @@ export interface DemoQuestion {
 }
 
 /**
+ * A point of interest with approximate coordinates. Shared as the single
+ * source of truth for the sample POI sets used by BOTH the demo-question SQL
+ * below AND the composable Search filters (ui/src/searchQuery.ts), so the two
+ * surfaces can never drift apart.
+ */
+export interface Poi {
+  name: string;
+  lat: number;
+  lon: number;
+}
+
+/** Render a POI array as SQL `VALUES` rows: `  ('name', lat, lon)`. */
+export function poisToValues(pois: Poi[]): string {
+  return pois
+    .map((p) => `  (${sqlString(p.name)}, ${p.lat}, ${p.lon})`)
+    .join(',\n');
+}
+
+/**
  * Haversine distance in meters, with a cheap bounding-box prefilter
  * (0.008 deg lat / 0.009 deg lon ~ 890 m at 26.5 N) so we do not compute
  * trigonometry for all 511k rows x every POI.
  */
 function poiProximitySql(
-  poisValues: string,
+  pois: Poi[],
   radiusMeters: number,
 ): { summary: string; rows: string } {
   const near = `
 WITH pois(poi_name, plat, plon) AS (VALUES
-${poisValues}
+${poisToValues(pois)}
 ),
 near AS (
   SELECT t.property_id, t.parcel_identifier, t.address_street, t.address_city,
@@ -66,18 +86,22 @@ LIMIT 25`,
 
 // Sample POI sets -- approximate coordinates, v1 placeholder.
 // Full POI data (GTFS transit stops, places API) lands with the Santa Clara ingest.
-const TRANSIT_POIS = `  ('Rosa Parks Transportation Center, Fort Myers', 26.6444, -81.8710),
-  ('Edison Mall transfer point, Fort Myers',      26.5983, -81.8709),
-  ('Cape Coral Transfer Center (SE 47th Terr)',   26.5624, -81.9497),
-  ('Beach Park & Ride, Summerlin Square',         26.4547, -81.9494),
-  ('Lehigh Acres transfer point (Homestead Rd)',  26.6079, -81.6448)`;
+export const TRANSIT_POIS: Poi[] = [
+  { name: 'Rosa Parks Transportation Center, Fort Myers', lat: 26.6444, lon: -81.871 },
+  { name: 'Edison Mall transfer point, Fort Myers', lat: 26.5983, lon: -81.8709 },
+  { name: 'Cape Coral Transfer Center (SE 47th Terr)', lat: 26.5624, lon: -81.9497 },
+  { name: 'Beach Park & Ride, Summerlin Square', lat: 26.4547, lon: -81.9494 },
+  { name: 'Lehigh Acres transfer point (Homestead Rd)', lat: 26.6079, lon: -81.6448 },
+];
 
-const STARBUCKS_POIS = `  ('Starbucks - First St, Downtown Fort Myers',   26.6414, -81.8687),
-  ('Starbucks - Cleveland Ave (US-41), Fort Myers', 26.5987, -81.8720),
-  ('Starbucks - Santa Barbara Blvd, Cape Coral',  26.6249, -81.9740),
-  ('Starbucks - Coconut Point, Estero',           26.4022, -81.8065),
-  ('Starbucks - Gulf Coast Town Center',          26.4859, -81.7859),
-  ('Starbucks - Bonita Beach Rd, Bonita Springs', 26.3312, -81.8069)`;
+export const STARBUCKS_POIS: Poi[] = [
+  { name: 'Starbucks - First St, Downtown Fort Myers', lat: 26.6414, lon: -81.8687 },
+  { name: 'Starbucks - Cleveland Ave (US-41), Fort Myers', lat: 26.5987, lon: -81.872 },
+  { name: 'Starbucks - Santa Barbara Blvd, Cape Coral', lat: 26.6249, lon: -81.974 },
+  { name: 'Starbucks - Coconut Point, Estero', lat: 26.4022, lon: -81.8065 },
+  { name: 'Starbucks - Gulf Coast Town Center', lat: 26.4859, lon: -81.7859 },
+  { name: 'Starbucks - Bonita Beach Rd, Bonita Springs', lat: 26.3312, lon: -81.8069 },
+];
 
 const transit = poiProximitySql(TRANSIT_POIS, 800);
 const starbucks = poiProximitySql(STARBUCKS_POIS, 800);
