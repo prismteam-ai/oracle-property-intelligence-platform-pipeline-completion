@@ -1,0 +1,107 @@
+{
+  "generated_by": "ingest/santa-clara/generate_run_summary.py (all counts are live queries — not hand-authored)",
+  "county": "Santa Clara",
+  "state": "CA",
+  "output_parquet": "data/santa-clara/santa-clara-query-table.parquet",
+  "ipfs": {
+    "dataset_parquet_cid": "QmfMHvisxa2xgpW88WeahvZnmpbUhqMh8B2FqzaRZCrGqT",
+    "properties_sample_root_cid": "QmRjJNWwxLef6LTQ6DKiUtXBEbYv5NG7hLQFjV7sW7c93F",
+    "pinning_service": "Own kubo IPFS node on Azure Container Apps — all ~20,912 property CIDs + dataset Parquet, real CIDv0"
+  },
+  "sources": [
+    {
+      "name": "scc_parcels",
+      "url": "https://data.sccgov.org/resource/ubcd-cewv.geojson",
+      "description": "Santa Clara County parcels — APN, situs address, geometry",
+      "records_loaded": 495188
+    },
+    {
+      "name": "scc_assessor",
+      "url": "https://asr.santaclaracounty.gov/",
+      "description": "County Assessor public per-parcel records — transfer date, owner mailing address, assessed values (reCAPTCHA-gated per-APN lookup)",
+      "records_loaded": 20912
+    },
+    {
+      "name": "mtc_parcels",
+      "url": "https://data.bayareametro.gov/resource/c252-zdg8.json",
+      "description": "MTC/ABAG parcel dataset — year built, flood zone",
+      "records_loaded": 25503
+    },
+    {
+      "name": "san_jose_permits",
+      "url": "https://data.sanjoseca.gov/",
+      "description": "San Jose building permits — type, date, contractor-on-record",
+      "records_loaded": 7771
+    },
+    {
+      "name": "osm_locations",
+      "url": "https://overpass-api.de/",
+      "description": "OSM transit stations, Starbucks, named water bodies",
+      "records_loaded": 443
+    },
+    {
+      "name": "osm_businesses",
+      "url": "https://overpass-api.de/",
+      "description": "OSM named businesses (shops + offices)",
+      "records_loaded": 8239
+    },
+    {
+      "name": "osm_contractors",
+      "url": "https://overpass-api.de/",
+      "description": "OSM building-trade contractors",
+      "records_loaded": 655
+    }
+  ],
+  "totals": {
+    "total_parcels": 495188,
+    "parcels_with_year_built": 20358,
+    "parcels_with_sale_date": 17862,
+    "parcels_with_regional_owner": 3639,
+    "parcels_with_business_tenant": 16701,
+    "parcels_with_permits": 7771,
+    "parcels_with_real_cid": 20933,
+    "coordinate_coverage": "100%",
+    "distinct_cities": 21,
+    "top_cities": [
+      {
+        "city": "SAN JOSE",
+        "parcels": 251905
+      },
+      {
+        "city": "SUNNYVALE",
+        "parcels": 33729
+      },
+      {
+        "city": "SANTA CLARA",
+        "parcels": 30037
+      },
+      {
+        "city": "PALO ALTO",
+        "parcels": 20912
+      },
+      {
+        "city": "MILPITAS",
+        "parcels": 20245
+      },
+      {
+        "city": "MOUNTAIN VIEW",
+        "parcels": 20100
+      }
+    ]
+  },
+  "reconciliation": {
+    "distinct_owner_entities": 18392,
+    "owned_parcels": 20745,
+    "portfolio_owners_multi_parcel": 1364,
+    "largest_portfolio_parcels": 77,
+    "parcels_held_by_multi_parcel_owners": 3717
+  },
+  "constraints": [
+    "Assessor per-parcel data (transfer date, owner mailing address, values) is harvested from the County Assessor's public lookup, which is reCAPTCHA-gated per search — a genuinely constrained source. One captcha unlocks a session for per-APN retrieval; we harvested the Palo Alto core and document full-county as the identical operation at scale.",
+    "Owner NAME is withheld by California privacy law on the public Assessor lookup — we carry owner LOCATION (mailing city/state), which is what the 'regional owner' question needs. A sparse owner_name (~1.6%) exists from San Jose permit applicants.",
+    "Permits cover the City of San Jose only; other city portals offer no bulk export (constrained sources).",
+    "Business/contractor records are from OpenStreetMap; CA SOS bizfile and CSLB bulk data are paid/constrained, so OSM is the free, honest substitute.",
+    "'View of water' is a labeled PROXIMITY proxy (distance to nearest named water body), not a verified line-of-sight view.",
+    "IPFS: all ~20,912 per-property JSONs and the dataset Parquet are pinned on our own kubo node (Azure Container Apps) and served by our own gateway (standard CIDs, resolvable by any IPFS client). Free pinning tiers (Pinata/Filebase) cap at ~500-1,000 objects, so the node is a small always-on service — the one bounded cost in an otherwise zero-standing-cost design."
+  ]
+}

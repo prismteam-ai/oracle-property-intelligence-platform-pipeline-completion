@@ -1,0 +1,10 @@
+# Static host for the Lee County query-table Parquet.
+# DuckDB (browser WASM + the MCP server) range-reads this over HTTPS.
+[[headers]]
+  for = "/*.parquet"
+  [headers.values]
+    Access-Control-Allow-Origin = "*"
+    Access-Control-Allow-Methods = "GET, HEAD, OPTIONS"
+    Access-Control-Allow-Headers = "Range, Content-Type"
+    Access-Control-Expose-Headers = "Content-Range, Content-Length, Accept-Ranges"
+    Cache-Control = "public, max-age=31536000, immutable"
