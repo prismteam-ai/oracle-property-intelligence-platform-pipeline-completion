@@ -70,3 +70,8 @@ data/santa-clara/*.csv
 *.png
 tenure-preset.md
 .playwright-mcp/
+
+# never commit filebase creds / console dumps
+filebase-*.yml
+filebase.env
+*filebase*key*
