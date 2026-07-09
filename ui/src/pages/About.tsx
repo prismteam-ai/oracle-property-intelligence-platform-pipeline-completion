@@ -319,8 +319,10 @@ export default function About({ county }: { county: CountyConfig }) {
           </li>
           <li>
             The MCP server and the agent are plain containers — deployable to any
-            container host, and scale-to-zero capable (Azure Container Apps
-            today; equally AWS Fargate / Lambda, Cloud Run, Fly).
+            container host and scale-to-zero capable. During this trial they run
+            at one warm replica (min-1) for demo reliability; a cost-optimized
+            deployment sets them to scale-to-zero (Azure Container Apps today;
+            equally AWS Fargate / Lambda, Cloud Run, Fly).
           </li>
           <li>
             The IPFS pinning node is a third container (kubo) — the one{' '}
