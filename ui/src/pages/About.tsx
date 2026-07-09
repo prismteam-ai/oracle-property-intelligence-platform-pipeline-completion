@@ -133,7 +133,7 @@ export default function About({ county }: { county: CountyConfig }) {
 
       <Section
         title="IPFS artifacts & content-addressing"
-        subtitle="Eligible dataset artifacts are content-addressed on IPFS — addressed by their content hash (CID), not a server location — and durably pinned (Pinata). Every CID below resolves on any public gateway."
+        subtitle="Eligible dataset artifacts are content-addressed on IPFS — addressed by their content hash (CID), not a server location — and pinned by our own kubo IPFS node. Every CID below is a standard IPFS CIDv0 that resolves on any public gateway (e.g. ipfs.io)."
       >
         <div className="text-sm bg-slate-50 border border-slate-200 rounded px-3 py-2 mb-2">
           <span className="font-medium text-slate-700">Dataset artifact — the full Santa Clara query-table Parquet on IPFS:</span>
@@ -147,7 +147,7 @@ export default function About({ county }: { county: CountyConfig }) {
             {DATASET_CID}
           </a>
         </div>
-        <p className="text-xs font-medium text-slate-600">Per-property source-document records (pinned sample):</p>
+        <p className="text-xs font-medium text-slate-600">Per-property source-document records (all ~20,912 pinned — examples):</p>
         <ul className="space-y-1.5">
           {SAMPLE_CIDS.map((s) => (
             <li key={s.cid} className="text-sm">
@@ -165,11 +165,15 @@ export default function About({ county }: { county: CountyConfig }) {
         </ul>
         <div className="text-xs text-slate-600 bg-slate-50 border border-slate-200 rounded px-3 py-2 space-y-1">
           <p>
-            <span className="font-medium text-slate-700">Honest architecture note: </span>
-            Each parcel's consolidated source-document set is pinned to IPFS and
-            referenced by <code className="font-mono">property_cid</code> — those
-            are the content-addressed artifacts (links above resolve through{' '}
-            <span className="font-mono">{IPFS_GATEWAY}</span>).
+            <span className="font-medium text-slate-700">Architecture note: </span>
+            All ~20,912 parcels' consolidated source-document sets are pinned to
+            IPFS and referenced by <code className="font-mono">property_cid</code>.
+            They are pinned by our own <span className="font-medium">kubo IPFS node</span>{' '}
+            (Azure Container Apps), which replaces a paid pinning service — free
+            tiers (Pinata, Filebase) cap at ~500–1,000 objects. Because that node
+            provides to the IPFS DHT, these standard CIDs resolve on{' '}
+            <span className="font-medium">any public gateway</span>; the links above
+            use <span className="font-mono">{IPFS_GATEWAY}</span>.
           </p>
           <p>
             The columnar <span className="font-medium text-slate-700">query-table Parquet</span> is
