@@ -177,8 +177,10 @@ export default function App() {
       const sources = await query(`
         SELECT COALESCE(NULLIF(trim(source_system), ''), '(unknown)') AS source, COUNT(*) AS n
         FROM ${deduped} t GROUP BY 1 ORDER BY n DESC`);
+      // property_type is VARCHAR in Lee but INTEGER (100% NULL) in Santa Clara —
+      // cast before trim() so the same query binds for either column type.
       const ptypes = await query(`
-        SELECT COALESCE(NULLIF(trim(property_type), ''), '(unknown)') AS ptype, COUNT(*) AS n
+        SELECT COALESCE(NULLIF(trim(CAST(property_type AS VARCHAR)), ''), '(unknown)') AS ptype, COUNT(*) AS n
         FROM ${deduped} t GROUP BY 1 ORDER BY n DESC LIMIT 10`);
 
       const s = stats.rows[0] ?? [];

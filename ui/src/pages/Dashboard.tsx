@@ -155,7 +155,12 @@ export default function Dashboard({
         <BarList title="Properties by city (top 15)" items={state.cities ?? []} />
         <div className="space-y-4">
           <BarList title="Records by data source" items={state.sources ?? []} />
-          <BarList title="Records by property type" items={state.ptypes ?? []} />
+          {/* Hide the property-type chart when the column carries no real types
+              (Santa Clara: property_type is a paid Assessor field, NULL in v1 —
+              the only bucket would be "(unknown)"). Lee keeps its real breakdown. */}
+          {(state.ptypes ?? []).some((p) => p.name !== '(unknown)') && (
+            <BarList title="Records by property type" items={state.ptypes ?? []} />
+          )}
         </div>
       </div>
 
