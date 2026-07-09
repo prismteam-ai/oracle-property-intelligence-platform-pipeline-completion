@@ -3,8 +3,23 @@
 Completes the Oracle pipeline for **Santa Clara County, CA** (the county containing
 Palo Alto): county public-record ingest → entity reconciliation with preserved
 provenance → publish to IPFS → query via DuckDB → explore through a UI and an
-agent. **Zero standing infrastructure cost** — static hosting + scale-to-zero
-compute + free IPFS pinning.
+agent. **Publicly reachable at a URL; no standing database, near-zero
+infrastructure cost.**
+
+**Anchored to `README.md`.** README.md is the acceptance contract — its
+acceptance-criteria list and its demo transcript. Everything below traces back to
+it, not to a derived plan: the demo video follows the transcript in order, and the
+six questions are the transcript's six questions, each shown with the exact
+"basis" / "Expected Result" the README asks for.
+
+## Demo video (two parts)
+
+- **Part 1 — UI + agent walkthrough** (run summary → DuckDB query layer → IPFS
+  artifacts → the six questions → the `/ask` agent):
+  https://www.loom.com/share/9c1d9201d089459089d29513cb1cf5f9
+- **Part 2 — MCP-ready, live** (an external agent — Claude Desktop — calls the
+  Oracle's MCP tools and queries the data):
+  https://www.loom.com/share/abaa2512057e41c0b72ba12fed4596af
 
 ## Live runtime (public, no login)
 
@@ -22,25 +37,35 @@ compute + free IPFS pinning.
    source constraints. Every number is generated from a live query, not authored.
 2. **DuckDB query layer** → **`/search`** — every filter composes into one
    client-side DuckDB-WASM query over the content-addressed Parquet (no backend DB).
-3. **IPFS artifacts** → **`/about`** — the dataset Parquet CID plus per-property
-   CIDs; all resolve on any public gateway (e.g. `https://ipfs.io/ipfs/<cid>`).
+3. **IPFS artifacts** → **`/about`** and **`/search`** — the dataset Parquet CID
+   plus all ~20,912 per-property CIDs. Open a record → **View source documents on
+   IPFS ↗** resolves that property's JSON by CID.
 4.–9. **The six questions** → `/search` presets: roofs > 15 yr, view of water,
    no ownership change > 10 yr, regional owners, within walking distance of
-   transit, within walking distance of Starbucks.
+   transit, within walking distance of Starbucks. Each shows a count, a labeled
+   basis note, and a concrete matching row.
 10. **Agent** → **`/ask`** — three compound prompts (roof + tenure; transit +
     regional owner; ranked review candidates). The agent writes and runs SQL,
     returns source-backed matches, and states its assumptions and coverage limits.
-11. **MCP-ready** → **`/about`** — drop-in config to point Claude Desktop / Cursor
-    at the public MCP and query the Oracle as a peer.
+11. **MCP-ready** → **`/about`** + **Part 2 video** — drop-in config to point
+    Claude Desktop / Cursor at the public MCP and query the Oracle as a peer.
 
-## Architecture — zero standing infrastructure cost
+## Architecture — near-zero infrastructure cost
 
 - **UI + query Parquet**: static on Netlify (CDN, HTTP range reads).
-- **IPFS**: the dataset Parquet + a per-property sample are pinned (Pinata) and
-  addressed by content hash (`property_cid`), resolvable on any gateway.
-- **Query**: DuckDB-WASM in the browser and DuckDB embedded in the MCP server
-  (Azure Container Apps, scale-to-zero capable) — no always-on database.
-- **Agent**: A2A endpoint (Google ADK), answering over the MCP query layer.
+- **IPFS**: the dataset Parquet + **all ~20,912 per-property JSONs** are pinned on
+  our **own kubo IPFS node** (Azure) and addressed by content hash (`property_cid`).
+  The app links to our own gateway for reliable direct serving; the CIDs are
+  standard and resolvable by any IPFS client. Free pinning services (Pinata /
+  Filebase) cap at ~500–1,000 objects, which is why we self-host the node.
+- **Query**: DuckDB-WASM in the browser and DuckDB embedded in the MCP server —
+  **no database at all**.
+- **Agent**: A2A endpoint (Google ADK + Azure GPT-5.4), answering over the MCP layer.
+- **The one bounded cost (disclosed)**: three small containers — MCP, agent, and
+  the kubo IPFS node — run on **free Azure credits**. The MCP + agent are
+  scale-to-zero capable (kept at one warm replica during the trial for demo
+  reliability); the IPFS node stays up because a gateway must serve. Nothing is
+  vendor-locked — the stack re-attaches to AWS / Cloud Run / any host by config.
 
 ## Data sources (Santa Clara County)
 
@@ -52,9 +77,10 @@ compute + free IPFS pinning.
 | Building permits | City of San Jose open data |
 | Businesses + contractors + transit / Starbucks / water POIs | OpenStreetMap |
 
-Reconciliation joins all sources on a normalized APN, and reconciles **owner
-entities** across parcels (owners deduped by mailing address → portfolio owners).
-Every served row carries `source_system` and `property_cid` provenance.
+Reconciliation joins all sources on a normalized APN (in Python/DuckDB over local
+files — no reconciliation database), and reconciles **owner entities** across
+parcels (owners deduped by mailing address → portfolio owners). Every served row
+carries `source_system` and `property_cid` provenance.
 
 ## Documented constraints (honest gaps)
 
@@ -97,15 +123,17 @@ Every served row carries `source_system` and `property_cid` provenance.
 }
 ```
 
-Then ask, e.g., *"Using the oracle tools, how many parcels are in Palo Alto?"* —
-the agent calls `queryProperties(county, sql)` against the live data.
+Then ask, e.g., *"Using the oracle tools, how many parcels are in Palo Alto,
+Santa Clara County?"* — the agent calls `queryProperties(county, sql)` against the
+live data. (Lee County, FL is included as the reference implementation; name Santa
+Clara or Palo Alto to query this deliverable's county.)
 
 ## Repository layout
 
 | Path | What |
 |---|---|
-| `ingest/santa-clara/` | ingest pipeline — harvest, merge/enrich, owner reconciliation, IPFS publish, run-summary generation |
+| `ingest/santa-clara/` | ingest pipeline — fetch, harvest, merge/enrich, owner reconciliation, IPFS publish, run-summary generation |
 | `agent/` | the A2A agent (+ `test_agent.py`, an end-to-end smoke test) |
 | `ui/` | the exploration UI (React + DuckDB-WASM) |
-| `deploy/mcp/` | the MCP server container |
+| `deploy/mcp/`, `deploy/ipfs/` | the MCP server + kubo IPFS node containers |
 | `.mcp.json` | MCP server configuration (environment-variable references only) |
