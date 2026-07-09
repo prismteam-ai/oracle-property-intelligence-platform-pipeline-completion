@@ -58,25 +58,43 @@ permit_count, has_sunbiz_tenant, has_bbb_contractor, hoa_flag.
 
 WHICH FIELDS ARE REAL DIFFERS BY COUNTY — this is critical for honesty:
 
-** santa-clara (default) ** — ingested from open Santa Clara County data.
-- REAL/populated: parcel_identifier, address_street/city/zip, latitude/longitude
-  (100%), lot_area_sqft, has_permits, permit_count, owner_name (SPARSE ~1.6%,
-  only where a San Jose permit carried an owner), plus extra cols last_permit_date
-  and last_reroof_date (sparse). source_system='scc_parcels', county_name='Santa
-  Clara', state_code='CA'. Full county scale ~495,188 distinct parcels.
-- NOT AVAILABLE (NULL — California locks the assessor roll behind a PAID offline
-  bulk order): property_type, property_usage_type, built_year, livable_floor_area,
-  all *_value columns, owner_count, owner_occupied, last_sale_date, last_sale_price,
-  subdivision, exterior_wall_material, roof_covering_material.
-- Therefore, for santa-clara:
-  * Distance/location questions (near transit, near Starbucks, within N metres) are
-    FULLY REAL — compute haversine from latitude/longitude. Answer them normally.
-  * Count / city / address / parcel questions are REAL.
-  * Roof-age, ownership-tenure, regional-owner, and value questions are NOT
-    answerable — the needed fields are NULL. Say exactly that: "that requires the
-    paid Santa Clara Assessor bulk file (owner/value/year-built/sales are not open
-    data in California)." NEVER fabricate a number. (A very sparse reroof-permit
-    signal exists via last_reroof_date but is too thin to answer roof age.)
+** santa-clara (default) ** — ingested from open SC data + a live harvest of the
+County Assessor's public per-parcel records + MTC/OSM. source_system='scc_parcels',
+county_name='Santa Clara', state_code='CA'. ~495,188 distinct parcels (whole county).
+It carries EXTRA enrichment columns beyond the shared 37 — use them:
+  regional_owner (BOOL), owner_mailing_city, owner_mailing_state, flood_zone,
+  dist_transit_m, dist_starbucks_m, dist_water_m (all precomputed metres).
+
+COVERAGE — two tiers, be honest about which:
+- COUNTY-WIDE (all ~495k parcels): parcel_identifier, address_*, latitude/longitude
+  (100%), lot_area_sqft, has_permits/permit_count, AND the precomputed distances
+  dist_transit_m / dist_starbucks_m / dist_water_m (real, from OSM + coordinates).
+- PALO ALTO enriched (~20.9k parcels, the flagship city; broader-county assessor
+  harvest is the documented scaled operation): built_year, last_sale_date,
+  assessed_value, land_value, owner_occupied, owner_mailing_city/state,
+  regional_owner, flood_zone. Outside Palo Alto these are mostly NULL — say so.
+
+Question mapping for santa-clara (all REAL now, no "deferred"):
+  * Roofs >15yr: built_year IS NOT NULL AND built_year < (year(current_date)-15).
+  * No ownership change >10yr: last_sale_date is an ISO 'YYYY-MM-DD' STRING here
+    (NOT the Lee JS-date format) — compare directly, e.g.
+    last_sale_date IS NOT NULL AND last_sale_date < strftime(current_date - INTERVAL 10 YEAR,'%Y-%m-%d').
+  * Regional owners: regional_owner = TRUE (owner mailing address is outside Santa
+    Clara County). ALWAYS cite owner_mailing_city + owner_mailing_state as evidence
+    (e.g. "owner in KIRKLAND, WA"). owner_name IS available but SPARSE (~1.6%,
+    7,735 parcels, from San Jose building-permit applicants) — cite it when
+    non-NULL (e.g. "owner LYNCH ROBERTA"). The SCC Assessor public lookup does NOT
+    publish owner name, so assessor-enriched parcels give owner LOCATION (mailing
+    city/state) without a name. Use whichever is present; never invent one.
+  * Near transit / Starbucks: dist_transit_m < 800 / dist_starbucks_m < 800 (metres,
+    precomputed). State the threshold.
+  * Water view: dist_water_m is distance to the nearest named water body (SF Bay
+    baylands, creeks, reservoirs). Use it as a labeled PROXIMITY PROXY for "water
+    view" (e.g. within 1500 m) and say it is proximity-based, not a verified view.
+  * Value questions: assessed_value, land_value (assessor).
+  * Count / city / address questions: REAL, county-wide.
+- owner_name is real but sparse (~1.6%, from permits) — present for some parcels,
+  NULL for most; last_sale_price is not published (NULL). Never fabricate either.
 
 ** lee ** — reference county, FULL field set. All questions answerable. Its quirks:
 - last_sale_date is a JavaScript Date STRING ('Fri Mar 27 1998 00:00:00 GMT...').
