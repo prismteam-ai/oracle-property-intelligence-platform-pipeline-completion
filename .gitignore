@@ -46,3 +46,27 @@ deploy/mcp/node_modules/
 # netlify CLI local link state
 .netlify/
 ui/.netlify/
+
+# Santa Clara working data (large / regenerable from ingest scripts) — never commit
+data/santa-clara/*.parquet
+data/santa-clara/ipfs-properties/
+data/santa-clara/assessor_harvest.csv
+data/santa-clara/osm/
+data/santa-clara/mtc_yearbuilt.json
+data/santa-clara/*.pdf
+
+# ── Pre-PR exclusions ──────────────────────────────────────────────
+# Internal playbook + Claude-specific kit — not part of the public deliverable
+CLAUDE.md
+.claude/
+# Pilot experiment (contains a local loader.env with DATABASE_URL)
+pilot/
+# Python virtualenv + node_modules (never commit build/runtime dirs)
+**/.venv/
+# Large / regenerable raw source data
+data/santa-clara/parcels-raw/
+data/santa-clara/*.csv
+# Debug screenshots + scratch notes + browser cache
+*.png
+tenure-preset.md
+.playwright-mcp/
