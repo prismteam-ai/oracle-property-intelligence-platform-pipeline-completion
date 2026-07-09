@@ -1,5 +1,6 @@
 import { Fragment } from 'react';
 import { IPFS_GATEWAY } from '../config';
+import type { CountyConfig } from '../counties';
 import type { QueryResult } from '../lib/duckdb';
 import Provenance, { ErrorBox, Spinner } from '../components/Provenance';
 import {
@@ -91,6 +92,8 @@ function DimControl({
   onChange,
   proxy,
   represents,
+  disabled,
+  disabledNote,
 }: {
   label: string;
   unit: string;
@@ -99,7 +102,35 @@ function DimControl({
   proxy?: boolean;
   /** Plain-text of what this dimension actually computes (esp. for proxies). */
   represents?: string;
+  /** When set, the dimension is unavailable for the active county. */
+  disabled?: boolean;
+  disabledNote?: string;
 }) {
+  if (disabled) {
+    return (
+      <div className="flex items-start justify-between gap-3 rounded border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
+        <span className="flex items-start gap-2 text-slate-400">
+          <input
+            type="checkbox"
+            disabled
+            aria-disabled="true"
+            className="mt-0.5 h-4 w-4 rounded border-slate-200"
+          />
+          <span>
+            {label}
+            {disabledNote && (
+              <span className="block text-[11px] leading-snug text-slate-400 mt-0.5">
+                {disabledNote}
+              </span>
+            )}
+          </span>
+        </span>
+        <span className="text-[10px] uppercase tracking-wide text-slate-400 shrink-0">
+          unavailable
+        </span>
+      </div>
+    );
+  }
   return (
     <div
       className={`flex items-start justify-between gap-3 rounded border px-3 py-2 text-sm ${
@@ -191,6 +222,7 @@ function DetailGrid({ detail }: { detail: QueryResult }) {
 // ---------- page ----------
 
 export default function Search({
+  county,
   filters,
   onFiltersChange,
   onSelectWater,
@@ -202,6 +234,7 @@ export default function Search({
   expanded,
   onToggleExpand,
 }: {
+  county: CountyConfig;
   filters: SearchFilters;
   onFiltersChange: (f: SearchFilters) => void;
   onSelectWater: () => void;
@@ -216,14 +249,14 @@ export default function Search({
   const res = results.result;
   const total = results.total ?? 0;
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const notes = activeNotes(filters);
-  const waterQ = question(WATER_QUESTION_ID);
+  const notes = activeNotes(county, filters);
+  const waterQ = question(county, WATER_QUESTION_ID);
 
   const setDim = (key: DimKey, v: DimFilter) =>
     onFiltersChange({ ...filters, [key]: v });
 
   // Generated SQL reflects the CURRENT filters + page, live.
-  const { pageSql } = buildSearchQuery(filters, page, PAGE_SIZE);
+  const { pageSql } = buildSearchQuery(county, filters, page, PAGE_SIZE);
 
   const cidIdx = res ? res.columns.indexOf('property_cid') : -1;
   const pidIdx = res ? res.columns.indexOf('parcel_identifier') : -1;
@@ -249,18 +282,35 @@ export default function Search({
           control AND-composes into a single distinct-parcel query.
         </p>
         <div className="flex flex-wrap gap-2 pt-1">
-          {PRESETS.map((p) => (
-            <button
-              key={p.id}
-              type="button"
-              onClick={() =>
-                p.water ? onSelectWater() : onFiltersChange(p.filters!)
-              }
-              className="text-sm border border-slate-300 rounded-full px-3 py-1 hover:bg-slate-100 text-slate-700"
-            >
-              {p.label}
-            </button>
-          ))}
+          {PRESETS.map((p) => {
+            const avail = !p.dim || county.dims[p.dim].enabled;
+            if (!avail) {
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  disabled
+                  aria-disabled="true"
+                  title={p.dim ? county.dims[p.dim].note : undefined}
+                  className="text-sm border border-slate-200 rounded-full px-3 py-1 text-slate-400 bg-slate-50 cursor-not-allowed line-through decoration-slate-300"
+                >
+                  {p.label}
+                </button>
+              );
+            }
+            return (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() =>
+                  p.water ? onSelectWater() : onFiltersChange(p.filters!)
+                }
+                className="text-sm border border-slate-300 rounded-full px-3 py-1 hover:bg-slate-100 text-slate-700"
+              >
+                {p.label}
+              </button>
+            );
+          })}
         </div>
       </section>
 
@@ -283,55 +333,68 @@ export default function Search({
           <TextField
             label="ZIP"
             value={filters.zip}
-            placeholder="e.g. 33904"
+            placeholder={county.hasAssessorFields ? 'e.g. 33904' : 'e.g. 94301'}
             onChange={(v) => onFiltersChange({ ...filters, zip: v })}
           />
-          <label className="flex flex-col gap-1 text-sm">
-            <span className="text-slate-600">Property type</span>
-            <select
-              value={filters.propertyType}
-              onChange={(e) =>
-                onFiltersChange({ ...filters, propertyType: e.target.value })
-              }
-              className="border border-slate-300 rounded px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-slate-400"
-            >
-              <option value="">Any type</option>
-              {propertyTypes.map((t) => (
-                <option key={t} value={t}>
-                  {t}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="grid grid-cols-2 gap-2">
-            <NumField
-              label="Built after"
-              value={filters.builtMin}
-              placeholder="1950"
-              onChange={(v) => onFiltersChange({ ...filters, builtMin: v })}
-            />
-            <NumField
-              label="Built before"
-              value={filters.builtMax}
-              placeholder="2010"
-              onChange={(v) => onFiltersChange({ ...filters, builtMax: v })}
-            />
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <NumField
-              label="Value ≥ ($)"
-              value={filters.valueMin}
-              placeholder="100000"
-              onChange={(v) => onFiltersChange({ ...filters, valueMin: v })}
-            />
-            <NumField
-              label="Value ≤ ($)"
-              value={filters.valueMax}
-              placeholder="500000"
-              onChange={(v) => onFiltersChange({ ...filters, valueMax: v })}
-            />
-          </div>
+          {county.hasAssessorFields && (
+            <>
+              <label className="flex flex-col gap-1 text-sm">
+                <span className="text-slate-600">Property type</span>
+                <select
+                  value={filters.propertyType}
+                  onChange={(e) =>
+                    onFiltersChange({ ...filters, propertyType: e.target.value })
+                  }
+                  className="border border-slate-300 rounded px-3 py-1.5 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-slate-400"
+                >
+                  <option value="">Any type</option>
+                  {propertyTypes.map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="grid grid-cols-2 gap-2">
+                <NumField
+                  label="Built after"
+                  value={filters.builtMin}
+                  placeholder="1950"
+                  onChange={(v) => onFiltersChange({ ...filters, builtMin: v })}
+                />
+                <NumField
+                  label="Built before"
+                  value={filters.builtMax}
+                  placeholder="2010"
+                  onChange={(v) => onFiltersChange({ ...filters, builtMax: v })}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <NumField
+                  label="Value ≥ ($)"
+                  value={filters.valueMin}
+                  placeholder="100000"
+                  onChange={(v) => onFiltersChange({ ...filters, valueMin: v })}
+                />
+                <NumField
+                  label="Value ≤ ($)"
+                  value={filters.valueMax}
+                  placeholder="500000"
+                  onChange={(v) => onFiltersChange({ ...filters, valueMax: v })}
+                />
+              </div>
+            </>
+          )}
         </div>
+        {!county.hasAssessorFields && (
+          <p className="text-xs text-slate-500 -mt-2">
+            Property type, build year and value filters are hidden for{' '}
+            {county.label}: those are assessor-derived columns and are 100% NULL
+            in v1 (a paid offline Assessor bulk order). City / street / ZIP
+            search over all {county.key === 'santa-clara' ? '495,231' : ''} real
+            parcels still applies.
+          </p>
+        )}
 
         {/* Dimension filters. */}
         <div>
@@ -345,7 +408,9 @@ export default function Search({
               value={filters.roof}
               onChange={(v) => setDim('roof', v)}
               proxy
-              represents="No roof data exists → stands in with building age ≥ N and no permit on record (roof presumed original)."
+              represents="built_year is REAL (County Assessor / MTC). A separate roof-install date isn't published, so structure age ≥ N years is the labeled roof-age proxy."
+              disabled={!county.dims.roof.enabled}
+              disabledNote={county.dims.roof.note}
             />
             <DimControl
               label="Not sold in ≥"
@@ -353,14 +418,17 @@ export default function Search({
               value={filters.tenure}
               onChange={(v) => setDim('tenure', v)}
               represents="Parcel's most recent recorded sale is older than N years (sentinel/placeholder dates excluded)."
+              disabled={!county.dims.tenure.enabled}
+              disabledNote={county.dims.tenure.note}
             />
             <DimControl
               label="Owner holds ≥"
               unit="parcels"
               value={filters.portfolio}
               onChange={(v) => setDim('portfolio', v)}
-              proxy
-              represents="No owner mailing address exists → 'regional owner' stands in with owners holding ≥ N parcels countywide."
+              represents="REAL: owner mailing address is harvested from the Assessor. This finds portfolio owners (owner_property_count ≥ N parcels); an out-of-county mailing address flags a regional owner."
+              disabled={!county.dims.portfolio.enabled}
+              disabledNote={county.dims.portfolio.note}
             />
             <DimControl
               label="Within transit"
@@ -368,7 +436,9 @@ export default function Search({
               value={filters.transit}
               onChange={(v) => setDim('transit', v)}
               proxy
-              represents="Real haversine distance from each parcel to a small SAMPLE set of transit hubs (full GTFS lands with county ingest)."
+              represents={`Real haversine distance from each parcel to ${county.transitLabel}.`}
+              disabled={!county.dims.transit.enabled}
+              disabledNote={county.dims.transit.note}
             />
             <DimControl
               label="Within Starbucks"
@@ -376,29 +446,20 @@ export default function Search({
               value={filters.starbucks}
               onChange={(v) => setDim('starbucks', v)}
               proxy
-              represents="Real haversine distance to a small SAMPLE set of Starbucks locations (full places data lands with county ingest)."
+              represents={`Real haversine distance to ${county.starbucksLabel}.`}
+              disabled={!county.dims.starbucks.enabled}
+              disabledNote={county.dims.starbucks.note}
             />
-            {/* Water view: never a query input — no data exists. */}
-            <div
-              className={`flex items-center justify-between gap-3 rounded border px-3 py-2 text-sm ${
-                waterSelected
-                  ? 'border-slate-400 bg-slate-100'
-                  : 'border-slate-200 bg-slate-50'
-              }`}
-            >
-              <span className="flex items-center gap-2 text-slate-400">
-                <input
-                  type="checkbox"
-                  disabled
-                  aria-disabled="true"
-                  className="h-4 w-4 rounded border-slate-200"
-                />
-                View of water
-              </span>
-              <span className="text-xs text-slate-400">
-                Not available — requires geo enrichment
-              </span>
-            </div>
+            <DimControl
+              label="Within water"
+              unit="metres"
+              value={filters.water}
+              onChange={(v) => setDim('water', v)}
+              proxy
+              represents="PROXY: precomputed haversine distance to the nearest named water body (SF Bay baylands, creeks, reservoirs). A labeled proximity stand-in for a water view — not a verified line-of-sight."
+              disabled={!county.dims.water.enabled}
+              disabledNote={county.dims.water.note}
+            />
           </div>
         </div>
       </section>
@@ -454,7 +515,7 @@ export default function Search({
             <ErrorBox message={results.error ?? 'Unknown error'} />
           )}
           {(results.status === 'loading' || results.status === 'idle') && (
-            <Spinner label="Composing SQL over 511k rows via HTTP range reads…" />
+            <Spinner label="Composing SQL over the parcel table via HTTP range reads…" />
           )}
 
           {results.status === 'done' && res && (
@@ -588,7 +649,7 @@ export default function Search({
                   </table>
                 </div>
               )}
-              <Provenance />
+              <Provenance countyLabel={county.label} />
             </div>
           )}
         </>

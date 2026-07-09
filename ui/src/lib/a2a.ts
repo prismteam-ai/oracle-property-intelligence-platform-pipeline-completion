@@ -124,10 +124,15 @@ function makeUuid(): string {
 export async function askOracle(
   question: string,
   contextId: string | null,
+  county?: string,
 ): Promise<AskResult> {
+  // The deployed agent accepts a leading "[county: <key>]" directive to pick
+  // which county to query (default santa-clara). Prepend it so the CUI follows
+  // the UI's active county selector.
+  const messageText = county ? `[county: ${county}] ${question}` : question;
   const message: Record<string, unknown> = {
     role: 'user',
-    parts: [{ kind: 'text', text: question }],
+    parts: [{ kind: 'text', text: messageText }],
     messageId: makeUuid(),
   };
   if (contextId) message.contextId = contextId;

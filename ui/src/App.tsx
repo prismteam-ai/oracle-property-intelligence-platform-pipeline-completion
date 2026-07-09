@@ -1,11 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { COUNTY_LABEL, TABLE } from './config';
+import {
+  COUNTIES,
+  CountyKey,
+  countyFromSearch,
+  DEFAULT_COUNTY_KEY,
+  getCounty,
+} from './counties';
 import {
   errorMessage,
   initDb,
   InitPhase,
   onPhaseChange,
   query,
+  setActiveParquet,
   sqlString,
 } from './lib/duckdb';
 import Dashboard, {
@@ -24,12 +31,14 @@ import {
 } from './searchQuery';
 import AskOracle, { ChatTurn } from './pages/AskOracle';
 import About from './pages/About';
+import RunSummary from './pages/RunSummary';
 import { askOracle } from './lib/a2a';
 
 // ---------- routing (path-based, no router dependency) ----------
 
 const ROUTES = [
   { path: '/', label: 'Dashboard' },
+  { path: '/run', label: 'Run Summary' },
   { path: '/search', label: 'Search' },
   { path: '/ask', label: 'Ask the Oracle' },
   { path: '/about', label: 'About' },
@@ -37,6 +46,11 @@ const ROUTES = [
 
 function normalizeRoute(pathname: string): string {
   return ROUTES.some((r) => r.path === pathname) ? pathname : '/';
+}
+
+/** Build the ?county= suffix (omitted for the default county). */
+function countySuffix(key: CountyKey): string {
+  return key === DEFAULT_COUNTY_KEY ? '' : `?county=${key}`;
 }
 
 // ---------- defensive result parsing ----------
@@ -60,6 +74,11 @@ function toNameCounts(rows: unknown[][]): NameCount[] {
 
 export default function App() {
   const [route, setRoute] = useState(() => normalizeRoute(location.pathname));
+  const [activeCountyKey, setActiveCountyKey] = useState<CountyKey>(() =>
+    countyFromSearch(location.search),
+  );
+  const county = getCounty(activeCountyKey);
+
   const [phase, setPhase] = useState<InitPhase>('idle');
   const [phaseDetail, setPhaseDetail] = useState<string>('');
 
@@ -79,6 +98,11 @@ export default function App() {
   const askContextId = useRef<string | null>(null);
   const askSeq = useRef(0);
 
+  // Search count is cached per full filter-set (not per page).
+  const lastCountKey = useRef<string | null>(null);
+  const lastTotal = useRef<number>(0);
+  const searchSeq = useRef(0);
+
   // -- engine init (once) --
   useEffect(() => {
     const off = onPhaseChange((p, detail) => {
@@ -91,17 +115,45 @@ export default function App() {
     return off;
   }, []);
 
+  // -- county switch: reset every county-scoped surface + repoint the
+  //    `properties` view (used by the agent-SQL re-run) at the new Parquet.
+  //    Runs on mount too (harmless: everything is already at its default).
+  useEffect(() => {
+    setDashboard({ status: 'idle' });
+    setFilters(baseFilters());
+    setPage(0);
+    setWaterSelected(false);
+    setSearchResults({ status: 'idle' });
+    setExpanded(null);
+    setPropertyTypes([]);
+    lastCountKey.current = null;
+    lastTotal.current = 0;
+    void setActiveParquet(county.parquetUrl);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCountyKey]);
+
+  const handleCountyChange = useCallback((key: CountyKey) => {
+    setActiveCountyKey(key);
+    history.replaceState(null, '', location.pathname + countySuffix(key));
+  }, []);
+
   // -- routing --
   useEffect(() => {
-    const onPop = () => setRoute(normalizeRoute(location.pathname));
+    const onPop = () => {
+      setRoute(normalizeRoute(location.pathname));
+      setActiveCountyKey(countyFromSearch(location.search));
+    };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
   }, []);
 
-  const navigate = useCallback((path: string) => {
-    history.pushState(null, '', path);
-    setRoute(normalizeRoute(path));
-  }, []);
+  const navigate = useCallback(
+    (path: string) => {
+      history.pushState(null, '', path + countySuffix(activeCountyKey));
+      setRoute(normalizeRoute(path));
+    },
+    [activeCountyKey],
+  );
 
   // -- dashboard data --
   const loadDashboard = useCallback(async () => {
@@ -109,7 +161,7 @@ export default function App() {
     try {
       // All dashboard stats count DISTINCT PARCELS (duplicate rows collapsed),
       // matching the unit used by Demo Questions and the agent.
-      const deduped = `(SELECT * FROM ${TABLE}
+      const deduped = `(SELECT * FROM ${county.table}
         QUALIFY row_number() OVER (PARTITION BY parcel_identifier ORDER BY property_id) = 1)`;
       const stats = await query(`
         SELECT COUNT(*) AS total,
@@ -147,7 +199,7 @@ export default function App() {
     } catch (err) {
       setDashboard({ status: 'error', error: errorMessage(err) });
     }
-  }, []);
+  }, [county.table]);
 
   useEffect(() => {
     if (phase === 'ready' && route === '/' && dashboard.status === 'idle') {
@@ -155,30 +207,34 @@ export default function App() {
     }
   }, [phase, route, dashboard.status, loadDashboard]);
 
-  // -- property-type options for the Search dropdown (loaded once) --
-  const loadedPropertyTypes = useRef(false);
+  // -- property-type options for the Search dropdown --
+  // Only counties with a populated property_type column (Lee). Santa Clara's is
+  // 100% NULL (paid Assessor field), so the dropdown is hidden and we skip.
   useEffect(() => {
-    if (phase !== 'ready' || loadedPropertyTypes.current) return;
-    loadedPropertyTypes.current = true;
+    if (phase !== 'ready') return;
+    if (!county.hasAssessorFields) {
+      setPropertyTypes([]);
+      return;
+    }
+    let alive = true;
     void (async () => {
       try {
         const r = await query(`
-          SELECT DISTINCT property_type FROM ${TABLE}
+          SELECT DISTINCT property_type FROM ${county.table}
           WHERE property_type IS NOT NULL AND property_type <> ''
           ORDER BY property_type`);
-        setPropertyTypes(r.rows.map((row) => String(row[0])));
+        if (alive) setPropertyTypes(r.rows.map((row) => String(row[0])));
       } catch {
-        loadedPropertyTypes.current = false; // allow a retry
+        /* leave empty; the dropdown just shows "Any type" */
       }
     })();
-  }, [phase]);
+    return () => {
+      alive = false;
+    };
+  }, [phase, activeCountyKey, county.hasAssessorFields, county.table]);
 
   // -- search (one composable query over the per-parcel base) --
-  // Count is cached per full filter-set (not per page); paging only re-reads rows.
   const queryKey = JSON.stringify(filters);
-  const lastCountKey = useRef<string | null>(null);
-  const lastTotal = useRef<number>(0);
-  const searchSeq = useRef(0);
 
   const runSearch = useCallback(
     async (f: SearchFilters, p: number, key: string) => {
@@ -186,7 +242,7 @@ export default function App() {
       setSearchResults((prev) => ({ ...prev, status: 'loading' }));
       setExpanded(null);
       try {
-        const { countSql, pageSql } = buildSearchQuery(f, p, PAGE_SIZE);
+        const { countSql, pageSql } = buildSearchQuery(county, f, p, PAGE_SIZE);
 
         let total = lastTotal.current;
         if (lastCountKey.current !== key) {
@@ -205,7 +261,7 @@ export default function App() {
         setSearchResults({ status: 'error', error: errorMessage(err) });
       }
     },
-    [],
+    [county],
   );
 
   // Debounced: refires on filter edits (reset to page 0) and on page changes.
@@ -218,7 +274,7 @@ export default function App() {
     );
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [phase, route, queryKey, page, waterSelected]);
+  }, [phase, route, queryKey, page, waterSelected, activeCountyKey]);
 
   const handleFiltersChange = useCallback((f: SearchFilters) => {
     setFilters(f);
@@ -241,7 +297,7 @@ export default function App() {
       setExpanded({ propertyId: parcelId, status: 'loading' });
       try {
         const detail = await query(
-          `SELECT * FROM ${TABLE} WHERE parcel_identifier = ${sqlString(parcelId)}
+          `SELECT * FROM ${county.table} WHERE parcel_identifier = ${sqlString(parcelId)}
            ORDER BY property_id LIMIT 1`,
         );
         setExpanded((prev) =>
@@ -257,13 +313,17 @@ export default function App() {
         );
       }
     },
-    [expanded],
+    [expanded, county.table],
   );
 
   // -- ask the oracle (A2A agent chat, session-only) --
   const runAsk = useCallback(async (id: number, question: string) => {
     try {
-      const res = await askOracle(question, askContextId.current);
+      const res = await askOracle(
+        question,
+        askContextId.current,
+        county.agentCounty,
+      );
       if (res.contextId) askContextId.current = res.contextId;
       setAskTurns((prev) =>
         prev.map((t) =>
@@ -293,7 +353,7 @@ export default function App() {
         ),
       );
     }
-  }, []);
+  }, [county.agentCounty]);
 
   const handleAsk = useCallback(
     (q: string) => {
@@ -327,10 +387,13 @@ export default function App() {
   const askBusy = askTurns.some((t) => t.status === 'loading');
 
   // -- render --
-  // /ask (A2A agent) and /about (static) don't touch DuckDB, so they never
-  // wait on the engine.
+  // /run, /ask (A2A agent) and /about (static) don't touch DuckDB, so they
+  // never wait on the engine.
   const engineNotReady =
-    phase !== 'ready' && route !== '/ask' && route !== '/about';
+    phase !== 'ready' &&
+    route !== '/ask' &&
+    route !== '/about' &&
+    route !== '/run';
 
   return (
     <div className="min-h-screen bg-slate-100 text-slate-900">
@@ -350,7 +413,7 @@ export default function App() {
               </h1>
             </a>
             <p className="text-xs text-slate-500">
-              {COUNTY_LABEL} ·{' '}
+              {county.label} ·{' '}
               <a
                 href="/about"
                 onClick={(e) => {
@@ -363,25 +426,42 @@ export default function App() {
               </a>
             </p>
           </div>
-          <nav className="flex gap-1">
-            {ROUTES.map((r) => (
-              <a
-                key={r.path}
-                href={r.path}
-                onClick={(e) => {
-                  e.preventDefault();
-                  navigate(r.path);
-                }}
-                className={`px-3 py-1.5 text-sm rounded ${
-                  route === r.path
-                    ? 'bg-slate-900 text-white'
-                    : 'text-slate-600 hover:bg-slate-100'
-                }`}
+          <div className="flex flex-wrap items-center gap-3">
+            <label className="flex items-center gap-2 text-xs text-slate-500">
+              <span className="hidden sm:inline">County</span>
+              <select
+                value={activeCountyKey}
+                onChange={(e) => handleCountyChange(e.target.value as CountyKey)}
+                className="border border-slate-300 rounded px-2.5 py-1.5 text-sm bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-400"
+                aria-label="Active county"
               >
-                {r.label}
-              </a>
-            ))}
-          </nav>
+                {Object.values(COUNTIES).map((c) => (
+                  <option key={c.key} value={c.key}>
+                    {c.selectorLabel}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <nav className="flex flex-wrap gap-1">
+              {ROUTES.map((r) => (
+                <a
+                  key={r.path}
+                  href={r.path}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    navigate(r.path);
+                  }}
+                  className={`px-3 py-1.5 text-sm rounded ${
+                    route === r.path
+                      ? 'bg-slate-900 text-white'
+                      : 'text-slate-600 hover:bg-slate-100'
+                  }`}
+                >
+                  {r.label}
+                </a>
+              ))}
+            </nav>
+          </div>
         </div>
       </header>
 
@@ -419,10 +499,16 @@ export default function App() {
         ) : (
           <>
             {route === '/' && (
-              <Dashboard state={dashboard} onRetry={() => void loadDashboard()} />
+              <Dashboard
+                state={dashboard}
+                onRetry={() => void loadDashboard()}
+                county={county}
+              />
             )}
+            {route === '/run' && <RunSummary />}
             {route === '/search' && (
               <Search
+                county={county}
                 filters={filters}
                 onFiltersChange={handleFiltersChange}
                 onSelectWater={handleSelectWater}
@@ -435,7 +521,7 @@ export default function App() {
                 onToggleExpand={(pid) => void handleToggleExpand(pid)}
               />
             )}
-            {route === '/about' && <About />}
+            {route === '/about' && <About county={county} />}
             {route === '/ask' && (
               <AskOracle
                 turns={askTurns}
@@ -451,7 +537,7 @@ export default function App() {
       </main>
 
       <footer className="max-w-6xl mx-auto px-4 pb-8 text-xs text-slate-400">
-        {COUNTY_LABEL} · zero standing infrastructure ·{' '}
+        {county.label} · zero standing infrastructure ·{' '}
         <a
           href="/about"
           onClick={(e) => {

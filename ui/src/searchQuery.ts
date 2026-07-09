@@ -1,34 +1,22 @@
 /**
- * Composable Search query layer.
+ * Composable Search query layer (county-aware).
  *
  * Search is one filter panel that AND-composes any number of optional filters
  * into a SINGLE DuckDB query. Every filter operates on a per-parcel base
  * (one row per parcel_identifier) so counts are always distinct-parcel and
  * filters never fight each other's row multiplicity.
  *
- * Correctness contract (verified against data/raw/lee-query-table.parquet):
- * with exactly one dimension filter active, the COUNT produced here equals the
- * standalone demo-question SQL in demoQuestions.ts for the same question:
- *   roof (N=15) = 198,582 · tenure (N=10) = 138,206 ·
- *   transit (N=800) = 4,095 · starbucks (N=800) = 3,696.
- * The parity relies on aggregating the MATCH itself (bool_or / min-distance),
- * not on a representative row — an any_value() representative loses parcels
- * whose duplicate rows disagree.
- *
- * Portfolio ("regional owners") is the one dimension whose headline is
- * intentionally a property count, not the demo card's owner count: a property
- * search returns properties, so it counts distinct parcels held by owners with
- * >= N parcels. See NOTE on the portfolio clause below.
+ * The active county (passed in) supplies the backing table fragment and the POI
+ * sets, so the same builder serves both Lee (full field set) and Santa Clara
+ * (real geo, paid assessor fields NULL). Correctness contract (verified against
+ * data/raw/lee-query-table.parquet for Lee): with exactly one dimension filter
+ * active, the COUNT produced here equals the standalone demo-question SQL for
+ * the same question. The parity relies on aggregating the MATCH itself
+ * (bool_or / min-distance), not on a representative row.
  */
-import { TABLE } from './config';
 import { sqlString } from './lib/duckdb';
-import {
-  DEMO_QUESTIONS,
-  DemoQuestion,
-  Poi,
-  STARBUCKS_POIS,
-  TRANSIT_POIS,
-} from './demoQuestions';
+import type { CountyConfig } from './counties';
+import { DemoQuestion, Poi } from './demoQuestions';
 
 // ---------- filter state (lifted in App.tsx, controlled by Search) ----------
 
@@ -52,9 +40,9 @@ export interface SearchFilters {
   roof: DimFilter; // roof age >= N years (proxy)
   tenure: DimFilter; // not sold in >= N years
   portfolio: DimFilter; // owner holds >= N parcels (regional-owner proxy)
-  transit: DimFilter; // within N metres of a sample transit POI
-  starbucks: DimFilter; // within N metres of a sample Starbucks POI
-  // Water view is a disabled control (no data) — never a query input.
+  transit: DimFilter; // within N metres of a transit POI
+  starbucks: DimFilter; // within N metres of a Starbucks POI
+  water: DimFilter; // within N metres of a named water body (proximity proxy)
 }
 
 /** Fresh default filter state (new nested objects each call — never share). */
@@ -73,6 +61,7 @@ export function baseFilters(): SearchFilters {
     portfolio: { on: false, n: 5 },
     transit: { on: false, n: 800 },
     starbucks: { on: false, n: 800 },
+    water: { on: false, n: 1500 },
   };
 }
 
@@ -93,13 +82,20 @@ export function isEmptyFilters(f: SearchFilters): boolean {
     !f.tenure.on &&
     !f.portfolio.on &&
     !f.transit.on &&
-    !f.starbucks.on
+    !f.starbucks.on &&
+    !f.water.on
   );
 }
 
-// ---------- dimension metadata (honesty labels come from demoQuestions) ------
+// ---------- dimension metadata (honesty labels come from the county) --------
 
-export type DimKey = 'roof' | 'tenure' | 'portfolio' | 'transit' | 'starbucks';
+export type DimKey =
+  | 'roof'
+  | 'tenure'
+  | 'portfolio'
+  | 'transit'
+  | 'starbucks'
+  | 'water';
 
 /** Map each adjustable dimension to its demo question (the honesty source). */
 export const DIM_QUESTION: Record<DimKey, string> = {
@@ -108,20 +104,28 @@ export const DIM_QUESTION: Record<DimKey, string> = {
   portfolio: 'regional-owners',
   transit: 'transit',
   starbucks: 'starbucks',
+  water: 'water-view',
 };
 
 export const WATER_QUESTION_ID = 'water-view';
 
-export function question(id: string): DemoQuestion | undefined {
-  return DEMO_QUESTIONS.find((q) => q.id === id);
+export function question(
+  county: CountyConfig,
+  id: string,
+): DemoQuestion | undefined {
+  if (id === WATER_QUESTION_ID) return county.water;
+  return county.demoQuestions.find((q) => q.id === id);
 }
 
 /** Honesty notes for every proxy/sample dimension currently active. */
-export function activeNotes(f: SearchFilters): DemoQuestion[] {
+export function activeNotes(
+  county: CountyConfig,
+  f: SearchFilters,
+): DemoQuestion[] {
   const out: DemoQuestion[] = [];
   (Object.keys(DIM_QUESTION) as DimKey[]).forEach((k) => {
     if (f[k].on) {
-      const q = question(DIM_QUESTION[k]);
+      const q = question(county, DIM_QUESTION[k]);
       if (q) out.push(q);
     }
   });
@@ -133,6 +137,8 @@ export function activeNotes(f: SearchFilters): DemoQuestion[] {
 export interface Preset {
   id: string;
   label: string;
+  /** The dimension this preset drives (used to gate availability per county). */
+  dim?: DimKey;
   /** Filter state this preset applies. Absent for the water-view preset. */
   filters?: SearchFilters;
   /** The water-view preset surfaces the deferred no-data note instead. */
@@ -140,20 +146,37 @@ export interface Preset {
 }
 
 export const PRESETS: Preset[] = [
-  { id: 'roof-age', label: 'Roofs > 15y', filters: withDim('roof', 15) },
-  { id: 'water-view', label: 'View of water', water: true },
+  { id: 'roof-age', label: 'Roofs > 15y', dim: 'roof', filters: withDim('roof', 15) },
+  {
+    id: 'water-view',
+    label: 'View of water',
+    dim: 'water',
+    filters: withDim('water', 1500),
+  },
   {
     id: 'ownership-tenure',
     label: 'No ownership change > 10y',
+    dim: 'tenure',
     filters: withDim('tenure', 10),
   },
-  { id: 'regional-owners', label: 'Regional owners', filters: withDim('portfolio', 5) },
+  {
+    id: 'regional-owners',
+    label: 'Regional owners',
+    dim: 'portfolio',
+    filters: withDim('portfolio', 5),
+  },
   {
     id: 'transit',
     label: 'Near public transportation',
+    dim: 'transit',
     filters: withDim('transit', 800),
   },
-  { id: 'starbucks', label: 'Near Starbucks', filters: withDim('starbucks', 800) },
+  {
+    id: 'starbucks',
+    label: 'Near Starbucks',
+    dim: 'starbucks',
+    filters: withDim('starbucks', 800),
+  },
 ];
 
 function withDim(key: DimKey, n: number): SearchFilters {
@@ -210,7 +233,7 @@ interface Core {
   where: string;
 }
 
-function buildCore(f: SearchFilters): Core {
+function buildCore(county: CountyConfig, f: SearchFilters): Core {
   // Per-parcel base. Display columns use any_value (a representative row);
   // owner_name uses max() so the portfolio filter is deterministic /
   // reproducible; filter-driving values (roof match, sale date, POI distance)
@@ -234,22 +257,48 @@ function buildCore(f: SearchFilters): Core {
 
   if (f.roof.on) {
     const n = clampInt(f.roof.n, 15);
-    aggs.push(
-      `bool_or(built_year>0 AND built_year<=year(current_date)-${n} ` +
-        `AND has_permits=FALSE ` +
-        `AND property_type IN ('Building','ManufacturedHome')) AS roof_match`,
-    );
+    if (county.key === 'santa-clara') {
+      // SC has real built_year but no property_type/permit-completeness — the
+      // roof proxy is simply structure age >= N years.
+      aggs.push(
+        `bool_or(built_year>0 AND built_year<=year(current_date)-${n}) AS roof_match`,
+      );
+    } else {
+      // Lee: building 15+ years old with no permit on record (roof presumed original).
+      aggs.push(
+        `bool_or(built_year>0 AND built_year<=year(current_date)-${n} ` +
+          `AND has_permits=FALSE ` +
+          `AND property_type IN ('Building','ManufacturedHome')) AS roof_match`,
+      );
+    }
     where.push('roof_match');
   }
   if (f.transit.on) {
     const n = clampInt(f.transit.n, 800);
-    aggs.push(`min(${nearestPoi(TRANSIT_POIS)}) AS transit_min_m`);
+    // SC uses the precomputed dist_transit_m (full 97-station OSM set, matches
+    // the agent); Lee has no such column and uses POI-list haversine.
+    aggs.push(
+      county.key === 'santa-clara'
+        ? `min(dist_transit_m) AS transit_min_m`
+        : `min(${nearestPoi(county.transitPois)}) AS transit_min_m`,
+    );
     where.push(`round(transit_min_m) <= ${n}`);
   }
   if (f.starbucks.on) {
     const n = clampInt(f.starbucks.n, 800);
-    aggs.push(`min(${nearestPoi(STARBUCKS_POIS)}) AS starbucks_min_m`);
+    aggs.push(
+      county.key === 'santa-clara'
+        ? `min(dist_starbucks_m) AS starbucks_min_m`
+        : `min(${nearestPoi(county.starbucksPois)}) AS starbucks_min_m`,
+    );
     where.push(`round(starbucks_min_m) <= ${n}`);
+  }
+  if (f.water.on) {
+    // Precomputed haversine metres to the nearest named water body (OSM) — a
+    // labeled proximity proxy for "view of water". Santa Clara only.
+    const n = clampInt(f.water.n, 1500);
+    aggs.push(`min(dist_water_m) AS water_min_m`);
+    where.push(`round(water_min_m) <= ${n}`);
   }
   if (f.tenure.on) {
     const n = clampInt(f.tenure.n, 10);
@@ -261,13 +310,19 @@ function buildCore(f: SearchFilters): Core {
   }
   if (f.portfolio.on) {
     const n = clampInt(f.portfolio.n, 5);
-    // NOTE: property count, not owner count — properties whose owner holds
-    // >= N distinct parcels countywide (the regional-owner proxy).
-    where.push(
-      `owner_name IN (SELECT owner_name FROM per_parcel ` +
-        `WHERE owner_name IS NOT NULL AND owner_name <> '' ` +
-        `GROUP BY owner_name HAVING count(*) >= ${n})`,
-    );
+    if (county.key === 'santa-clara') {
+      // Santa Clara: real reconciled portfolio size (owners deduped by mailing
+      // address across parcels) — parcels whose owner holds >= N properties.
+      aggs.push('any_value(owner_property_count) AS owner_property_count');
+      where.push(`owner_property_count >= ${n}`);
+    } else {
+      // Lee: no reconciled owner column — group by owner_name as a proxy.
+      where.push(
+        `owner_name IN (SELECT owner_name FROM per_parcel ` +
+          `WHERE owner_name IS NOT NULL AND owner_name <> '' ` +
+          `GROUP BY owner_name HAVING count(*) >= ${n})`,
+      );
+    }
   }
 
   // Plain real-column filters.
@@ -286,8 +341,14 @@ function buildCore(f: SearchFilters): Core {
   if (isNum(f.valueMax)) where.push(`market_value <= ${Number(f.valueMax)}`);
 
   const cte = `WITH rows AS (
-  SELECT *, try_strptime(substr(last_sale_date,1,15),'%a %b %d %Y') AS parsed_sale
-  FROM ${TABLE} WHERE parcel_identifier IS NOT NULL
+  SELECT *,
+         -- Santa Clara stores ISO 'YYYY-MM-DD'; Lee stores a JS date string.
+         -- Handle both so the tenure filter works for either county.
+         coalesce(
+           try_cast(last_sale_date AS DATE),
+           try_strptime(substr(last_sale_date,1,15),'%a %b %d %Y')
+         ) AS parsed_sale
+  FROM ${county.table} WHERE parcel_identifier IS NOT NULL
 ),
 per_parcel AS (
   SELECT parcel_identifier,
@@ -310,11 +371,12 @@ export interface QueryPlan {
 }
 
 export function buildSearchQuery(
+  county: CountyConfig,
   f: SearchFilters,
   page: number,
   pageSize: number,
 ): QueryPlan {
-  const { cte, where } = buildCore(f);
+  const { cte, where } = buildCore(county, f);
   const countSql = `${cte}\nSELECT count(*) FROM per_parcel\n${where}`.trimEnd();
   const pageSql = `${cte}
 SELECT parcel_identifier, address_street, address_city, address_zip,

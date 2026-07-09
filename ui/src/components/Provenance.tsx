@@ -1,23 +1,22 @@
-import { COUNTY_LABEL } from '../config';
-
 /**
  * Source attribution line -- provenance is the product, so every result
  * view renders one of these.
  */
 export default function Provenance({
   sourceSystems,
+  countyLabel,
 }: {
   sourceSystems?: string[];
+  countyLabel?: string;
 }) {
   const sources =
     sourceSystems && sourceSystems.length > 0
       ? sourceSystems.join(', ')
-      : 'lee_appraiser';
+      : 'county open data';
   return (
     <p className="text-xs text-slate-500">
       Source: <span className="font-mono text-slate-600">{sources}</span>
-      {' · '}
-      {COUNTY_LABEL}
+      {countyLabel ? ` · ${countyLabel}` : ''}
       {' · '}queried live from the content-addressed Parquet table
     </p>
   );

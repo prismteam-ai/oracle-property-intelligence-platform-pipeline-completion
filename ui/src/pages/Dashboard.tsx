@@ -1,4 +1,5 @@
-import { COUNTY_LABEL, IPFS_GATEWAY, QUERY_TABLE_URL } from '../config';
+import { IPFS_GATEWAY } from '../config';
+import type { CountyConfig } from '../counties';
 import Provenance, { ErrorBox, Spinner } from '../components/Provenance';
 
 export interface NameCount {
@@ -85,9 +86,11 @@ function BarList({ title, items }: { title: string; items: NameCount[] }) {
 export default function Dashboard({
   state,
   onRetry,
+  county,
 }: {
   state: DashboardState;
   onRetry: () => void;
+  county: CountyConfig;
 }) {
   if (state.status === 'loading' || state.status === 'idle') {
     return <Spinner label="Running dashboard queries against the remote Parquet table…" />;
@@ -119,7 +122,7 @@ export default function Dashboard({
     <div className="space-y-6">
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <StatCard
-          label={`Properties · ${COUNTY_LABEL}`}
+          label={`Properties · ${county.label}`}
           value={s.total.toLocaleString('en-US')}
           sub="distinct parcels"
         />
@@ -131,12 +134,20 @@ export default function Dashboard({
         <StatCard
           label="Known build year"
           value={pct(s.withBuiltYear, s.total)}
-          sub={`${s.withBuiltYear.toLocaleString('en-US')} parcels`}
+          sub={
+            county.hasAssessorFields
+              ? `${s.withBuiltYear.toLocaleString('en-US')} parcels`
+              : 'paid Assessor field — NULL in v1'
+          }
         />
         <StatCard
           label="Recorded last sale"
           value={pct(s.withSaleDate, s.total)}
-          sub={`${s.withSaleDate.toLocaleString('en-US')} parcels`}
+          sub={
+            county.hasAssessorFields
+              ? `${s.withSaleDate.toLocaleString('en-US')} parcels`
+              : 'paid Assessor/Recorder — NULL in v1'
+          }
         />
       </div>
 
@@ -173,9 +184,12 @@ export default function Dashboard({
           </p>
         )}
         <p className="text-xs text-slate-500 break-all">
-          Query table: <span className="font-mono">{QUERY_TABLE_URL}</span>
+          Query table: <span className="font-mono">{county.parquetUrl}</span>
         </p>
-        <Provenance sourceSystems={(state.sources ?? []).map((x) => x.name)} />
+        <Provenance
+          sourceSystems={(state.sources ?? []).map((x) => x.name)}
+          countyLabel={county.label}
+        />
       </div>
     </div>
   );

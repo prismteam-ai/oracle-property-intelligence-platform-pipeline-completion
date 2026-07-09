@@ -1,5 +1,8 @@
 import { AGENT_A2A_URL, IPFS_GATEWAY, MCP_URL } from '../config';
 import type { CountyConfig } from '../counties';
+import runSummary from '../data/santa-clara-run-summary.json';
+
+const CONSTRAINTS: string[] = (runSummary as { constraints?: string[] }).constraints ?? [];
 
 /**
  * Static reference page. No DuckDB engine required — App renders /about
@@ -13,17 +16,17 @@ import type { CountyConfig } from '../counties';
  */
 
 /**
- * Real, resolvable per-property CIDs pulled from the live query table
- * (SELECT property_cid … FROM the Lee query Parquet). Each resolves to the
- * consolidated source-document JSON for that parcel via any IPFS gateway.
- * Verified 200 OK via ipfs.io on 2026-07-08.
+ * The Santa Clara dataset artifact (the query-table Parquet) pinned to IPFS,
+ * plus real per-property CIDs from the pinned sample layer. Every one resolves
+ * to its consolidated source-document JSON via any public IPFS gateway.
+ * Pinned on Pinata; verified 200 OK via ipfs.io on 2026-07-09.
  */
+const DATASET_CID = 'QmPDpyaHnjWSHaoRJQpq7qBsZqRXgAGJvczRAJieg5MvJP';
 const SAMPLE_CIDS: { cid: string; label: string }[] = [
-  { cid: 'QmNLemwgTPCuGwDGkQD6Kzt63k1hwYNjaUgtX4QPdQbins', label: '10742 Cetrella Drive, Fort Myers (built 2014)' },
-  { cid: 'QmNLeqszZogAGzhGtK9774RwXYzH66hyNSSNnXXjs54y1u', label: '9572 Dunkirk Drive, Fort Myers (built 2001)' },
-  { cid: 'QmNLfC2agpNdCdb5szAM39CgbYDNU5dz3VJXk9oK9zbuAz', label: '2526 SE 16th Place #210, Cape Coral (built 1981)' },
-  { cid: 'QmNLfFo5G7YuySVg12DGSh7PxLzus9c5KoiPrsavoE5edQ', label: '39 Broadway Circle, Fort Myers (built 1963)' },
-  { cid: 'QmNLfPwxJVbHmniFAusEGDVHfhHMUou2Sv8HyCwj8aAowJ', label: '314 NW 9th Terrace, Cape Coral (built 2004)' },
+  { cid: 'QmQRrv9jv47QqREM3SmnoK6HQ692n1eox5cdLtXZiajv3j', label: '780 Palo Alto Ave, Palo Alto (built 1921)' },
+  { cid: 'QmW3HHxtbbVA4YbPt4cCAYZoffAJV6FicXEh9eyh2nq1Xh', label: '786 Palo Alto Ave, Palo Alto (built 1923)' },
+  { cid: 'QmWd6hNTWTRfbWRRxaBxe6PuQBc4hVAF2Gi7nYm5AAmuhb', label: '788 Palo Alto Ave, Palo Alto (built 1922)' },
+  { cid: 'Qmex1mTxDBAg277AL12ti4b39ryYW51eztW3SbC9JNxuhi', label: '253 Fulton St, Palo Alto (built 1906)' },
 ];
 
 function mcpRequest(agentCounty: string): string {
@@ -129,8 +132,21 @@ export default function About({ county }: { county: CountyConfig }) {
 
       <Section
         title="IPFS artifacts & content-addressing"
-        subtitle="Per-property source-document records are content-addressed on IPFS — addressed by their content hash (CID), not by a server location. Below are live, resolvable sample CIDs from the Lee reference county."
+        subtitle="Eligible dataset artifacts are content-addressed on IPFS — addressed by their content hash (CID), not a server location — and durably pinned (Pinata). Every CID below resolves on any public gateway."
       >
+        <div className="text-sm bg-slate-50 border border-slate-200 rounded px-3 py-2 mb-2">
+          <span className="font-medium text-slate-700">Dataset artifact — the full Santa Clara query-table Parquet on IPFS:</span>
+          <br />
+          <a
+            href={`${IPFS_GATEWAY}${DATASET_CID}`}
+            target="_blank"
+            rel="noreferrer"
+            className="font-mono text-xs text-slate-700 underline decoration-slate-300 hover:decoration-slate-600 break-all"
+          >
+            {DATASET_CID}
+          </a>
+        </div>
+        <p className="text-xs font-medium text-slate-600">Per-property source-document records (pinned sample):</p>
         <ul className="space-y-1.5">
           {SAMPLE_CIDS.map((s) => (
             <li key={s.cid} className="text-sm">
@@ -155,15 +171,32 @@ export default function About({ county }: { county: CountyConfig }) {
             <span className="font-mono">{IPFS_GATEWAY}</span>).
           </p>
           <p>
-            The columnar <span className="font-medium text-slate-700">query-table Parquet</span> itself
-            is <span className="font-medium">CDN-hosted</span> (Netlify) for fast HTTP range-reads by
-            DuckDB — it is <span className="font-medium">not</span> claimed to be on IPFS. The Parquet
-            is the query index; the CIDs are the verifiable provenance layer.
+            The columnar <span className="font-medium text-slate-700">query-table Parquet</span> is
+            both <span className="font-medium">pinned to IPFS</span> (the dataset CID above, resolvable
+            on any gateway) <span className="font-medium">and</span> CDN-mirrored (Netlify) so DuckDB
+            gets fast HTTP range-reads at query time. IPFS is the durable, content-addressed source of
+            truth; the CDN is a performance mirror of the same bytes.
           </p>
           <p className="break-all">
             Active query table: <span className="font-mono">{county.parquetUrl}</span>
           </p>
         </div>
+      </Section>
+
+      <Section
+        title="Documented source constraints & honest gaps"
+        subtitle="The real limitations of the Santa Clara ingest — what is paid, reCAPTCHA-gated, single-city, or a labeled proxy. Nothing here is fabricated; gaps are named, not hidden."
+      >
+        <ul className="space-y-2">
+          {CONSTRAINTS.map((c, i) => (
+            <li
+              key={i}
+              className="text-sm text-amber-900 bg-amber-50 border border-amber-200 rounded px-3 py-2"
+            >
+              {c}
+            </li>
+          ))}
+        </ul>
       </Section>
 
       <Section

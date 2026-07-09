@@ -16,7 +16,7 @@ import duckdb_wasm from '@duckdb/duckdb-wasm/dist/duckdb-mvp.wasm?url';
 import mvp_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-mvp.worker.js?url';
 import duckdb_wasm_eh from '@duckdb/duckdb-wasm/dist/duckdb-eh.wasm?url';
 import eh_worker from '@duckdb/duckdb-wasm/dist/duckdb-browser-eh.worker.js?url';
-import { QUERY_TABLE_URL } from '../config';
+import { SANTA_CLARA_PARQUET_URL } from '../config';
 
 export interface QueryResult {
   columns: string[];
@@ -42,6 +42,12 @@ const MANUAL_BUNDLES: duckdb.DuckDBBundles = {
 let initPromise: Promise<duckdb.AsyncDuckDBConnection> | null = null;
 let phaseListeners: PhaseListener[] = [];
 let currentPhase: InitPhase = 'idle';
+
+// The Parquet the `properties` view points at. Defaults to Santa Clara (the
+// primary county); switched at runtime by setActiveParquet when the user
+// changes counties, so the agent's `FROM properties` SQL re-runs against the
+// active county's data in the browser.
+let activeParquetUrl = SANTA_CLARA_PARQUET_URL;
 
 function setPhase(phase: InitPhase, detail?: string) {
   currentPhase = phase;
@@ -69,14 +75,28 @@ async function doInit(): Promise<duckdb.AsyncDuckDBConnection> {
   await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
   setPhase('connecting', 'Opening connection');
   const conn = await db.connect();
-  // Register a `properties` view over the remote Parquet so the agent's SQL
-  // (which says `FROM properties`) runs verbatim in-browser. CREATE VIEW is
-  // lazy — it stores the definition and triggers no fetch until first query.
+  // Register a `properties` view over the active county's remote Parquet so the
+  // agent's SQL (which says `FROM properties`) runs verbatim in-browser. CREATE
+  // VIEW is lazy — it stores the definition and triggers no fetch until first
+  // query.
   await conn.query(
-    `CREATE OR REPLACE VIEW properties AS SELECT * FROM read_parquet('${QUERY_TABLE_URL}')`,
+    `CREATE OR REPLACE VIEW properties AS SELECT * FROM read_parquet('${activeParquetUrl}')`,
   );
   setPhase('ready');
   return conn;
+}
+
+/**
+ * Point the `properties` view at a different county's Parquet. Safe to call
+ * before the engine is ready (it awaits init). Recreating the view is cheap and
+ * lazy — no fetch happens until the next query references `properties`.
+ */
+export async function setActiveParquet(url: string): Promise<void> {
+  activeParquetUrl = url;
+  const conn = await initDb();
+  await conn.query(
+    `CREATE OR REPLACE VIEW properties AS SELECT * FROM read_parquet('${url}')`,
+  );
 }
 
 /** Initialize the engine once; safe to call from anywhere, any number of times. */

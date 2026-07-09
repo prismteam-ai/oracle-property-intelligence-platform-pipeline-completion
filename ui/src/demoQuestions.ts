@@ -1,13 +1,18 @@
 /**
- * The six assignment questions as saved queries.
+ * Demo-question building blocks (county-agnostic).
+ *
+ * The concrete per-county question sets are assembled in `counties.ts`, which
+ * supplies the backing table fragment and POI sets. This module only defines
+ * the shared types and the SQL helpers so the two surfaces that consume a
+ * question (the Search honesty labels and the standalone question cards) can
+ * never drift from the underlying math.
  *
  * Honesty rule: every question is graded against the columns that actually
- * exist in the query table (verified via DESCRIBE against the live parquet).
+ * exist in the active county's query table.
  * - 'supported'  -- answerable directly from real columns
  * - 'partial'    -- answerable via a clearly-labeled proxy or sample POI set
  * - 'deferred'   -- the schema genuinely cannot answer it yet; no fake results
  */
-import { TABLE } from './config';
 import { sqlString } from './lib/duckdb';
 
 export type QuestionStatus = 'supported' | 'partial' | 'deferred';
@@ -28,9 +33,9 @@ export interface DemoQuestion {
 
 /**
  * A point of interest with approximate coordinates. Shared as the single
- * source of truth for the sample POI sets used by BOTH the demo-question SQL
- * below AND the composable Search filters (ui/src/searchQuery.ts), so the two
- * surfaces can never drift apart.
+ * source of truth for the POI sets used by BOTH the demo-question SQL AND the
+ * composable Search filters (ui/src/searchQuery.ts), so the two surfaces can
+ * never drift apart.
  */
 export interface Poi {
   name: string;
@@ -47,10 +52,11 @@ export function poisToValues(pois: Poi[]): string {
 
 /**
  * Haversine distance in meters, with a cheap bounding-box prefilter
- * (0.008 deg lat / 0.009 deg lon ~ 890 m at 26.5 N) so we do not compute
- * trigonometry for all 511k rows x every POI.
+ * (~0.008 deg lat / 0.009 deg lon) so we do not compute trigonometry for every
+ * row x every POI. `table` is the caller's read_parquet(...) fragment.
  */
-function poiProximitySql(
+export function poiProximitySql(
+  table: string,
   pois: Poi[],
   radiusMeters: number,
 ): { summary: string; rows: string } {
@@ -66,7 +72,7 @@ near AS (
            cos(radians(p.plat)) * cos(radians(t.latitude)) *
            pow(sin(radians(t.longitude - p.plon) / 2), 2)
          ))) AS distance_m
-  FROM ${TABLE} t, pois p
+  FROM ${table} t, pois p
   WHERE t.latitude  BETWEEN p.plat - 0.0080 AND p.plat + 0.0080
     AND t.longitude BETWEEN p.plon - 0.0090 AND p.plon + 0.0090
 )`;
@@ -83,171 +89,3 @@ ORDER BY distance_m
 LIMIT 25`,
   };
 }
-
-// Sample POI sets -- approximate coordinates, v1 placeholder.
-// Full POI data (GTFS transit stops, places API) lands with the Santa Clara ingest.
-export const TRANSIT_POIS: Poi[] = [
-  { name: 'Rosa Parks Transportation Center, Fort Myers', lat: 26.6444, lon: -81.871 },
-  { name: 'Edison Mall transfer point, Fort Myers', lat: 26.5983, lon: -81.8709 },
-  { name: 'Cape Coral Transfer Center (SE 47th Terr)', lat: 26.5624, lon: -81.9497 },
-  { name: 'Beach Park & Ride, Summerlin Square', lat: 26.4547, lon: -81.9494 },
-  { name: 'Lehigh Acres transfer point (Homestead Rd)', lat: 26.6079, lon: -81.6448 },
-];
-
-export const STARBUCKS_POIS: Poi[] = [
-  { name: 'Starbucks - First St, Downtown Fort Myers', lat: 26.6414, lon: -81.8687 },
-  { name: 'Starbucks - Cleveland Ave (US-41), Fort Myers', lat: 26.5987, lon: -81.872 },
-  { name: 'Starbucks - Santa Barbara Blvd, Cape Coral', lat: 26.6249, lon: -81.974 },
-  { name: 'Starbucks - Coconut Point, Estero', lat: 26.4022, lon: -81.8065 },
-  { name: 'Starbucks - Gulf Coast Town Center', lat: 26.4859, lon: -81.7859 },
-  { name: 'Starbucks - Bonita Beach Rd, Bonita Springs', lat: 26.3312, lon: -81.8069 },
-];
-
-const transit = poiProximitySql(TRANSIT_POIS, 800);
-const starbucks = poiProximitySql(STARBUCKS_POIS, 800);
-
-export const DEMO_QUESTIONS: DemoQuestion[] = [
-  {
-    id: 'roof-age',
-    title: 'A. Roofs older than 15 years',
-    question: 'Which properties have roofs older than 15 years?',
-    status: 'partial',
-    dataBasis:
-      'The schema has a roof_covering_material column but it is 100% NULL in ' +
-      'this extract, and there is no roof-install date. Proxy used: structure ' +
-      'built 15+ years ago with no permit on record (has_permits = FALSE), so ' +
-      'the roof is presumed original. Direct roof-age answers land with the ' +
-      'permit/enrichment phase.',
-    summaryLabel:
-      'properties (distinct parcels) with a presumed-original roof aged 15+ years',
-    summarySql: `SELECT COUNT(DISTINCT parcel_identifier)
-FROM ${TABLE}
-WHERE built_year IS NOT NULL AND built_year > 0
-  AND built_year <= year(current_date) - 15
-  AND has_permits = FALSE
-  AND property_type IN ('Building', 'ManufacturedHome')`,
-    rowsSql: `SELECT parcel_identifier, address_street, address_city, built_year,
-       year(current_date) - built_year AS structure_age_years,
-       property_type, has_permits, source_system
-FROM ${TABLE}
-WHERE built_year IS NOT NULL AND built_year > 0
-  AND built_year <= year(current_date) - 15
-  AND has_permits = FALSE
-  AND property_type IN ('Building', 'ManufacturedHome')
-QUALIFY row_number() OVER (PARTITION BY parcel_identifier ORDER BY property_id) = 1
-ORDER BY built_year
-LIMIT 25`,
-  },
-  {
-    id: 'water-view',
-    title: 'B. View of water',
-    question: 'Which properties have a view of water?',
-    status: 'deferred',
-    dataBasis:
-      'Requires geo enrichment - lands with the county data phase. None of the ' +
-      '37 columns encode view, waterfront, or water frontage. Latitude/longitude ' +
-      'are fully populated (511,695 rows), so once water-body geometry (NHD / ' +
-      'county GIS shoreline) is ingested this becomes a straightforward spatial ' +
-      'join. No results are shown because none can honestly be computed yet.',
-  },
-  {
-    id: 'ownership-tenure',
-    title: 'C. No ownership change in 10+ years',
-    question: 'Which properties have not changed ownership in more than 10 years?',
-    status: 'supported',
-    dataBasis:
-      'Computed from last_sale_date, taking the most recent recorded sale per ' +
-      'parcel. Placeholder dates (1900-01-01 and earlier) are source-record ' +
-      'sentinels, not real sales, so those parcels are treated as "no recorded ' +
-      'sale" and excluded rather than counted as ~126-year tenure. Rows with no ' +
-      'parseable sale are likewise excluded — tenure cannot be verified for them. ' +
-      'Counted by distinct parcel (duplicate rows collapsed).',
-    summaryLabel:
-      'parcels whose most recent recorded sale is over 10 years ago',
-    summarySql: `SELECT COUNT(*) FROM (
-  SELECT parcel_identifier,
-         MAX(try_strptime(substr(last_sale_date, 1, 15), '%a %b %d %Y')) AS latest_sale
-  FROM ${TABLE}
-  WHERE parcel_identifier IS NOT NULL
-  GROUP BY parcel_identifier
-  HAVING latest_sale IS NOT NULL
-     AND latest_sale >= DATE '1902-01-01'
-     AND latest_sale < current_date - INTERVAL 10 YEAR
-)`,
-    rowsSql: `SELECT t.parcel_identifier, any_value(t.address_street) AS address_street,
-       any_value(t.address_city) AS address_city,
-       strftime(MAX(try_strptime(substr(t.last_sale_date, 1, 15), '%a %b %d %Y')),
-                '%Y-%m-%d') AS latest_sale,
-       any_value(t.owner_name) AS owner_name,
-       any_value(t.source_system) AS source_system
-FROM ${TABLE} t
-WHERE t.parcel_identifier IS NOT NULL
-GROUP BY t.parcel_identifier
-HAVING MAX(try_strptime(substr(t.last_sale_date, 1, 15), '%a %b %d %Y')) >= DATE '1902-01-01'
-   AND MAX(try_strptime(substr(t.last_sale_date, 1, 15), '%a %b %d %Y'))
-       < current_date - INTERVAL 10 YEAR
-ORDER BY latest_sale
-LIMIT 25`,
-  },
-  {
-    id: 'regional-owners',
-    title: 'D. Regional owners',
-    question: 'Which properties are held by regional owners?',
-    status: 'partial',
-    dataBasis:
-      'This extract has owner_name / owners_text / owner_occupied but no owner ' +
-      'mailing address, so in-region vs out-of-region cannot be determined ' +
-      'directly. Proxy used: portfolio owners holding 5+ parcels in the county ' +
-      '(3,820 such owners exist). True regional classification lands with ' +
-      'owner-address enrichment.',
-    summaryLabel: 'owners holding 5+ parcels in the county',
-    summarySql: `SELECT COUNT(*) FROM (
-  SELECT owner_name
-  FROM ${TABLE}
-  WHERE owner_name IS NOT NULL AND owner_name <> ''
-  GROUP BY owner_name
-  HAVING COUNT(*) >= 5
-)`,
-    rowsSql: `SELECT owner_name,
-       COUNT(*) AS parcels_held,
-       COUNT(DISTINCT address_city) AS cities,
-       COUNT(*) FILTER (owner_occupied) AS owner_occupied_parcels,
-       any_value(source_system) AS source_system
-FROM ${TABLE}
-WHERE owner_name IS NOT NULL AND owner_name <> ''
-GROUP BY owner_name
-HAVING COUNT(*) >= 5
-ORDER BY parcels_held DESC
-LIMIT 25`,
-  },
-  {
-    id: 'transit',
-    title: 'E. Walking distance to public transportation',
-    question:
-      'Which properties are within walking distance (~800 m) of public transportation?',
-    status: 'partial',
-    dataBasis:
-      'Latitude/longitude are populated for all 511,695 rows, so the distance ' +
-      'math (haversine) is real. The transit locations are a SAMPLE POI SET: 5 ' +
-      'approximate LeeTran hub/transfer coordinates hardcoded for v1. The full ' +
-      'GTFS stop network lands with the Santa Clara ingest, at which point this ' +
-      'query only swaps its POI table.',
-    summaryLabel: 'properties within 800 m of a sample transit hub',
-    summarySql: transit.summary,
-    rowsSql: transit.rows,
-  },
-  {
-    id: 'starbucks',
-    title: 'F. Walking distance to Starbucks',
-    question: 'Which properties are within walking distance (~800 m) of a Starbucks?',
-    status: 'partial',
-    dataBasis:
-      'Same basis as the transit question: real per-property coordinates, ' +
-      'haversine distance, but against a SAMPLE POI SET of 6 approximate ' +
-      'Starbucks locations in the county. Full place data lands with the Santa ' +
-      'Clara ingest.',
-    summaryLabel: 'properties within 800 m of a sample Starbucks location',
-    summarySql: starbucks.summary,
-    rowsSql: starbucks.rows,
-  },
-];
