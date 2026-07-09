@@ -16,7 +16,7 @@ QUESTION = (
     sys.argv[1]
     if len(sys.argv) > 1
     else "How many properties are in the dataset, and how many have coordinates? "
-    "Then show me 3 properties in Cape Coral with their provenance CIDs."
+    "Then show me 3 properties in Palo Alto with their provenance CIDs."
 )
 
 
