@@ -542,7 +542,7 @@ export default function AskOracle({
                 }
               }}
               rows={2}
-              placeholder="e.g. How many properties in Cape Coral were built before 1980?"
+              placeholder="e.g. How many properties in Palo Alto were built before 1980?"
               className="flex-1 border border-slate-300 rounded px-3 py-2 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-slate-400"
             />
             <button

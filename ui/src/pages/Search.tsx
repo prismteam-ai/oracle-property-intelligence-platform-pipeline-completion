@@ -321,7 +321,7 @@ export default function Search({
           <TextField
             label="City"
             value={filters.city}
-            placeholder="e.g. Cape Coral"
+            placeholder="e.g. Palo Alto"
             onChange={(v) => onFiltersChange({ ...filters, city: v })}
           />
           <TextField

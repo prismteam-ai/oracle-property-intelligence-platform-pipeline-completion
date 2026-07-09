@@ -481,7 +481,10 @@ export const COUNTIES: Record<CountyKey, CountyConfig> = {
   lee: LEE,
 };
 
-export const COUNTY_KEYS: CountyKey[] = ['santa-clara', 'lee'];
+// Santa Clara only — the deliverable county. Lee's config stays below as the
+// build-time reference, but it is NOT served by the public product (the MCP is
+// Santa-Clara-only, so a Lee selection in the UI would have no queryable backend).
+export const COUNTY_KEYS: CountyKey[] = ['santa-clara'];
 
 export const DEFAULT_COUNTY_KEY: CountyKey = 'santa-clara';
 
@@ -492,7 +495,8 @@ export function isCountyKey(v: string | null): v is CountyKey {
 /** Resolve the active county key from a URL search string (?county=…). */
 export function countyFromSearch(search: string): CountyKey {
   const v = new URLSearchParams(search).get('county');
-  return isCountyKey(v) ? v : DEFAULT_COUNTY_KEY;
+  // Only honor counties the product actually serves (clamps a stray ?county=lee).
+  return isCountyKey(v) && COUNTY_KEYS.includes(v) ? v : DEFAULT_COUNTY_KEY;
 }
 
 export function getCounty(key: CountyKey): CountyConfig {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   COUNTIES,
+  COUNTY_KEYS,
   CountyKey,
   countyFromSearch,
   DEFAULT_COUNTY_KEY,
@@ -429,21 +430,23 @@ export default function App() {
             </p>
           </div>
           <div className="flex flex-wrap items-center gap-3">
-            <label className="flex items-center gap-2 text-xs text-slate-500">
-              <span className="hidden sm:inline">County</span>
-              <select
-                value={activeCountyKey}
-                onChange={(e) => handleCountyChange(e.target.value as CountyKey)}
-                className="border border-slate-300 rounded px-2.5 py-1.5 text-sm bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-400"
-                aria-label="Active county"
-              >
-                {Object.values(COUNTIES).map((c) => (
-                  <option key={c.key} value={c.key}>
-                    {c.selectorLabel}
-                  </option>
-                ))}
-              </select>
-            </label>
+            {COUNTY_KEYS.length > 1 && (
+              <label className="flex items-center gap-2 text-xs text-slate-500">
+                <span className="hidden sm:inline">County</span>
+                <select
+                  value={activeCountyKey}
+                  onChange={(e) => handleCountyChange(e.target.value as CountyKey)}
+                  className="border border-slate-300 rounded px-2.5 py-1.5 text-sm bg-white text-slate-800 focus:outline-none focus:ring-2 focus:ring-slate-400"
+                  aria-label="Active county"
+                >
+                  {COUNTY_KEYS.map((k) => (
+                    <option key={k} value={k}>
+                      {COUNTIES[k].selectorLabel}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <nav className="flex flex-wrap gap-1">
               {ROUTES.map((r) => (
                 <a

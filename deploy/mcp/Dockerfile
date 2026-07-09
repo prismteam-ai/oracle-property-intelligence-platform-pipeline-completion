@@ -13,15 +13,14 @@ RUN npm install
 
 # Cache-bust marker — bump this string to force a fresh parquet re-download
 # (otherwise Docker reuses the cached curl layer and serves a stale dataset).
-RUN echo "parquet-rev: 2026-07-09-owner-reconciliation"
+RUN echo "parquet-rev: 2026-07-10-santa-clara-only"
 
-# Bake BOTH counties' parquets into the image so queries never touch the
-# network. santa-clara = the correct county (Palo Alto); lee = reference.
+# Bake ONLY the Santa Clara parquet — the deliverable county (contains Palo Alto).
+# Lee (the reference implementation) is intentionally NOT served by the public MCP,
+# so an external agent's county-less question can't fall back to the wrong county.
 RUN curl -fSL --retry 3 -o santa-clara.parquet \
       https://oracle-parquet-host.netlify.app/santa-clara-query-table.parquet \
-    && curl -fSL --retry 3 -o lee.parquet \
-      https://oracle-parquet-host.netlify.app/lee-query-table.parquet \
-    && ls -lh santa-clara.parquet lee.parquet
+    && ls -lh santa-clara.parquet
 
 ENV PORT=8787
 EXPOSE 8787

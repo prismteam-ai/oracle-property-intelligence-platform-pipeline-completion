@@ -13,8 +13,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 
 // county key -> local parquet filename (downloaded at build time)
 const COUNTIES = {
-  "santa-clara": "santa-clara.parquet", // the correct county (contains Palo Alto)
-  lee: "lee.parquet", // reference county (full assessor field set)
+  "santa-clara": "santa-clara.parquet", // the deliverable county (contains Palo Alto) — the ONLY county the public MCP serves
 };
 
 const map = {};
