@@ -385,7 +385,11 @@ SELECT parcel_identifier, address_street, address_city, address_zip,
        source_system, property_cid, latitude, longitude
 FROM per_parcel
 ${where}
-ORDER BY address_city NULLS LAST, address_street NULLS LAST, parcel_identifier
+-- Float records that carry a property_cid to the top so any row a user opens
+-- immediately shows its IPFS source-document reference (Santa Clara: only the
+-- CID-pinned Palo Alto core has one; Lee: all rows have one, so this is a no-op).
+ORDER BY (property_cid IS NOT NULL AND property_cid <> '') DESC,
+         address_city NULLS LAST, address_street NULLS LAST, parcel_identifier
 LIMIT ${pageSize} OFFSET ${page * pageSize}`;
   return { countSql, pageSql };
 }
