@@ -17,11 +17,12 @@ const CONSTRAINTS: string[] = (runSummary as { constraints?: string[] }).constra
 
 /**
  * The Santa Clara dataset artifact (the query-table Parquet) pinned to IPFS,
- * plus real per-property CIDs from the pinned sample layer. Every one resolves
- * to its consolidated source-document JSON via any public IPFS gateway.
- * Pinned on Pinata; verified 200 OK via ipfs.io on 2026-07-09.
+ * plus real per-property CIDs. Every one resolves to its consolidated
+ * source-document JSON. Pinned on our own kubo node (Azure Container Apps),
+ * which serves all ~20.9k property CIDs + the dataset parquet; verified 200 OK
+ * on 2026-07-09.
  */
-const DATASET_CID = 'QmPDpyaHnjWSHaoRJQpq7qBsZqRXgAGJvczRAJieg5MvJP';
+const DATASET_CID = 'QmfMHvisxa2xgpW88WeahvZnmpbUhqMh8B2FqzaRZCrGqT';
 const SAMPLE_CIDS: { cid: string; label: string }[] = [
   { cid: 'QmQRrv9jv47QqREM3SmnoK6HQ692n1eox5cdLtXZiajv3j', label: '780 Palo Alto Ave, Palo Alto (built 1921)' },
   { cid: 'QmW3HHxtbbVA4YbPt4cCAYZoffAJV6FicXEh9eyh2nq1Xh', label: '786 Palo Alto Ave, Palo Alto (built 1923)' },

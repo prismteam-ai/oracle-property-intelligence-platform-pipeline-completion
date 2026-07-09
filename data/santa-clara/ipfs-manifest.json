@@ -1,0 +1,11 @@
+{
+  "county": "santa-clara",
+  "dataset_parquet_cid": "QmfMHvisxa2xgpW88WeahvZnmpbUhqMh8B2FqzaRZCrGqT",
+  "properties_root_cid": "QmRjJNWwxLef6LTQ6DKiUtXBEbYv5NG7hLQFjV7sW7c93F",
+  "property_count": 20912,
+  "sample_property": {
+    "apn": "00302051",
+    "cid": "QmNsTWDTcSXnzGB4gUBYznNQGoDTgWNZKGCzYEV7W1Cvcn"
+  },
+  "note": "Real IPFS CIDv0 (UnixFS DAG-PB). Durable pin keeps them online; content-addressing guarantees the same CID on any node."
+}

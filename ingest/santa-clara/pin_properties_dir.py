@@ -18,14 +18,18 @@ JWT = next((l.split("=", 1)[1].strip()
             if l.startswith("PINATA_JWT=")), None)
 EXPECTED = sys.argv[1] if len(sys.argv) > 1 else None
 
-# Free tier caps total pinned files at 500, so the per-property JSON is a pinned
-# SAMPLE layer (the full county dataset is pinned as the Parquet artifact).
-SAMPLE = 450
+# Pinata free tier is storage-based (1 GB), NOT a 500-file cap (verified 2026-07-09:
+# pin_count exceeded 500 without error). The full ~20.9k property set is ~82 MB, so
+# every property_cid is pinned and resolvable as one recursive folder pin.
+LIMIT = int(sys.argv[2]) if len(sys.argv) > 2 else None  # optional cap for testing
+paths = sorted(PROPDIR.rglob("*.json"))
+if LIMIT:
+    paths = paths[:LIMIT]
 files = []
-for p in sorted(PROPDIR.rglob("*.json"))[:SAMPLE]:
+for p in paths:
     rel = p.relative_to(PROPDIR.parent)  # ipfs-properties/<shard>/<apn>.json
     files.append(("file", (str(rel), p.read_bytes(), "application/json")))
-print(f"uploading {len(files)} sample property files as one folder pin...", flush=True)
+print(f"uploading {len(files)} property files as one folder pin...", flush=True)
 
 r = requests.post(
     "https://api.pinata.cloud/pinning/pinFileToIPFS",
@@ -33,7 +37,7 @@ r = requests.post(
     files=files,
     data={"pinataMetadata": json.dumps({"name": "santa-clara-properties"}),
           "pinataOptions": json.dumps({"cidVersion": 0})},
-    timeout=600,
+    timeout=1800,
 )
 print("HTTP", r.status_code, flush=True)
 try:

@@ -26,7 +26,12 @@ export const LEE_PARQUET_URL: string =
   import.meta.env.VITE_LEE_QUERY_TABLE_URL ||
   'https://oracle-parquet-host.netlify.app/lee-query-table.parquet';
 
-export const IPFS_GATEWAY = 'https://ipfs.io/ipfs/';
+// Our own kubo IPFS node on Azure Container Apps — pins & serves all ~20.9k
+// per-property JSONs plus the dataset parquet by CID. The CIDs are standard
+// IPFS content addresses (public gateways resolve them too); we use our node
+// for reliable, cap-free coverage.
+export const IPFS_GATEWAY =
+  'https://oracle-ipfs.whitewave-2a3d27b9.eastus2.azurecontainerapps.io/ipfs/';
 
 /** Base URL of the Oracle agent's A2A endpoint (JSON-RPC + agent card). */
 export const AGENT_A2A_URL: string =
