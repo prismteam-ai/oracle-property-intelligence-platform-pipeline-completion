@@ -123,10 +123,10 @@ carries `source_system` and `property_cid` provenance.
 }
 ```
 
-Then ask, e.g., *"Using the oracle tools, how many parcels are in Palo Alto,
-Santa Clara County?"* — the agent calls `queryProperties(county, sql)` against the
-live data. (Lee County, FL is included as the reference implementation; name Santa
-Clara or Palo Alto to query this deliverable's county.)
+Then ask, e.g., *"Using the oracle tools, how many parcels are in Palo Alto?"* —
+the agent calls `queryProperties(county, sql)` against the live data. The public
+MCP serves **Santa Clara County only** (the deliverable county); Lee, FL was the
+build-time reference implementation and is not exposed.
 
 ## Repository layout
 
