@@ -68,7 +68,7 @@ def main():
         "ipfs": {
             "dataset_parquet_cid": manifest.get("dataset_parquet_cid"),
             "properties_sample_root_cid": manifest.get("properties_root_cid"),
-            "pinning_service": "Pinata (durable) + local kubo (real CIDv0)",
+            "pinning_service": "Own kubo IPFS node on Azure Container Apps — all ~20,912 property CIDs + dataset Parquet, real CIDv0",
         },
         "sources": [
             {"name": "scc_parcels", "url": "https://data.sccgov.org/resource/ubcd-cewv.geojson",
@@ -101,7 +101,7 @@ def main():
             "Permits cover the City of San Jose only; other city portals offer no bulk export (constrained sources).",
             "Business/contractor records are from OpenStreetMap; CA SOS bizfile and CSLB bulk data are paid/constrained, so OSM is the free, honest substitute.",
             "'View of water' is a labeled PROXIMITY proxy (distance to nearest named water body), not a verified line-of-sight view.",
-            "IPFS: the full dataset Parquet is pinned + resolvable; per-property JSON is a pinned sample layer (Pinata free tier caps pins) — the full county lives in the pinned Parquet artifact.",
+            "IPFS: all ~20,912 per-property JSONs and the dataset Parquet are pinned on our own kubo node (Azure Container Apps) and resolve on any public gateway (e.g. ipfs.io). Free pinning tiers (Pinata/Filebase) cap at ~500-1,000 objects, so the node is a small always-on service — the one bounded cost in an otherwise zero-standing-cost design.",
         ],
     }
 

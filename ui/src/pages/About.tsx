@@ -323,6 +323,13 @@ export default function About({ county }: { county: CountyConfig }) {
             today; equally AWS Fargate / Lambda, Cloud Run, Fly).
           </li>
           <li>
+            The IPFS pinning node is a third container (kubo) — the one{' '}
+            <span className="font-medium">always-on</span> piece, since a gateway
+            must stay up to serve. It replaces a paid pinning service (free tiers
+            cap at ~500–1,000 objects); on Azure Container Apps today, equally any
+            container host.
+          </li>
+          <li>
             DuckDB reads the Parquet directly; IPFS artifacts resolve through any
             gateway. Swapping counties is pure config (Parquet URL + county
             label).
