@@ -12,8 +12,9 @@ Design notes:
   * lat/lon come from the parcel MultiPolygon centroid (no lat/lon field exists).
   * lot_area_sqft uses `shape_area_stateplane` -- verified against reprojected ground
     area (UTM 10N) to be the real square footage; the `shape_area` field is NOT sqft.
-  * property_cid is a genuine IPFS CIDv0 (sha2-256 multihash, base58btc) of the
-    parcel's canonical consolidated JSON -- a real content address before any pin.
+  * property_cid here is a PLACEHOLDER content-hash. The real, gateway-resolvable
+    IPFS CIDs (UnixFS/DAG-PB) are produced later by publish_ipfs.py via a kubo
+    node and pinned; this base value is overwritten there.
   * Assessor-only fields (owner counts, values, year built, sales) are left NULL --
     honest gaps; that data is a paid offline bulk order.
 """
@@ -50,7 +51,13 @@ def norm_apn(v):
 
 
 def cidv0(obj: dict) -> str:
-    """Real IPFS CIDv0: base58btc(0x12 0x20 sha256(canonical_json))."""
+    """Placeholder content-hash: base58btc(0x12 0x20 sha256(canonical_json)).
+
+    NOTE: this is NOT the CID a gateway resolves -- IPFS wraps content in a
+    UnixFS/DAG-PB block and hashes that. The real, gateway-resolvable
+    property_cid is computed in publish_ipfs.py via `ipfs add` (kubo) and
+    overwrites this base value.
+    """
     payload = json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = hashlib.sha256(payload).digest()
     multihash = bytes([0x12, 0x20]) + digest  # sha2-256, 32 bytes
