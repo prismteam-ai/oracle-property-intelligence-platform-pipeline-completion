@@ -26,12 +26,13 @@ export const LEE_PARQUET_URL: string =
   import.meta.env.VITE_LEE_QUERY_TABLE_URL ||
   'https://oracle-parquet-host.netlify.app/lee-query-table.parquet';
 
-// Our own kubo IPFS node on Azure Container Apps — pins & serves all ~20.9k
-// per-property JSONs plus the dataset parquet by CID. The CIDs are standard
-// IPFS content addresses (public gateways resolve them too); we use our node
-// for reliable, cap-free coverage.
-export const IPFS_GATEWAY =
-  'https://oracle-ipfs.whitewave-2a3d27b9.eastus2.azurecontainerapps.io/ipfs/';
+// The app links to the public ipfs.io gateway — standard, recognizable IPFS
+// retrieval. Content availability is guaranteed by our own kubo PINNING NODE on
+// Azure Container Apps (see deploy/ipfs), which provides all ~20.9k per-property
+// CIDs + the dataset parquet to the IPFS network. That node replaces a paid
+// pinning service (Pinata/Filebase free tiers cap at ~500-1000 objects); because
+// it provides to the DHT, ipfs.io (and any public gateway) resolves the CIDs.
+export const IPFS_GATEWAY = 'https://ipfs.io/ipfs/';
 
 /** Base URL of the Oracle agent's A2A endpoint (JSON-RPC + agent card). */
 export const AGENT_A2A_URL: string =
