@@ -133,7 +133,7 @@ export default function About({ county }: { county: CountyConfig }) {
 
       <Section
         title="IPFS artifacts & content-addressing"
-        subtitle="Eligible dataset artifacts are content-addressed on IPFS — addressed by their content hash (CID), not a server location — and pinned by our own kubo IPFS node. Every CID below is a standard IPFS CIDv0 that resolves on any public gateway (e.g. ipfs.io)."
+        subtitle="Eligible dataset artifacts are content-addressed on IPFS — addressed by their content hash (CID), not a server location — and pinned + served by our own kubo IPFS node. Every CID below is a standard IPFS CIDv0 — content-addressed and portable, resolvable by any IPFS client."
       >
         <div className="text-sm bg-slate-50 border border-slate-200 rounded px-3 py-2 mb-2">
           <span className="font-medium text-slate-700">Dataset artifact — the full Santa Clara query-table Parquet on IPFS:</span>
@@ -170,15 +170,16 @@ export default function About({ county }: { county: CountyConfig }) {
             IPFS and referenced by <code className="font-mono">property_cid</code>.
             They are pinned by our own <span className="font-medium">kubo IPFS node</span>{' '}
             (Azure Container Apps), which replaces a paid pinning service — free
-            tiers (Pinata, Filebase) cap at ~500–1,000 objects. Because that node
-            provides to the IPFS DHT, these standard CIDs resolve on{' '}
-            <span className="font-medium">any public gateway</span>; the links above
-            use <span className="font-mono">{IPFS_GATEWAY}</span>.
+            tiers (Pinata, Filebase) cap at ~500–1,000 objects. The links above use
+            our own gateway (<span className="font-mono">{IPFS_GATEWAY}</span>) for
+            reliable, direct in-browser serving — the public <code className="font-mono">ipfs.io</code>{' '}
+            gateway now bounces browsers to a service-worker gateway that can be
+            flaky, though these standard CIDs stay resolvable by any IPFS client.
           </p>
           <p>
             The columnar <span className="font-medium text-slate-700">query-table Parquet</span> is
-            both <span className="font-medium">pinned to IPFS</span> (the dataset CID above, resolvable
-            on any gateway) <span className="font-medium">and</span> CDN-mirrored (Netlify) so DuckDB
+            both <span className="font-medium">pinned to IPFS</span> (the dataset CID above)
+            <span className="font-medium"> and</span> CDN-mirrored (Netlify) so DuckDB
             gets fast HTTP range-reads at query time. IPFS is the durable, content-addressed source of
             truth; the CDN is a performance mirror of the same bytes.
           </p>
