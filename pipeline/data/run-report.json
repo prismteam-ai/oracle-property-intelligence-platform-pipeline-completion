@@ -1,0 +1,152 @@
+{
+  "generatedAt": "2026-07-10T13:28:47.832Z",
+  "county": "Santa Clara County, CA",
+  "focus": "Palo Alto",
+  "bbox": [
+    37.35,
+    -122.22,
+    37.48,
+    -122.08
+  ],
+  "grandTotalRecords": 73939,
+  "runs": [
+    {
+      "connector": "scc-parcels",
+      "source": "Santa Clara County Parcels (data.sccgov.org)",
+      "entity": "property",
+      "count": 20933,
+      "sourceUrl": "https://data.sccgov.org/resource/ubcd-cewv.json?%24limit=5000&%24offset=20000&%24order=%3Aid&%24where=situs_city_name%3D%27PALO+ALTO%27",
+      "startedAt": "2026-07-10T13:28:14.065Z",
+      "finishedAt": "2026-07-10T13:28:15.251Z",
+      "notes": []
+    },
+    {
+      "connector": "pa-permits-2013-01_2015-05",
+      "source": "City of Palo Alto Development Center Permits (data.paloalto.gov)",
+      "entity": "permit",
+      "count": 9639,
+      "sourceUrl": "https://data.paloalto.gov/rest/datastreams/296815/data.csv/",
+      "startedAt": "2026-07-10T13:28:15.253Z",
+      "finishedAt": "2026-07-10T13:28:21.087Z",
+      "notes": []
+    },
+    {
+      "connector": "pa-permits-2015-06_2017-11",
+      "source": "City of Palo Alto Development Center Permits (data.paloalto.gov)",
+      "entity": "permit",
+      "count": 9824,
+      "sourceUrl": "https://data.paloalto.gov/rest/datastreams/296813/data.csv/",
+      "startedAt": "2026-07-10T13:28:21.087Z",
+      "finishedAt": "2026-07-10T13:28:26.243Z",
+      "notes": []
+    },
+    {
+      "connector": "pa-permits-2017-12_2020-04",
+      "source": "City of Palo Alto Development Center Permits (data.paloalto.gov)",
+      "entity": "permit",
+      "count": 9386,
+      "sourceUrl": "https://data.paloalto.gov/rest/datastreams/296812/data.csv/",
+      "startedAt": "2026-07-10T13:28:26.243Z",
+      "finishedAt": "2026-07-10T13:28:32.001Z",
+      "notes": []
+    },
+    {
+      "connector": "pa-permits-2020-05_2022-11",
+      "source": "City of Palo Alto Development Center Permits (data.paloalto.gov)",
+      "entity": "permit",
+      "count": 9759,
+      "sourceUrl": "https://data.paloalto.gov/rest/datastreams/296811/data.csv/",
+      "startedAt": "2026-07-10T13:28:32.002Z",
+      "finishedAt": "2026-07-10T13:28:37.957Z",
+      "notes": []
+    },
+    {
+      "connector": "pa-permits-2022-12_2025-02",
+      "source": "City of Palo Alto Development Center Permits (data.paloalto.gov)",
+      "entity": "permit",
+      "count": 9793,
+      "sourceUrl": "https://data.paloalto.gov/rest/datastreams/296814/data.csv/",
+      "startedAt": "2026-07-10T13:28:37.957Z",
+      "finishedAt": "2026-07-10T13:28:44.219Z",
+      "notes": []
+    },
+    {
+      "connector": "pa-permits-2025-03_2026-07",
+      "source": "City of Palo Alto Development Center Permits (data.paloalto.gov)",
+      "entity": "permit",
+      "count": 5858,
+      "sourceUrl": "https://data.paloalto.gov/rest/datastreams/297909/data.csv/",
+      "startedAt": "2026-07-10T13:28:44.220Z",
+      "finishedAt": "2026-07-10T13:28:47.761Z",
+      "notes": []
+    },
+    {
+      "connector": "osm-transit",
+      "source": "OpenStreetMap (Overpass API)",
+      "entity": "poi",
+      "count": 739,
+      "sourceUrl": "https://overpass-api.de/api/interpreter",
+      "startedAt": "2026-07-10T13:28:47.761Z",
+      "finishedAt": "2026-07-10T13:28:47.789Z",
+      "notes": []
+    },
+    {
+      "connector": "osm-starbucks",
+      "source": "OpenStreetMap (Overpass API)",
+      "entity": "poi",
+      "count": 21,
+      "sourceUrl": "https://overpass-api.de/api/interpreter",
+      "startedAt": "2026-07-10T13:28:47.789Z",
+      "finishedAt": "2026-07-10T13:28:47.794Z",
+      "notes": []
+    },
+    {
+      "connector": "osm-water",
+      "source": "OpenStreetMap (Overpass API)",
+      "entity": "poi",
+      "count": 110,
+      "sourceUrl": "https://overpass-api.de/api/interpreter",
+      "startedAt": "2026-07-10T13:28:47.794Z",
+      "finishedAt": "2026-07-10T13:28:47.800Z",
+      "notes": []
+    }
+  ],
+  "dbTotals": [
+    {
+      "entity": "permit",
+      "source": "City of Palo Alto Development Center Permits (data.paloalto.gov)",
+      "records": 52157
+    },
+    {
+      "entity": "poi",
+      "source": "OpenStreetMap (Overpass API)",
+      "records": 870
+    },
+    {
+      "entity": "property",
+      "source": "Santa Clara County Parcels (data.sccgov.org)",
+      "records": 20912
+    }
+  ],
+  "constraints": [
+    {
+      "source": "City of Palo Alto Development Center Permits (Junar)",
+      "status": "resolved-workaround",
+      "detail": "catalog advertises host api.data.paloalto.gov which is dead (NXDOMAIN); worked around by using the live portal export at data.paloalto.gov/rest/datastreams/<id>/data.csv/ (numeric ids browser-discovered). Permit history 2013-2026 ingested.",
+      "affects": [
+        "roof age (Q1)"
+      ],
+      "catalog": "https://data.paloalto.gov/data.json"
+    },
+    {
+      "source": "SCC Assessor bulk / commercial parcel data",
+      "status": "not-open-data",
+      "detail": "owner name, owner mailing address, last sale date, and year built are not available as free open data for Santa Clara County; requires paid SCC Assessor bulk order or a commercial aggregator (Regrid/ATTOM). Owner names are additionally restricted by CA law.",
+      "affects": [
+        "regional owner (Q3)",
+        "no sale in 10yr (Q4)",
+        "roof age fallback via year_built (Q1)"
+      ]
+    }
+  ]
+}

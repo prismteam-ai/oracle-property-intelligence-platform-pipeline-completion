@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/oracle.duckdb
+data/oracle.duckdb.wal
+data/staging/
+data/raw/
+*.log
+data/export/
+.env
+.env.local

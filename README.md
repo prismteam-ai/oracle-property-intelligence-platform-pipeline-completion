@@ -1,78 +1,154 @@
-# Oracle Property Intelligence Platform Pipeline Completion
+# Oracle Property Intelligence — Palo Alto
 
-## Context
+Property-intelligence over **real** Santa Clara County / Palo Alto public data,
+with **no ongoing hosted-database cost**: the dataset is published to public
+**IPFS** and queried on demand by a **DuckDB** engine — in the browser (UI), in
+an agent, and over **MCP**.
 
-The Oracle ingestion pipeline has been started, but the full dataset has not been completely uploaded, reconciled, or demonstrated. The infrastructure must be designed so Oracle does not carry ongoing infrastructure cost by default. For this candidate, they are acting as both the Oracle and the builder, so they are responsible for completing the pipeline and proving the infrastructure approach.
+> The original assignment brief is preserved in [`ASSIGNMENT.md`](./ASSIGNMENT.md).
 
-## Description
+```
+Sources ──▶ Ingest (DuckDB) ──▶ Transform ──▶ IPFS (Filebase) ──▶ Query
+ SCC parcels    raw_records         one row/         Parquet,         UI · Agent · MCP
+ PA permits     + provenance        property         no hosted DB     (DuckDB-WASM / httpfs)
+ OSM POIs
+```
 
-Complete the Oracle pipeline by loading all available county property, permit, ownership, business, contractor, location, and public-source data into an MCP-ready database, using IPFS and DuckDB to minimize Oracle-hosted infrastructure costs while enabling UI and agent access to answer property intelligence questions.
+## What's inside
 
-## Acceptance Criteria
-- Run the Oracle pipeline until all available county data is uploaded.
-- Confirm the pipeline covers the county that includes Palo Alto, CA.
-- Load available property records into the database.
-- Load available permit records into the database.
-- Load available ownership records into the database.
-- Load available contractor records into the database.
-- Load available business records into the database.
-- Load available location and coordinate data into the database.
-- Reconcile duplicate entities across all uploaded datasets.
-- Preserve source provenance for uploaded records.
-- Optimize pipeline performance where feasible.
-- Identify slow source sites or constrained contractor data sources.
-- Document pipeline speed limitations and source constraints.
-- Design the infrastructure so Oracle does not carry ongoing infrastructure cost by default.
-- Use IPFS for decentralized storage of eligible dataset artifacts.
-- Use DuckDB for local or portable analytical querying.
-- Structure the database to support MCP access.
-- Enable agent access to query the database.
-- Provide a UI for exploring the uploaded data.
-- Support questions about properties with roofs older than 15 years.
-- Support questions about properties with a view of water.
-- Support questions about properties that have not exchanged ownership in more than 10 years.
-- Support questions about properties with regional owners.
-- Support questions about properties within walking distance of public transportation using property coordinates.
-- Support questions about properties within walking distance of Starbucks using property coordinates.
-- Return source-backed answers where source data is available.
-- Demonstrate the uploaded dataset through the UI.
-- Demonstrate the uploaded dataset through an agent query.
-- Demonstrate that Oracle can operate without carrying the infrastructure cost.
-- Confirm the candidate fulfilled both Oracle and builder responsibilities for this milestone.
-- Pass the demo using real uploaded county records.
+| Piece | Where | What it does |
+|---|---|---|
+| Ingestion pipeline | `pipeline/` | Connectors → DuckDB `raw_records` with provenance |
+| Transform | `pipeline/src/transforms` | Reconcile on APN, compute the 6-question signals, one row per property |
+| Publish | `pipeline/src/publish` | Export Parquet, pin to IPFS (Filebase), write `manifest.json` |
+| MCP server | `pipeline/src/mcp` | `queryProperties` over the IPFS Parquet — see [`MCP.md`](./MCP.md) |
+| Web app | `web/` | Next.js UI: run summary, the 6 questions on a map, agent, IPFS artifacts |
 
-## Demo Transcript
-- Presenter: “I will demonstrate that the Oracle pipeline has loaded the full available dataset for the county that includes Palo Alto, that the data is queryable through DuckDB, that eligible artifacts are stored through IPFS, and that both the UI and agent can answer property intelligence questions.”
-- Presenter: “First, I am opening the pipeline run summary.”
-  - Expected Result: The system displays the completed pipeline run, source list, record counts, timestamps, and any documented source limitations.
-- Presenter: “Show the total uploaded records by source.”
-  - Expected Result: The system shows uploaded property, permit, ownership, contractor, business, and coordinate records with collection timestamps and provenance.
-- Presenter: “Now I am opening the DuckDB-backed query layer.”
-  - Expected Result: The system confirms that the loaded data is available for structured querying without requiring Oracle-hosted database infrastructure.
-- Presenter: “Show the IPFS artifacts created for the uploaded datasets.”
-  - Expected Result: The system displays IPFS references or content identifiers for eligible dataset artifacts.
-- Presenter: “Now I am using the UI to search for properties with roofs older than 15 years.”
-  - Expected Result: The UI returns matching properties, supporting permit or property evidence, and source provenance where available.
-- Presenter: “Show properties with a view of water.”
-  - Expected Result: The UI returns properties identified using available location, parcel, or geographic indicators and explains the source basis.
-- Presenter: “Show properties that have not exchanged ownership in more than 10 years.”
-  - Expected Result: The system returns properties with ownership history showing no recorded exchange within the last 10 years.
-- Presenter: “Show properties with regional owners.”
-  - Expected Result: The system returns properties where owner location or ownership metadata indicates a regional owner.
-- Presenter: “Show properties within walking distance of public transportation.”
-  - Expected Result: The system uses property coordinates to return properties near public transportation and shows the distance calculation basis.
-- Presenter: “Show properties within walking distance of Starbucks.”
-  - Expected Result: The system uses property coordinates and nearby place data to return properties near Starbucks locations and shows the distance calculation basis.
-- Presenter: “Now I am asking the same type of questions through the agent.”
-  - Agent Prompt: “Which properties have roofs older than 15 years and have not exchanged ownership in more than 10 years?”
-    - Expected Result: The agent returns matching properties, explains the reasoning, and includes source-backed evidence.
-  - Agent Prompt: “Which properties are near public transportation and also have regional owners?”
-    - Expected Result: The agent returns matching properties with coordinate-based distance logic and ownership evidence.
-  - Agent Prompt: “Which properties appear to be strong candidates for further review based on ownership age, roof age, and location signals?”
-    - Expected Result: The agent returns a ranked or filtered list using available data and clearly identifies any assumptions or missing data.
-- Presenter: “Finally, I will show that the system is MCP-ready.”
-  - Expected Result: The system demonstrates an MCP-ready interface or documented MCP-compatible query structure that agents can use without changing the data model.
+Live dataset (public IPFS, verified):
+`properties.parquet` → `https://ipfs.filebase.io/ipfs/QmYa6qQA4VNY2HZzt25ABHMziaZeTz128Y476cF3iAUtF6`
+(20,912 properties · 52,157 permits · 870 POIs — see [`manifest.json`](./manifest.json)).
 
-## Reference
-- [Soofi XYZ Team Kit](https://github.com/soofi-xyz/soofi-xyz-team-kit)
-- [Elephant Oracle Skills](https://github.com/elephant-xyz/skills)
+## The six questions & data honesty
+
+Free open data answers four questions directly. Two are constrained by California
+law (owner/sale data is not free open data — R&T Code §408), so rather than fake
+them, the app is explicit:
+
+| Question | Approach | Data |
+|---|---|---|
+| Roofs > 15 years | No roofing permit in the last 15 yr (permit history from 2013) | **real** |
+| View of water | Parcel centroid within 150 m of an OSM water body (heuristic) | **real** |
+| No sale in 10+ years | **Proxy**: no permit activity in 10 yr — *not* a recorded sale | proxy (labeled) |
+| Regional (out-of-area) owner | Requires owner mailing address — **not in free open data** | gap (documented) |
+| Near public transit | Parcel centroid within ~800 m of an OSM transit stop | **real** |
+| Near a Starbucks | Parcel centroid within ~800 m of an OSM Starbucks | **real** |
+
+Every property row carries a `sources` provenance array. If an owner/sale CSV is
+later supplied, the file connector ingests it and Q3/Q4 light up with real data —
+no code change.
+
+## Data sources (all free)
+
+| Source | Used for | Endpoint |
+|---|---|---|
+| Santa Clara County Parcels (Socrata) | parcel geometry + APN + situs address | `data.sccgov.org/resource/ubcd-cewv` |
+| City of Palo Alto Development Center Permits (Junar) | permit dates, roofing, contractor, APN | `data.paloalto.gov/rest/datastreams/<id>/data.csv` |
+| OpenStreetMap (Overpass API) | transit stops, Starbucks, water bodies | `overpass-api.de` (+ mirrors) |
+
+The permit source's advertised host (`api.data.paloalto.gov`) is dead in DNS; the
+pipeline uses the live portal export path discovered from the dataview. Owner /
+sale / year-built data is paid only (SCC Assessor bulk or a commercial aggregator).
+
+## Run it
+
+### Docker (recommended)
+
+```bash
+cp web/.env.example web/.env.local      # fill in ANTHROPIC_API_KEY + AUTH_JWT_SECRET
+docker compose up --build
+# open http://localhost:3100  ·  login: owner / owner1234
+```
+
+The `properties.parquet` is baked into the image, so the app is self-contained —
+no pipeline run or external DB needed to demo. The agent ("Ask the data") needs
+`ANTHROPIC_API_KEY`; the six preset questions work without it.
+
+### Local dev
+
+```bash
+cd web && npm install
+cp .env.example .env.local              # fill in keys
+npm run fetch-data                      # download the parquet from the cloud bucket
+npm run dev                             # http://localhost:3100
+```
+
+> The query Parquet is **not committed** — it lives in cloud object storage and
+> is pulled by `npm run fetch-data` (the Docker build runs this automatically).
+> Primary source is a public **Google Cloud Storage** bucket
+> (`gs://dmitriy-konyrev-oracle-property`), with the Filebase/IPFS gateway as an
+> automatic fallback. Override with `DATA_URL=…`.
+
+### Re-run the pipeline (optional)
+
+```bash
+cd pipeline && npm install
+npm run run          # ingest real data -> DuckDB raw_records
+npm run build:db     # transforms -> properties table
+npm run export       # -> data/export/*.parquet
+npm run publish      # pin to IPFS (needs Filebase keys in pipeline/.env)
+```
+
+## Query it over MCP
+
+Any MCP-capable agent (Cursor, Claude Desktop, Claude Code, Codex) can query the
+dataset — it reads the Parquet straight from IPFS. Copy-paste configs are in
+[`MCP.md`](./MCP.md) and in the app's **IPFS artifacts → Connect via MCP** panel.
+
+```bash
+cd pipeline && npm install
+PROPERTY_QUERY_TABLE_MAP='{"santa-clara":"https://ipfs.filebase.io/ipfs/QmYa6qQA4VNY2HZzt25ABHMziaZeTz128Y476cF3iAUtF6"}' \
+  npx tsx ./pipeline/src/mcp/server.ts
+```
+
+Tools: `getPropertyQuerySchema`, `queryProperties` (read-only SELECT, row-capped),
+`getOracleDatasetInfo`.
+
+## Evaluation
+
+Search relevance is benchmarked in the **Relevance evals** tab: a labeled question
+set scores the intent agent (precision/recall/F1 + exact-match) and an
+**LLM-as-judge** rates result relevance (0–5). The harness caught and fixed real
+bugs — see [`FINDINGS.md`](./FINDINGS.md). Current: 100% intent exact-match, 100%
+pass rate, 4.0/5 avg judge relevance.
+
+## Demo credentials
+
+| User | Password | Role |
+|---|---|---|
+| `owner` | `owner1234` | owner |
+| `demo` | `demo1234` | viewer |
+
+No OAuth — env-based demo login (`web/lib/auth.ts`), overridable via `DEMO_*` env vars.
+
+## Repo structure
+
+```
+pipeline/   ingestion + transform + publish + MCP server (TypeScript, DuckDB)
+web/        Next.js 15 UI (DuckDB-WASM, MapLibre, Anthropic agent)
+manifest.json   IPFS CIDs + gateway URLs + PROPERTY_QUERY_TABLE_MAP
+mcp.json        MCP server config (points at the IPFS Parquet)
+MCP.md          how to connect via MCP
+ASSIGNMENT.md   original brief
+```
+
+## Design decisions
+
+- **No hosted database.** The query table is a single flat Parquet on IPFS;
+  DuckDB range-reads it (server-side via `httpfs`, client-side via DuckDB-WASM).
+- **APN reconciliation.** Parcels (`13213051`) and permits (`124-37-065`) are
+  joined on a normalized 8-digit APN.
+- **Transparent agent.** A dedicated intent agent parses questions into
+  structured criteria (shown in the UI) that deterministically build the SQL;
+  a second agent explains the results and flags proxies/gaps.
+- **Provenance everywhere** — run report, per-property `sources`, documented
+  source constraints.

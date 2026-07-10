@@ -1,0 +1,25 @@
+# Run the Oracle Property Intelligence UI locally.
+#
+#   docker compose up --build
+#   open http://localhost:3100   (login: owner / owner1234)
+#
+# Secrets (ANTHROPIC_API_KEY, AUTH_JWT_SECRET, demo creds) are read from
+# web/.env.local at runtime — copy web/.env.example to web/.env.local and fill it
+# in if you don't already have one.
+services:
+  web:
+    build:
+      context: ./web
+    image: oracle-web
+    container_name: oracle-web
+    # Host port is configurable so it runs alongside other apps on the same box:
+    #   WEB_PORT=3200 docker compose up -d --build   ->  http://server:3200
+    ports:
+      - "${WEB_PORT:-3100}:3100"
+    env_file:
+      - ./web/.env.local
+    environment:
+      NODE_ENV: production
+      # Allow the session cookie over plain http://localhost (no TLS locally).
+      COOKIE_SECURE: "false"
+    restart: unless-stopped

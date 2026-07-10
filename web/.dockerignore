@@ -1,0 +1,10 @@
+node_modules
+.next
+out
+.git
+.env
+.env*.local
+*.log
+.DS_Store
+.playwright-mcp
+public/data/*.parquet
