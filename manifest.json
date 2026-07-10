@@ -1,0 +1,36 @@
+{
+  "generatedAt": "2026-07-10T14:18:42.300Z",
+  "county": "santa-clara",
+  "focus": "Palo Alto",
+  "provider": "Filebase (IPFS)",
+  "artifacts": [
+    {
+      "file": "properties.parquet",
+      "key": "query-tables/santa-clara/properties.parquet",
+      "rows": 20912,
+      "bytes": 1061832,
+      "cid": "QmYa6qQA4VNY2HZzt25ABHMziaZeTz128Y476cF3iAUtF6",
+      "gateway": "https://ipfs.filebase.io/ipfs/QmYa6qQA4VNY2HZzt25ABHMziaZeTz128Y476cF3iAUtF6"
+    },
+    {
+      "file": "permits.parquet",
+      "key": "query-tables/santa-clara/permits.parquet",
+      "rows": 52157,
+      "bytes": 2409880,
+      "cid": "QmWfLBCRoJPpyL2VbcmrSSPZKAVqcMwDAPvreRAQDERbY4",
+      "gateway": "https://ipfs.filebase.io/ipfs/QmWfLBCRoJPpyL2VbcmrSSPZKAVqcMwDAPvreRAQDERbY4"
+    },
+    {
+      "file": "pois.parquet",
+      "key": "query-tables/santa-clara/pois.parquet",
+      "rows": 870,
+      "bytes": 27189,
+      "cid": "Qmd22TaoqAb1knuxTX4ypGC9UNX6CPzm3ngCfGep313YkJ",
+      "gateway": "https://ipfs.filebase.io/ipfs/Qmd22TaoqAb1knuxTX4ypGC9UNX6CPzm3ngCfGep313YkJ"
+    }
+  ],
+  "propertyQueryTableMap": {
+    "santa-clara": "https://ipfs.filebase.io/ipfs/QmYa6qQA4VNY2HZzt25ABHMziaZeTz128Y476cF3iAUtF6"
+  },
+  "note": "Parquet artifacts pinned to public IPFS; no Oracle-hosted database. The MCP server range-reads properties.parquet directly from the gateway URL above."
+}

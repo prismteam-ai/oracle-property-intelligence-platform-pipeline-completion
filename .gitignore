@@ -1,0 +1,18 @@
+# dependencies / build artifacts (also ignored per-package)
+**/node_modules/
+**/.next/
+**/dist/
+**/out/
+# env & secrets
+**/.env
+**/.env*.local
+# local data / build outputs
+pipeline/data/oracle.duckdb
+pipeline/data/oracle.duckdb.wal
+pipeline/data/staging/
+pipeline/data/raw/
+pipeline/data/export/
+# os / editor
+.DS_Store
+*.log
+*.tsbuildinfo

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://cursor.com/schemas/mcp.json",
+  "_comment": "Oracle Property MCP server. PROPERTY_QUERY_TABLE_MAP points at the properties Parquet published to public IPFS (Filebase gateway), so the server carries no hosted database. To serve the local export instead, remove the env var.",
+  "mcpServers": {
+    "oracle": {
+      "command": "npx",
+      "args": [
+        "tsx",
+        "./pipeline/src/mcp/server.ts"
+      ],
+      "env": {
+        "PROPERTY_QUERY_TABLE_MAP": "{\"santa-clara\":\"https://ipfs.filebase.io/ipfs/QmYa6qQA4VNY2HZzt25ABHMziaZeTz128Y476cF3iAUtF6\"}"
+      }
+    }
+  }
+}
