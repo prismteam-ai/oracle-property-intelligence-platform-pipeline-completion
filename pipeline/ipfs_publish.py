@@ -69,3 +69,27 @@ def pinned_cids() -> set:
         return set(r.json().get("Keys", {}).keys())
     except (requests.RequestException, ValueError):
         return set()
+
+
+def ensure_pinned() -> set:
+    """Re-add + pin any manifest artifact missing from the node's pin set.
+
+    The IPFS repo is ephemeral in the hosted deployment, so pins are lost on
+    restart. Re-adding the identical parquet bytes reproduces the same CID,
+    restoring pin state without changing the manifest.
+    """
+    manifest = load_manifest()
+    pins = pinned_cids()
+    if not manifest.get("artifacts") or not ipfs_available():
+        return pins
+    for entry in manifest["artifacts"].values():
+        cid, path = entry.get("cid"), entry.get("local_path")
+        if cid and cid not in pins and path:
+            try:
+                from pathlib import Path
+                p = Path(path)
+                if p.exists() and add_and_pin(p) == cid:
+                    pins.add(cid)
+            except Exception:
+                pass
+    return pins

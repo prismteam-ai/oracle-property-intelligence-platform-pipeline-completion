@@ -10,7 +10,7 @@ MANIFEST_FILE = DATA_DIR / "manifest.json"
 DUCKDB_FILE = DATA_DIR / "oracle.duckdb"
 
 # Cap records per source; 0 = pull everything.
-MAX_RECORDS = int(os.environ.get("MAX_RECORDS", "25000"))
+MAX_RECORDS = int(os.environ.get("MAX_RECORDS", "100000"))
 
 IPFS_API = os.environ.get("IPFS_API", "http://127.0.0.1:5001")
 IPFS_GATEWAY = os.environ.get("IPFS_GATEWAY", "http://127.0.0.1:8080")

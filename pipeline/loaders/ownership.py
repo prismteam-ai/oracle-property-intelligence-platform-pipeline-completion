@@ -22,6 +22,7 @@ def run():
         out_fields=("APN,PROPERTY_O,PROPERTY_1,OWNERS_ADD,OWNERS_CIT,OWNERS_STA,"
                     "OWNERS_ZIP,OWNERS_COU,ADDRESS,CITY_ST_ZI,USE_CODE_E,"
                     "LAND_VALUE,IMPROVEMEN"),
+        return_geometry=True, geometry_centroid=True,
         source_key=SOURCE_NAME,
     ))
     df = pd.DataFrame(rows).rename(columns={

@@ -82,7 +82,7 @@ function render(s) {
     const meta = info[name] || {};
     total += src.records || 0;
     maxSeen[name] = Math.max(maxSeen[name]||1, src.records||1);
-    const pct = src.status === "done" ? 100 : Math.min(99, 100*(src.records||0)/maxSeen[name]);
+    const pct = (src.status === "done" || src.status === "cached") ? 100 : Math.min(99, 100*(src.records||0)/maxSeen[name]);
     const cid = (arts[name] && arts[name].cid) ? `ipfs://${arts[name].cid}` : "";
     el.insertAdjacentHTML("beforeend", `
       <div class="card">

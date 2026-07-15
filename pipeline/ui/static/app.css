@@ -32,3 +32,4 @@ th { background:var(--card); position:sticky; top:0; color:var(--dim); }
 .badge.done { color:var(--ok); border-color:var(--ok); }
 .badge.running { color:var(--run); border-color:var(--run); }
 .badge.error { color:var(--err); border-color:var(--err); }
+.badge.cached { color:var(--run); border-color:var(--run); }

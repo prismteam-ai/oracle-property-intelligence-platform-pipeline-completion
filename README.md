@@ -51,7 +51,10 @@ python3 -m pipeline.server         # UI at http://127.0.0.1:5050 → click "Pull
 python3 -m pipeline.mcp_server     # MCP over stdio (MCP_TRANSPORT=http PORT=8090 for HTTP)
 ```
 
-Headless: `python3 -m pipeline.run_pipeline` (env `MAX_RECORDS` caps each source; default 25000).
+Headless: `python3 -m pipeline.run_pipeline` (env `MAX_RECORDS` caps each source; default 100000).
+
+Tests: `python3 -m pytest tests/ -q` (15 unit tests over ETL, feature marts, and agent
+intent parsing; also run in CI via `.github/workflows/ci.yml`).
 
 Query: `python3 -c "from pipeline.build_db import query; print(query('SELECT COUNT(*) FROM properties'))"`
 
@@ -116,7 +119,10 @@ CIDs for pinned artifacts are recorded in `data/manifest.json`.
 - Permits and address points cover San José only — other SCC cities publish no feeds.
 - CSLB has no bulk API: legacy postback, ≤10 classifications/request.
 - No bulk business-license dataset exists; OSM community data is used for businesses.
-- Default cap: 25,000 records per source (`MAX_RECORDS`).
+- Default cap: 100,000 records per source (`MAX_RECORDS`); the hosted deployment runs at
+  this cap (~312K records across 6 sources).
+- If a source is temporarily unreachable on a run, the pipeline falls back to the previous
+  snapshot and marks it `cached` instead of failing.
 
 ## Infrastructure cost model
 Artifacts are content-addressed on IPFS and re-hostable by anyone from the manifest CIDs.

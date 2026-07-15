@@ -130,12 +130,42 @@ def build_features(con):
             GROUP BY 1
             HAVING count(DISTINCT OWNERNAME) = 1
                AND count(*) > 1""",
-        "feat_regional": """
-            SELECT apn, situs_address AS address, match_key,
-                   owner_name, owner_city, owner_state, owner_zip,
-                   land_value, _source_url AS source
-            FROM ownership
-            WHERE owner_name IS NOT NULL""",
+        "feat_regional": f"""
+            WITH own AS (
+              SELECT o.apn, o.owner_name, o.owner_city, o.owner_state, o.owner_zip,
+                     o.land_value, o.centroid_lat, o.centroid_lon,
+                     o.situs_address, o.match_key AS own_key,
+                     o._source_url AS source
+              FROM ownership o WHERE o.owner_name IS NOT NULL),
+            near_addr AS (
+              -- ownership situs fields are blank server-side, so borrow the
+              -- nearest address point (<=250 m) for a cross-source match key
+              SELECT own.apn,
+                     arg_min(l.full_address,
+                             {HAVERSINE.format(alat='own.centroid_lat', alon='own.centroid_lon',
+                                               blat='l.lat', blon='l.lon')}) AS near_address,
+                     arg_min(l.match_key,
+                             {HAVERSINE.format(alat='own.centroid_lat', alon='own.centroid_lon',
+                                               blat='l.lat', blon='l.lon')}) AS near_key,
+                     min({HAVERSINE.format(alat='own.centroid_lat', alon='own.centroid_lon',
+                                           blat='l.lat', blon='l.lon')}) AS addr_dist_m
+              FROM own
+              JOIN locations l
+                ON abs(own.centroid_lat - l.lat) < 0.0023
+               AND abs(own.centroid_lon - l.lon) < 0.0029
+              WHERE own.centroid_lat IS NOT NULL AND l.lat IS NOT NULL
+              GROUP BY own.apn
+              HAVING min({HAVERSINE.format(alat='own.centroid_lat', alon='own.centroid_lon',
+                                           blat='l.lat', blon='l.lon')}) <= 250)
+            SELECT own.apn,
+                   coalesce(na.near_address,
+                            nullif(nullif(trim(own.situs_address), ''), '(LAND ONLY)')) AS address,
+                   coalesce(na.near_key,
+                            CASE WHEN own.own_key ~ '^[0-9]+ ' THEN own.own_key END) AS match_key,
+                   own.owner_name, own.owner_city, own.owner_state, own.owner_zip,
+                   own.land_value, own.centroid_lat, own.centroid_lon,
+                   round(na.addr_dist_m) AS matched_address_m, own.source
+            FROM own LEFT JOIN near_addr na USING (apn)""",
         "feat_water": f"""
             WITH p AS (
               SELECT apn, situs_address, match_key, situs_city,

@@ -8,7 +8,7 @@ from . import state
 from .agent import answer, filter_options, filtered
 from .build_db import query
 from .etl import load_etl_summary
-from .ipfs_publish import load_manifest, pinned_cids
+from .ipfs_publish import ensure_pinned, load_manifest, pinned_cids
 from .run_pipeline import run_all
 
 SOURCE_INFO = {
@@ -29,8 +29,9 @@ SOURCE_INFO = {
         "label": "Ownership records",
         "provider": "SCC assessor GIS parcel layer with owner fields (ArcGIS)",
         "limitations": "Only ~231 parcels expose owner fields publicly — the bulk assessor roll and "
-                       "recorded deeds are not open data. Ownership tenure is therefore inferred "
-                       "from permit history, not deeds.",
+                       "recorded deeds are not open data. Parcel centroids are matched to the "
+                       "nearest address point (≤250 m) for cross-source joins; ownership tenure "
+                       "is inferred from permit history, not deeds.",
     },
     "contractors": {
         "label": "Licensed contractors",
@@ -59,7 +60,11 @@ _pins_cache = {"at": 0.0, "pins": set()}
 
 def _pins():
     if time.time() - _pins_cache["at"] > 30:
-        _pins_cache["pins"] = pinned_cids()
+        pins = pinned_cids()
+        manifest_cids = {a.get("cid") for a in load_manifest().get("artifacts", {}).values()}
+        if manifest_cids - {None} - pins:
+            pins = ensure_pinned()  # self-heal: repo is ephemeral in hosted deploys
+        _pins_cache["pins"] = pins
         _pins_cache["at"] = time.time()
     return _pins_cache["pins"]
 
