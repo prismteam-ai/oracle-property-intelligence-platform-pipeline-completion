@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <h1>Query sandbox</h1>
+  <p>
+    Adjust filters and results update live. Use presets for README demo questions
+    or write a read-only SQL query against the <code>properties</code> view.
+  </p>
+  <p class="sandbox-hint">Move a slider or change city — the table refreshes automatically.</p>
+</div>
+
+<div class="sandbox-tabs{% if not dataset_ready %} sandbox-disabled{% endif %}">
+  <button type="button" class="tab active" data-tab="preset">Preset filters</button>
+  <button type="button" class="tab" data-tab="sql">SQL sandbox</button>
+</div>
+
+<section id="panel-preset" class="card sandbox-panel{% if not dataset_ready %} sandbox-disabled{% endif %}">
+  <form id="sandbox-form" class="sandbox-form">
+    <div class="form-grid">
+      <label>
+        Question preset
+        <select name="preset" id="preset">
+          {% for key, meta in presets.items() %}
+          <option value="{{ key }}">{{ meta.label }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label>
+        City (optional)
+        <input list="cities" name="city" id="city" placeholder="e.g. PALO ALTO">
+        <datalist id="cities">
+          {% for c in cities %}<option value="{{ c }}">{% endfor %}
+        </datalist>
+      </label>
+      <label class="field-roof">
+        Min roof age (years)
+        <input type="range" name="min_roof_age" id="min_roof_age" min="0" max="40" value="15">
+        <span class="range-val" id="min_roof_age_val">15</span>
+      </label>
+      <label class="field-ownership">
+        Min years since ownership change
+        <input type="range" name="min_ownership_years" id="min_ownership_years" min="0" max="40" value="10">
+        <span class="range-val" id="min_ownership_years_val">10</span>
+      </label>
+      <label class="field-transit">
+        Max distance to transit (m)
+        <input type="range" name="max_transit_m" id="max_transit_m" min="100" max="3000" step="50" value="800">
+        <span class="range-val" id="max_transit_m_val">800</span>
+      </label>
+      <label class="field-starbucks">
+        Max distance to Starbucks (m)
+        <input type="range" name="max_starbucks_m" id="max_starbucks_m" min="100" max="3000" step="50" value="800">
+        <span class="range-val" id="max_starbucks_m_val">800</span>
+      </label>
+      <label class="field-water">
+        Max distance to water (m)
+        <input type="range" name="max_water_m" id="max_water_m" min="100" max="2000" step="50" value="500">
+        <span class="range-val" id="max_water_m_val">500</span>
+      </label>
+      <label>
+        Result limit
+        <input type="number" name="limit" id="limit" min="1" max="100" value="25">
+      </label>
+    </div>
+    <button type="submit" class="btn-primary">Run query</button>
+  </form>
+</section>
+
+<section id="panel-sql" class="card sandbox-panel hidden{% if not dataset_ready %} sandbox-disabled{% endif %}">
+  <form id="sql-form">
+    <label>
+      Read-only SQL (SELECT on <code>properties</code>)
+      <textarea name="sql" id="sql" rows="6">SELECT parcel_id, address_street, address_city, roof_age_years
+FROM properties
+WHERE roof_age_years >= 15
+ORDER BY roof_age_years DESC
+LIMIT 25</textarea>
+    </label>
+    <button type="submit" class="btn-primary">Run SQL</button>
+  </form>
+</section>
+
+<section class="card" id="results-card">
+  <h2 id="result-title">Results</h2>
+  <p class="basis" id="result-basis"></p>
+  <p id="result-meta" class="result-meta">{% if not dataset_ready %}Load the dataset above to run queries.{% endif %}</p>
+  <div id="result-table"></div>
+</section>
+
+<script>
+  window.SANDBOX_DATASET_READY = {{ dataset_ready | tojson }};
+</script>
+<script src="{{ url_for('static', filename='sandbox.js') }}"></script>
+{% endblock %}

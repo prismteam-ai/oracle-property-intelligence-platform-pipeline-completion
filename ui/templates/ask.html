@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <h1>Agent demo prompts</h1>
+  <p>Ask the same property intelligence questions through an MCP-connected agent using <code>queryProperties</code>.</p>
+</div>
+
+<div class="card" style="margin-bottom:1.25rem">
+  <h3>Connect your agent</h3>
+  <p>Point Cursor or Claude Desktop at <code>{{ mcp_url }}</code> — see <a href="/about">About</a> for MCP config.</p>
+</div>
+
+<section>
+  <h2 style="font-size:1.15rem;margin-bottom:1rem">README demo prompts</h2>
+  {% for prompt in prompts %}
+  <div class="agent-prompt">{{ prompt }}</div>
+  {% endfor %}
+</section>
+
+<section style="margin-top:2rem">
+  <h2 style="font-size:1.15rem;margin-bottom:1rem">Example tool call</h2>
+  <pre>queryProperties(
+  county: "santa-clara",
+  sql: "SELECT parcel_id, address_street, roof_age_years
+        FROM properties WHERE roof_age_years >= 15 LIMIT 25"
+)</pre>
+</section>
+{% endblock %}

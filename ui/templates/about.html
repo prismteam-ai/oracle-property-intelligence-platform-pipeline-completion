@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <h1>About &amp; IPFS artifacts</h1>
+  <p>Decentralized storage, DuckDB query layer, and MCP-ready agent access — no Oracle-hosted database.</p>
+</div>
+
+<div class="card" style="margin-bottom:1.25rem">
+  <h3>MCP-ready access</h3>
+  <p>Agents connect via <strong>@elephant-xyz/mcp</strong> using <code>queryProperties</code> and <code>getPropertyQuerySchema</code>.</p>
+  <p>Endpoint: <code>{{ mcp_url }}</code></p>
+  <div class="mcp-box">
+    <pre>{
+  "mcpServers": {
+    "oracle-property": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "{{ mcp_url }}"]
+    }
+  }
+}</pre>
+  </div>
+</div>
+
+<section>
+  <h2 style="font-size:1.15rem;margin-bottom:1rem">IPFS artifacts</h2>
+  {% for artifact in artifacts %}
+  <div class="card" style="margin-bottom:1rem">
+    <h3>{{ artifact.name }}</h3>
+    {% if artifact.cid %}<p>CID: <code>{{ artifact.cid }}</code></p>{% endif %}
+    {% if artifact.ipfs %}<p>IPFS: <code>{{ artifact.ipfs }}</code></p>{% endif %}
+    {% if artifact.gateway %}<p>Gateway: <a href="{{ artifact.gateway }}">{{ artifact.gateway }}</a></p>{% endif %}
+    {% if artifact.provider %}<p style="color:var(--muted)">{{ artifact.provider }}</p>{% endif %}
+    {% if artifact.description %}<p style="color:var(--muted)">{{ artifact.description }}</p>{% endif %}
+  </div>
+  {% else %}
+  <p class="empty">No manifest found. Run the pipeline first.</p>
+  {% endfor %}
+</section>
+{% endblock %}

@@ -76,3 +76,104 @@ Complete the Oracle pipeline by loading all available county property, permit, o
 ## Reference
 - [Soofi XYZ Team Kit](https://github.com/soofi-xyz/soofi-xyz-team-kit)
 - [Elephant Oracle Skills](https://github.com/elephant-xyz/skills)
+
+---
+
+## Implementation (this PR)
+
+Santa Clara County pipeline completion with hybrid ingest (Elephant IPFS seeds + SCC Socrata parcels + OpenStreetMap POIs), DuckDB parquet query table, Flask demo UI, `@elephant-xyz/mcp` HTTP serve, and optional AWS CloudFormation deploy.
+
+**Branch:** `eran/property_pipeline`
+
+### Quick start (local demo)
+
+```bash
+cp .env.example .env
+./scripts/run.sh pipeline          # build data/properties.parquet
+./scripts/run.sh ui-start          # http://localhost:3000
+./scripts/run.sh ui-mcp-start      # http://localhost:8000/mcp (optional)
+./scripts/run.sh test              # 38 acceptance tests
+```
+
+If the dataset is missing, open the UI and click **Load dataset** (runs the pipeline in the background).
+
+### Demo video
+
+Short local walkthrough (~35s) following the README demo transcript:
+
+- **File:** [`demo/oracle-property-intelligence-demo.webm`](demo/oracle-property-intelligence-demo.webm)
+- **Re-record:** `./scripts/run.sh record-demo` (with UI running)
+
+Scenes: dashboard stats → run summary → IPFS/about → interactive sandbox (roof + transit filters) → explore → agent prompts.
+
+### Assumptions and limitations
+
+| Topic | Assumption / limitation |
+|-------|-------------------------|
+| **County scope** | Santa Clara County (includes Palo Alto). Five cities enriched via Socrata open data (`ubcd-cewv`). |
+| **Property & permit backbone** | Elephant-published IPFS seeds (`QmRTMf9cw2wKmYZVXE3yJTNNY7GU9uvoiRaVRrWxcMmssA` properties, permit IPNS). |
+| **Coordinates** | ~100k parcels matched to Socrata geometry by APN; remaining parcels lack real lat/lon. |
+| **Ownership / sale dates** | California assessor bulk data withholds owner names and last-sale dates. Ownership tenure uses permit dormancy and owner-text signals — not recorded deed transfers. |
+| **Contractor data** | Sparse (14 signals from permit text); county portal coverage is uneven. |
+| **Water view** | OSM water-feature proximity ≤500m — labeled proxy, not line-of-sight. |
+| **Transit / Starbucks distance** | Haversine meters from parcel coordinates to nearest OSM node. |
+| **Roof age** | Years since last roof permit issue date — not assessor roof material. |
+| **IPFS publish** | Without Filebase `S3_*` keys, manifest uses local SHA-256 CIDs. Real IPFS CIDs require Filebase credentials in `.env`. |
+| **Hosted database** | None by default — DuckDB over local/S3 parquet. No RDS or Neon required for demo. |
+| **Elephant skills `onboard-county`** | Not run end-to-end; pipeline uses direct HTTP/IPFS/Socrata/OSM connectors. Full skill path needs company Neon + Filebase + AWS. |
+| **Cursor Elephant MCP** | Requires `./scripts/fix-cursor-elephant-mcp.sh` and Soofi plugin enabled in Cursor. |
+
+Documented in UI basis notes on `/explore` and `/sandbox`, and in `data/run_summary.json` constraints.
+
+### AWS deployment — what is ready vs what you need
+
+Deploy templates and scripts are included (`deploy/aws/`, `./scripts/run.sh deploy-aws`) but **this submission was built and demoed locally** without a company AWS account.
+
+**Already in the repo**
+
+- CloudFormation stack: S3 artifact bucket + ECS Fargate (UI + MCP) + ALB (`/` → UI, `/mcp` → MCP)
+- Docker images: `deploy/ui/Dockerfile`, `deploy/mcp/Dockerfile`
+- `docker-compose.yml` for local prod smoke test
+- `scripts/deploy-aws.sh` — build, push ECR, deploy stack, upload parquet/manifest
+
+**What a reviewer must add to deploy**
+
+| Requirement | Action |
+|-------------|--------|
+| **AWS account** | `aws configure` or env credentials; `aws sts get-caller-identity` must succeed |
+| **Docker** | Running locally for image build/push |
+| **Pipeline artifacts** | Run `./scripts/run.sh pipeline` first (creates `data/properties.parquet`, `manifest.json`) |
+| **Deploy** | `./scripts/run.sh deploy-aws` |
+| **Post-deploy URL** | Note ALB DNS from stack outputs; open `http://<alb>/` for demo |
+
+**Optional — real IPFS CIDs (not required for AWS UI)**
+
+Fill in `.env` (from `.env.example`):
+
+```bash
+S3_ENDPOINT=https://s3.filebase.io
+S3_BUCKET=<your-bucket>
+S3_ACCESS_KEY_ID=<key>
+S3_SECRET_ACCESS_KEY=<secret>
+FILEBASE_IPNS_LABEL=oracle-query-table-santa-clara
+```
+
+Then re-run pipeline publish so `manifest.json` has Filebase/IPFS gateway URLs instead of `local-sha256-*` placeholders.
+
+**Optional — HTTPS**
+
+Add ACM certificate + ALB listener on 443 (template currently serves HTTP on 80).
+
+**Cost if left running**
+
+~$15–25/mo Fargate (2 small tasks) + ~$16/mo ALB + S3 storage. Scale ECS `DesiredCount` to 0 or delete the stack after review.
+
+See [`deploy/aws/README.md`](deploy/aws/README.md) for full deploy steps.
+
+### Acceptance tests
+
+```bash
+./scripts/run.sh servers   # check UI :3000 and MCP :8000
+./scripts/run.sh test      # 38 tests (31 README + 7 Cursor Elephant MCP)
+```
+

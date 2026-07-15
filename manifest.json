@@ -1,0 +1,18 @@
+{
+  "county": "santa-clara",
+  "published_at": "2026-07-15T11:54:51+00:00",
+  "artifacts": [
+    {
+      "name": "properties.parquet",
+      "cid": "local-sha256-b0d8b378dfe8651c",
+      "ipfs": "local://local-sha256-b0d8b378dfe8651c",
+      "gateway": null,
+      "provider": "local-hash (Filebase keys not configured)",
+      "local_path": "data/properties.parquet"
+    },
+    {
+      "name": "run_summary.json",
+      "description": "Pipeline run metadata and per-source record counts"
+    }
+  ]
+}

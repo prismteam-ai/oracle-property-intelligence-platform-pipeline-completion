@@ -1,0 +1,37 @@
+# Environment — real secrets stay local; samples are committed
+.env
+.env.*
+!.env.example
+!.env.paths
+
+# Local Cursor MCP config (run ./scripts/fix-cursor-elephant-mcp.sh)
+.mcp.json
+.cursor/
+
+# Local AWS CLI installer (deploy templates live under deploy/aws/)
+/aws/
+awscliv2.zip
+
+# Pipeline outputs
+data/
+ingest/
+*.parquet
+
+# Demo video capture temp files
+demo/.capture/
+scripts/demo-video/node_modules/
+
+# Python
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+*.pyc
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+build/
+
+.DS_Store
