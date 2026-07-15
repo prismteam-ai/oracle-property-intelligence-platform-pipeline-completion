@@ -102,7 +102,7 @@ gh pr create --base main --head eran/property_pipeline \
 ```bash
 # 1. Fork the repo on GitHub to your account
 # 2. Add your fork as a remote and push
-git remote add fork https://github.com/<your-github-user>/oracle-property-intelligence-platform-pipeline-completion.git
+git remote add fork git@github.com:EranTenenboim/oracle-property-intelligence-platform-pipeline-completion.git
 git push -u fork eran/property_pipeline
 
 # 3. Open PR from fork → upstream main
