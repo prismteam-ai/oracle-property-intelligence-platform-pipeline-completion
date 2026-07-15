@@ -1,8 +1,0 @@
-{
-  "name": "oracle-demo-video",
-  "private": true,
-  "type": "module",
-  "dependencies": {
-    "playwright": "^1.52.0"
-  }
-}

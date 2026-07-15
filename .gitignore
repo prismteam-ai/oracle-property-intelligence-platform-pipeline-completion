@@ -18,9 +18,8 @@ data/
 ingest/
 *.parquet
 
-# Demo video capture temp files
+# Demo video (submitted with PR; no re-record tooling in repo)
 demo/.capture/
-scripts/demo-video/node_modules/
 
 # Python
 __pycache__/

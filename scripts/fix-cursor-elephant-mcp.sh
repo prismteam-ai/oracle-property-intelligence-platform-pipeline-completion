@@ -72,4 +72,4 @@ echo
 echo "Next:"
 echo "  1. Reload Cursor window"
 echo "  2. Settings → MCP → restart elephant (plugin-soofi-xyz-elephant)"
-echo "  3. ./scripts/run.sh cursor-mcp-test"
+echo "  3. ./scripts/run.sh test"

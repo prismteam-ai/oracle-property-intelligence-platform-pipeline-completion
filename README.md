@@ -123,7 +123,7 @@ Short walkthrough (~35s) of the working local solution:
 | | |
 |--|--|
 | **File** | [`demo/oracle-property-intelligence-demo.webm`](demo/oracle-property-intelligence-demo.webm) |
-| **Re-record** | `./scripts/run.sh record-demo` (UI must be running) |
+| **Format** | WebM (~35s) — play in browser or VLC |
 
 **What the video shows:** dashboard → run summary (6 sources) → IPFS/about → interactive sandbox (roof + transit filters) → explore → agent/MCP prompts.
 
@@ -272,7 +272,6 @@ If the dataset is missing, open the UI and click **Load dataset** (runs the pipe
 Short local walkthrough (~35s) following the README demo transcript:
 
 - **File:** [`demo/oracle-property-intelligence-demo.webm`](demo/oracle-property-intelligence-demo.webm)
-- **Re-record:** `./scripts/run.sh record-demo` (with UI running)
 
 Scenes: dashboard stats → run summary → IPFS/about → interactive sandbox (roof + transit filters) → explore → agent prompts.
 

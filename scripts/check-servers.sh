@@ -24,7 +24,7 @@ if port_open "${MCP_PORT}"; then
   echo "OK  MCP listening on port ${MCP_PORT} (${MCP_BASE_URL})"
 else
   echo "MISSING MCP on port ${MCP_PORT}"
-  echo "  Start with: ./scripts/run.sh mcp-start"
+  echo "  Start with: ./scripts/run.sh ui-mcp-start"
 fi
 
 echo
