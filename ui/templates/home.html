@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  {% if summary.status == 'completed' %}<span class="badge">Pipeline completed</span>{% endif %}
+  <h1>Property intelligence for Santa Clara County</h1>
+  <p>
+    Uploaded county records for Palo Alto and neighboring cities — queryable through
+    DuckDB, stored on IPFS, and accessible via MCP agents.
+  </p>
+</div>
+
+<div class="stats">
+  <div class="stat-card">
+    <div class="stat-label">Properties</div>
+    <div class="stat-value">{{ stats.property | default('—') }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Permits</div>
+    <div class="stat-value">{{ stats.permit | default('—') }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">Coordinates</div>
+    <div class="stat-value">{{ stats.coordinate | default('—') }}</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">County</div>
+    <div class="stat-value" style="font-size:1.1rem">{{ summary.county | default('Santa Clara') }}</div>
+  </div>
+</div>
+
+<section>
+  <h2 style="margin-bottom:1rem;font-size:1.15rem">Demo questions</h2>
+  <p style="color:var(--muted);margin-bottom:1rem">
+    Use <a href="/search">Search</a>, <a href="/explore">Explore</a>, or the interactive
+    <a href="/sandbox">Sandbox</a> to run DuckDB queries with source-backed results.
+  </p>
+  <div class="grid-2">
+    {% for q in questions %}
+    <a href="/sandbox?preset={{ q.preset }}" class="card question-card" style="text-decoration:none;color:inherit">
+      <h3>{{ q.label }}</h3>
+      <p>{{ q.hint }}</p>
+    </a>
+    {% endfor %}
+  </div>
+</section>
+
+<section style="margin-top:2rem">
+  <h2 style="margin-bottom:1rem;font-size:1.15rem">Architecture</h2>
+  <div class="pill-row">
+    <span class="pill">IPFS artifacts</span>
+    <span class="pill">DuckDB parquet</span>
+    <span class="pill">MCP queryProperties</span>
+    <span class="pill">No hosted database</span>
+  </div>
+</section>
+{% endblock %}

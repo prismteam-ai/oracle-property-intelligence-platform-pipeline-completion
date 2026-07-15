@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <h1>Search &amp; explore</h1>
+  <p>
+    Static snapshot of README demo questions.
+    For a live demo, use the interactive <a href="/sandbox">Query sandbox</a>
+    — sliders and city filters update results instantly.
+  </p>
+</div>
+
+<div class="sandbox-cta card">
+  <h2>Try the interactive sandbox</h2>
+  <p class="basis">Search and Explore pages are read-only. Sandbox lets you change roof age, distances, and city during the demo.</p>
+  <div class="pill-row">
+    <a class="pill pill-link" href="/sandbox?preset=roofs">Roofs</a>
+    <a class="pill pill-link" href="/sandbox?preset=water">Water view</a>
+    <a class="pill pill-link" href="/sandbox?preset=ownership">Ownership</a>
+    <a class="pill pill-link" href="/sandbox?preset=regional">Regional owners</a>
+    <a class="pill pill-link" href="/sandbox?preset=transit">Transit</a>
+    <a class="pill pill-link" href="/sandbox?preset=starbucks">Starbucks</a>
+  </div>
+</div>
+
+{% for item in examples %}
+<section class="card" id="{{ item.slug }}" style="margin-bottom:1.25rem">
+  <h2>{{ item.question }}</h2>
+  {% if item.basis %}<p class="basis">{{ item.basis }}</p>{% endif %}
+  {% if item.count is not none %}
+  <span class="count-pill">{{ item.count }} matches</span>
+  {% endif %}
+  {% if item.rows %}
+  <table>
+    <thead><tr>
+      {% for col in item.columns %}<th>{{ col }}</th>{% endfor %}
+    </tr></thead>
+    <tbody>
+      {% for row in item.rows %}
+      <tr>{% for value in row %}<td>{{ value if value is not none else '' }}</td>{% endfor %}</tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="empty">No matching rows in the current snapshot.</p>
+  {% endif %}
+</section>
+{% endfor %}
+{% endblock %}

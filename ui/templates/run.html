@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="page-header">
+  <span class="badge">{{ summary.status | default('unknown') }}</span>
+  <h1>Pipeline run summary</h1>
+  <p>{{ summary.coverage | default('Santa Clara County including Palo Alto, CA') }}</p>
+</div>
+
+{% if sources %}
+<section class="card" style="margin-bottom:1.5rem">
+  <h2>Records by source</h2>
+  <p style="color:var(--muted);font-size:0.9rem">property · permit · ownership · contractor · business · coordinate</p>
+  {% for s in sources %}
+  <div class="bar-row">
+    <div class="bar-label">
+      <span>{{ s.name }}</span>
+      <span>{{ '{:,}'.format(s.count) }}</span>
+    </div>
+    <div class="bar-track"><div class="bar-fill" style="width:{{ s.pct }}%"></div></div>
+    <div style="font-size:0.75rem;color:var(--muted);margin-top:0.2rem">{{ s.provenance }}</div>
+  </div>
+  {% endfor %}
+</section>
+
+<div class="grid-2">
+  <div class="card">
+    <h3>Timing</h3>
+    <p><strong>Started:</strong> {{ summary.started_at }}</p>
+    <p><strong>Finished:</strong> {{ summary.finished_at }}</p>
+  </div>
+  <div class="card">
+    <h3>Architecture</h3>
+    {% for key, val in (summary.architecture or {}).items() %}
+    <p><strong>{{ key }}:</strong> {{ val }}</p>
+    {% endfor %}
+  </div>
+</div>
+
+<section class="card" style="margin-top:1.25rem">
+  <h3>Documented constraints</h3>
+  <ul class="constraint-list">
+    {% for c in summary.constraints or [] %}
+    <li>{{ c }}</li>
+    {% endfor %}
+  </ul>
+</section>
+{% else %}
+<p class="empty">Run summary not found. Execute <code>./scripts/run.sh pipeline</code>.</p>
+{% endif %}
+{% endblock %}

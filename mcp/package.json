@@ -1,0 +1,11 @@
+{
+  "name": "oracle-property-mcp",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@elephant-xyz/mcp": "github:elephant-xyz/elephant-mcp#main"
+  },
+  "scripts": {
+    "start": "node start.mjs"
+  }
+}

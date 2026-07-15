@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} · Oracle Property Intelligence</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">Oracle Property Intelligence</div>
+      <div class="brand-sub">Santa Clara County · Palo Alto</div>
+      <nav>
+        <a class="nav-link{% if active == 'home' %} active{% endif %}" href="/">Dashboard</a>
+        <a class="nav-link{% if active == 'search' %} active{% endif %}" href="/search">Search</a>
+        <a class="nav-link{% if active == 'search' %} active{% endif %}" href="/explore">Explore</a>
+        <a class="nav-link{% if active == 'sandbox' %} active{% endif %}" href="/sandbox">Sandbox</a>
+        <a class="nav-link{% if active == 'run' %} active{% endif %}" href="/run">Run summary</a>
+        <a class="nav-link{% if active == 'ask' %} active{% endif %}" href="/ask">Agent</a>
+        <a class="nav-link{% if active == 'about' %} active{% endif %}" href="/about">About</a>
+      </nav>
+    </aside>
+    <main class="main">
+      {% if not dataset_ready %}
+      <section id="dataset-empty-banner" class="card dataset-empty-banner">
+        <h2>Dataset not loaded</h2>
+        <p>
+          The local DuckDB parquet file is missing. For the demo, load Santa Clara County
+          property records from public sources — no AWS account required.
+        </p>
+        <button type="button" id="load-dataset-btn" class="btn-primary">Load dataset</button>
+        <p id="load-dataset-status" class="load-dataset-status"></p>
+      </section>
+      <script src="{{ url_for('static', filename='load-dataset.js') }}"></script>
+      {% endif %}
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</body>
+</html>
