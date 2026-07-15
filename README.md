@@ -1,78 +1,135 @@
-# Oracle Property Intelligence Platform Pipeline Completion
+# Oracle Property Intel — Santa Clara County
 
-## Context
+Pulls free public county data → dedupes (ETL) → **pins Parquet artifacts to IPFS** →
+**DuckDB** materializes tables + precomputed feature marts → web UI (pipeline / chat / data
+exploration) + **MCP server** so any agent can query the data as tools.
+A rule-based agent answers property-intelligence questions, with Claude (key in Azure Key
+Vault) adding narratives and SQL generation for off-bank questions.
 
-The Oracle ingestion pipeline has been started, but the full dataset has not been completely uploaded, reconciled, or demonstrated. The infrastructure must be designed so Oracle does not carry ongoing infrastructure cost by default. For this candidate, they are acting as both the Oracle and the builder, so they are responsible for completing the pipeline and proving the infrastructure approach.
+## Live URLs (Azure)
 
-## Description
+| What | URL |
+|---|---|
+| Web app (Pipeline · Chat · Data Exploration) | https://opi-web.livelyisland-4b7ca71a.westus2.azurecontainerapps.io |
+| MCP endpoint (streamable HTTP) | `https://opi-mcp.livelyisland-4b7ca71a.westus2.azurecontainerapps.io/mcp` |
 
-Complete the Oracle pipeline by loading all available county property, permit, ownership, business, contractor, location, and public-source data into an MCP-ready database, using IPFS and DuckDB to minimize Oracle-hosted infrastructure costs while enabling UI and agent access to answer property intelligence questions.
+⚠️ The MCP endpoint is currently unauthenticated.
 
-## Acceptance Criteria
-- Run the Oracle pipeline until all available county data is uploaded.
-- Confirm the pipeline covers the county that includes Palo Alto, CA.
-- Load available property records into the database.
-- Load available permit records into the database.
-- Load available ownership records into the database.
-- Load available contractor records into the database.
-- Load available business records into the database.
-- Load available location and coordinate data into the database.
-- Reconcile duplicate entities across all uploaded datasets.
-- Preserve source provenance for uploaded records.
-- Optimize pipeline performance where feasible.
-- Identify slow source sites or constrained contractor data sources.
-- Document pipeline speed limitations and source constraints.
-- Design the infrastructure so Oracle does not carry ongoing infrastructure cost by default.
-- Use IPFS for decentralized storage of eligible dataset artifacts.
-- Use DuckDB for local or portable analytical querying.
-- Structure the database to support MCP access.
-- Enable agent access to query the database.
-- Provide a UI for exploring the uploaded data.
-- Support questions about properties with roofs older than 15 years.
-- Support questions about properties with a view of water.
-- Support questions about properties that have not exchanged ownership in more than 10 years.
-- Support questions about properties with regional owners.
-- Support questions about properties within walking distance of public transportation using property coordinates.
-- Support questions about properties within walking distance of Starbucks using property coordinates.
-- Return source-backed answers where source data is available.
-- Demonstrate the uploaded dataset through the UI.
-- Demonstrate the uploaded dataset through an agent query.
-- Demonstrate that Oracle can operate without carrying the infrastructure cost.
-- Confirm the candidate fulfilled both Oracle and builder responsibilities for this milestone.
-- Pass the demo using real uploaded county records.
+## What was built
 
-## Demo Transcript
-- Presenter: “I will demonstrate that the Oracle pipeline has loaded the full available dataset for the county that includes Palo Alto, that the data is queryable through DuckDB, that eligible artifacts are stored through IPFS, and that both the UI and agent can answer property intelligence questions.”
-- Presenter: “First, I am opening the pipeline run summary.”
-  - Expected Result: The system displays the completed pipeline run, source list, record counts, timestamps, and any documented source limitations.
-- Presenter: “Show the total uploaded records by source.”
-  - Expected Result: The system shows uploaded property, permit, ownership, contractor, business, and coordinate records with collection timestamps and provenance.
-- Presenter: “Now I am opening the DuckDB-backed query layer.”
-  - Expected Result: The system confirms that the loaded data is available for structured querying without requiring Oracle-hosted database infrastructure.
-- Presenter: “Show the IPFS artifacts created for the uploaded datasets.”
-  - Expected Result: The system displays IPFS references or content identifiers for eligible dataset artifacts.
-- Presenter: “Now I am using the UI to search for properties with roofs older than 15 years.”
-  - Expected Result: The UI returns matching properties, supporting permit or property evidence, and source provenance where available.
-- Presenter: “Show properties with a view of water.”
-  - Expected Result: The UI returns properties identified using available location, parcel, or geographic indicators and explains the source basis.
-- Presenter: “Show properties that have not exchanged ownership in more than 10 years.”
-  - Expected Result: The system returns properties with ownership history showing no recorded exchange within the last 10 years.
-- Presenter: “Show properties with regional owners.”
-  - Expected Result: The system returns properties where owner location or ownership metadata indicates a regional owner.
-- Presenter: “Show properties within walking distance of public transportation.”
-  - Expected Result: The system uses property coordinates to return properties near public transportation and shows the distance calculation basis.
-- Presenter: “Show properties within walking distance of Starbucks.”
-  - Expected Result: The system uses property coordinates and nearby place data to return properties near Starbucks locations and shows the distance calculation basis.
-- Presenter: “Now I am asking the same type of questions through the agent.”
-  - Agent Prompt: “Which properties have roofs older than 15 years and have not exchanged ownership in more than 10 years?”
-    - Expected Result: The agent returns matching properties, explains the reasoning, and includes source-backed evidence.
-  - Agent Prompt: “Which properties are near public transportation and also have regional owners?”
-    - Expected Result: The agent returns matching properties with coordinate-based distance logic and ownership evidence.
-  - Agent Prompt: “Which properties appear to be strong candidates for further review based on ownership age, roof age, and location signals?”
-    - Expected Result: The agent returns a ranked or filtered list using available data and clearly identifies any assumptions or missing data.
-- Presenter: “Finally, I will show that the system is MCP-ready.”
-  - Expected Result: The system demonstrates an MCP-ready interface or documented MCP-compatible query structure that agents can use without changing the data model.
+```
+sources (6 free APIs)
+   └─► pipeline/loaders/*        pull + provenance columns (_source, _source_url, _collected_at)
+        └─► pipeline/etl.py      dedupe per table + cross-source overlap summary
+             └─► pipeline/ipfs_publish.py   add+pin parquet to Kubo → data/manifest.json (CIDs)
+                  └─► pipeline/build_db.py  DuckDB: *_ipfs provenance views + materialized tables
+                       └─► pipeline/features.py  precomputed marts: feat_roof, feat_stable_owner,
+                           feat_regional, feat_water, feat_transit, feat_starbucks
+                            ├─► pipeline/server.py  Flask UI + APIs (port 5050)
+                            ├─► pipeline/agent.py   NL question → SQL (+ Claude via pipeline/llm.py)
+                            └─► pipeline/mcp_server.py  MCP tools (stdio or HTTP)
+```
 
-## Reference
-- [Soofi XYZ Team Kit](https://github.com/soofi-xyz/soofi-xyz-team-kit)
-- [Elephant Oracle Skills](https://github.com/elephant-xyz/skills)
+- **Pipeline page** — Pull Data button, per-source progress/limitations, run timestamps,
+  ETL dedup summary, IPFS artifact table (CIDs, sizes, pin status, gateway links).
+- **Chat page** — question bank (roof >15y, water view, stable ownership, regional owners,
+  walk-to-transit/Starbucks, candidate ranking) + raw SQL passthrough; Claude narrates and
+  writes DuckDB SQL for anything outside the bank.
+- **Data Exploration page** — same question bank as dynamic filters with threshold
+  dropdowns, city dropdown, address search, column sorting; filters intersect by
+  normalized street address (the open address layer's APN field is null). Raw table
+  browsing when no filters are active.
+- **MCP tools** — `ask`, `find_properties`, `query_sql`, `list_filters`,
+  `pipeline_status`, `list_ipfs_artifacts`.
+
+## Run locally
+
+```bash
+pip3 install -r requirements.txt
+ipfs daemon &                      # Kubo on localhost:5001/8080 (optional — falls back to local parquet)
+python3 -m pipeline.server         # UI at http://127.0.0.1:5050 → click "Pull Data"
+python3 -m pipeline.mcp_server     # MCP over stdio (MCP_TRANSPORT=http PORT=8090 for HTTP)
+```
+
+Headless: `python3 -m pipeline.run_pipeline` (env `MAX_RECORDS` caps each source; default 100000).
+
+Tests: `python3 -m pytest tests/ -q` (15 unit tests over ETL, feature marts, and agent
+intent parsing; also run in CI via `.github/workflows/ci.yml`).
+
+Query: `python3 -c "from pipeline.build_db import query; print(query('SELECT COUNT(*) FROM properties'))"`
+
+## MCP config (Claude Code)
+
+```bash
+claude mcp add --transport http oracle-property-intel \
+  https://opi-mcp.livelyisland-4b7ca71a.westus2.azurecontainerapps.io/mcp
+```
+
+or in `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "oracle-property-intel": {
+      "type": "http",
+      "url": "https://opi-mcp.livelyisland-4b7ca71a.westus2.azurecontainerapps.io/mcp"
+    }
+  }
+}
+```
+
+## Azure resources (subscription "Azure subscription 1", RG `oracle-property-intel-rg`, westus2)
+
+| Resource | Name | Purpose |
+|---|---|---|
+| Key Vault | `opi-kv-14929` | secret `anthropic-api-key`; apps read it via managed identity (never in code/config) |
+| Container Registry | `opiacr14929` | image `opi:v1` (built with `az acr build`) |
+| Storage account | `opistore14929` | Azure Files share `opidata` mounted at `/data` (parquet, DuckDB, manifest persist) |
+| Container Apps env | `opi-env` | hosts both apps |
+| Container App | `opi-web` | gunicorn Flask + **Kubo IPFS sidecar** (`ipfs/kubo:v0.32.1`, ephemeral repo — Azure Files SMB breaks Kubo's chmod; pins re-publish on each pull) |
+| Container App | `opi-mcp` | same image, `python -m pipeline.mcp_server`, port 8090 |
+
+Redeploy after code changes:
+
+```bash
+az acr build -r opiacr14929 -t opi:v1 .
+az containerapp update -g oracle-property-intel-rg -n opi-web --image opiacr14929.azurecr.io/opi:v1
+az containerapp update -g oracle-property-intel-rg -n opi-mcp --image opiacr14929.azurecr.io/opi:v1
+```
+
+## Sources (all free, programmatic)
+
+| Table | Source | Notes |
+|---|---|---|
+| properties | CA statewide parcels (ArcGIS FeatureServer), filtered to Santa Clara County cities | APN, situs address, centroid coords |
+| permits | San Jose Open Data (CKAN): active / expired / under-inspection building permits | CSV resources |
+| ownership | SCC county GIS parcel layer with owner fields | see constraints |
+| contractors | CSLB "List by Classification & County" portal | ASP.NET VIEWSTATE postback → XLSX |
+| businesses | OpenStreetMap Overpass API (county relation 396501), incl. transit stops | 3 mirror fallback |
+| locations | San Jose master address points (395K, lat/long) | APN field is null server-side → address-key matching |
+
+CIDs for pinned artifacts are recorded in `data/manifest.json`.
+
+## Documented source constraints
+- `mapservices.sccgov.org` (county's 502K-parcel service) is offline; `gis.sccgov.org` is
+  Cloudflare-protected — a statewide parcel mirror is used instead.
+- Bulk assessor ownership roll and recorded deeds are not open data; ownership is limited
+  to ~231 parcels with public owner fields, and ownership tenure is *inferred from permit
+  history* (single owner across 10+ years of permits).
+- Permits and address points cover San José only — other SCC cities publish no feeds.
+- CSLB has no bulk API: legacy postback, ≤10 classifications/request.
+- No bulk business-license dataset exists; OSM community data is used for businesses.
+- Default cap: 100,000 records per source (`MAX_RECORDS`); the hosted deployment runs at
+  this cap (~312K records across 6 sources).
+- If a source is temporarily unreachable on a run, the pipeline falls back to the previous
+  snapshot and marks it `cached` instead of failing.
+
+## Infrastructure cost model
+Artifacts are content-addressed on IPFS and re-hostable by anyone from the manifest CIDs.
+DuckDB is embedded — no hosted database. Both container apps are right-sized
+(web+IPFS sidecar 0.75 vCPU/1.5Gi, MCP 0.25 vCPU/0.5Gi) and **scale to zero when idle**
+— you pay only per-second while a request is being served (first request after idle has a
+~10–20s cold start). Fixed costs are just ACR Basic (~$5/mo), a few GB of Azure Files, and
+Log Analytics (30-day retention). Idle total ≈ **$5–8/mo**; active use adds pennies/hour.
+Note: keep the Pipeline page open during a "Pull Data" run — its status polling keeps the
+replica alive until the run finishes.

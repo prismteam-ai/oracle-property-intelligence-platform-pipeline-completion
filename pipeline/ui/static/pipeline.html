@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pipeline — Oracle Property Intel</title>
+<link rel="stylesheet" href="/app.css">
+<style>
+  .name { font-weight:600; text-transform:capitalize; width:120px; }
+  .msg { color:var(--dim); font-size:13px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .count { font-variant-numeric:tabular-nums; font-weight:700; font-size:18px; min-width:90px; text-align:right; }
+  .bar { height:6px; background:var(--border); border-radius:3px; margin-top:10px; overflow:hidden; }
+  .bar > div { height:100%; background:var(--accent); border-radius:3px; transition:width .5s; }
+  .cid { font-family:ui-monospace,monospace; font-size:11px; color:var(--dim); margin-top:6px;
+         overflow:hidden; text-overflow:ellipsis; }
+  #total { font-size:34px; font-weight:800; }
+  #run { display:flex; gap:28px; flex-wrap:wrap; }
+  #run .kv { font-size:13px; }
+  #run .kv b { display:block; color:var(--dim); font-weight:500; font-size:11px;
+               text-transform:uppercase; letter-spacing:.05em; margin-bottom:2px; }
+  .provider { color:var(--dim); font-size:12px; margin-top:6px; }
+  .limits { font-size:12px; color:#d3a44a; margin-top:4px; line-height:1.4; }
+  .limits::before { content:"Limitations: "; }
+</style>
+</head>
+<body>
+<script src="/common.js"></script>
+<script>sidebar('pipeline');</script>
+<div class="main">
+  <h1>Pipeline</h1>
+  <div class="sub">Pull Santa Clara County data → dedupe (ETL) → pin to IPFS → DuckDB reads the pinned artifacts.</div>
+  <div class="row" style="margin-bottom:14px">
+    <button id="pull" class="primary">Pull Data</button>
+    <div><span id="total">0</span> <span class="sub" style="display:inline">total records</span></div>
+  </div>
+  <div class="card" id="run"></div>
+  <h2 style="margin-top:24px;font-size:18px">Sources</h2>
+  <div id="sources"></div>
+
+  <h2 style="margin-top:36px;font-size:18px">IPFS artifacts</h2>
+  <div class="sub" id="ipfsmeta" style="margin-bottom:8px"></div>
+  <div class="tablewrap"><table id="ipfs"><thead></thead><tbody></tbody></table></div>
+
+  <h2 style="margin-top:36px;font-size:18px">ETL summary — deduplication</h2>
+  <div class="tablewrap"><table id="etl"><thead></thead><tbody></tbody></table></div>
+  <div class="sub" id="overlap" style="margin:10px 0 4px"></div>
+</div>
+<script>
+const SOURCES = ["properties","permits","ownership","contractors","businesses","locations"];
+let maxSeen = {};
+
+function ts(t) { return t ? new Date(t*1000).toLocaleString() : "—"; }
+
+function renderRun(s) {
+  const el = document.getElementById("run");
+  const started = s.started_at, finished = s.finished_at;
+  let status, dur = "—";
+  if (s.running) status = `<span class="badge running">running</span>`;
+  else if (finished) status = `<span class="badge done">completed</span>`;
+  else status = `<span class="badge pending">no run yet</span>`;
+  if (started && finished) dur = Math.round(finished - started) + "s";
+  else if (started && s.running) dur = Math.round(Date.now()/1000 - started) + "s elapsed";
+  const pinned = (s.manifest && s.manifest.published_at)
+    ? new Date(s.manifest.published_at).toLocaleString() : "—";
+  el.innerHTML = `
+    <div class="kv"><b>Pipeline run</b>${status}</div>
+    <div class="kv"><b>Started</b>${ts(started)}</div>
+    <div class="kv"><b>Finished</b>${s.running ? "—" : ts(finished)}</div>
+    <div class="kv"><b>Duration</b>${dur}</div>
+    <div class="kv"><b>Pinned to IPFS</b>${pinned}</div>
+    <div class="kv"><b>Record cap</b>${fmt(s.max_records || 0)} / source</div>`;
+}
+
+function render(s) {
+  renderRun(s);
+  let total = 0;
+  const el = document.getElementById("sources");
+  el.innerHTML = "";
+  const arts = (s.manifest && s.manifest.artifacts) || {};
+  const info = s.source_info || {};
+  for (const name of SOURCES) {
+    const src = (s.sources||{})[name] || {status:"pending",records:0,message:""};
+    const meta = info[name] || {};
+    total += src.records || 0;
+    maxSeen[name] = Math.max(maxSeen[name]||1, src.records||1);
+    const pct = (src.status === "done" || src.status === "cached") ? 100 : Math.min(99, 100*(src.records||0)/maxSeen[name]);
+    const cid = (arts[name] && arts[name].cid) ? `ipfs://${arts[name].cid}` : "";
+    el.insertAdjacentHTML("beforeend", `
+      <div class="card">
+        <div class="row">
+          <span class="name" title="${esc(meta.label||name)}">${name}</span>
+          <span class="badge ${src.status}">${src.status}</span>
+          <span class="msg">${esc(src.message||"")}</span>
+          <span class="count">${fmt(src.records)}</span>
+        </div>
+        <div class="bar"><div style="width:${src.status==='pending'?0:pct}%"></div></div>
+        ${meta.provider ? `<div class="provider">${esc(meta.label||"")} — ${esc(meta.provider)}${src.url ? ` · <a href="${esc(src.url)}" target="_blank" style="color:inherit">endpoint</a>` : ""}</div>` : ""}
+        ${meta.limitations ? `<div class="limits">${esc(meta.limitations)}</div>` : ""}
+        ${cid ? `<div class="cid">${cid}</div>` : ""}
+      </div>`);
+  }
+  document.getElementById("total").textContent = fmt(total);
+  document.getElementById("pull").disabled = !!s.running;
+  renderIpfs(s.manifest || {});
+  renderEtl(s.etl || {});
+}
+
+function renderIpfs(m) {
+  const arts = m.artifacts || {};
+  const names = Object.keys(arts).sort();
+  const head = document.querySelector("#ipfs thead");
+  const body = document.querySelector("#ipfs tbody");
+  const meta = document.getElementById("ipfsmeta");
+  if (!names.length) {
+    head.innerHTML = ""; meta.textContent = "";
+    body.innerHTML = "<tr><td style='color:var(--dim)'>Run a pull to publish artifacts to IPFS.</td></tr>";
+    return;
+  }
+  meta.textContent = `Node: ${m.ipfs_available ? "reachable" : "unreachable"} · gateway ${m.gateway || "—"}` +
+    (m.published_at ? ` · published ${new Date(m.published_at).toLocaleString()}` : "");
+  head.innerHTML = "<tr><th>dataset</th><th>CID</th><th>size</th><th>pinned</th><th>gateway</th></tr>";
+  body.innerHTML = names.map(n => {
+    const a = arts[n];
+    const cid = a.cid
+      ? `<span style="font-family:ui-monospace,monospace;font-size:11px">${esc(a.cid)}</span>
+         <button onclick="navigator.clipboard.writeText('${esc(a.cid)}')" title="copy CID"
+                 style="background:none;border:1px solid var(--border);color:var(--dim);border-radius:4px;font-size:10px;padding:1px 6px;cursor:pointer">copy</button>`
+      : `<span style="color:var(--err)">${esc(a.error || "not published")}</span>`;
+    const size = a.size_bytes ? (a.size_bytes/1048576).toFixed(2) + " MB" : "—";
+    const pin = a.cid
+      ? (a.pinned ? "<span style='color:var(--ok)'>pinned</span>" : "<span style='color:var(--err)'>not pinned</span>")
+      : "—";
+    const gw = a.gateway_url ? `<a href="${esc(a.gateway_url)}" target="_blank">open</a>` : "—";
+    return `<tr><td>${esc(n)}.parquet</td><td>${cid}</td><td>${size}</td><td>${pin}</td><td>${gw}</td></tr>`;
+  }).join("");
+}
+
+function renderEtl(etl) {
+  const tables = etl.tables || {};
+  const names = Object.keys(tables);
+  const head = document.querySelector("#etl thead");
+  const body = document.querySelector("#etl tbody");
+  if (!names.length) {
+    head.innerHTML = ""; body.innerHTML =
+      "<tr><td style='color:var(--dim)'>Run a pull to generate the ETL summary.</td></tr>";
+    document.getElementById("overlap").textContent = "";
+    return;
+  }
+  head.innerHTML = "<tr><th>table</th><th>raw</th><th>duplicates removed</th><th>clean</th><th>dedupe method</th></tr>";
+  body.innerHTML = names.map(n => {
+    const t = tables[n];
+    return `<tr><td>${n}</td><td>${fmt(t.raw_records)}</td>` +
+      `<td style="color:${t.duplicates_removed ? 'var(--run)' : 'var(--dim)'}">${fmt(t.duplicates_removed)}</td>` +
+      `<td style="color:var(--ok)">${fmt(t.clean_records)}</td><td>${t.dedupe_method}</td></tr>`;
+  }).join("");
+  const cs = etl.cross_source || {};
+  document.getElementById("overlap").textContent =
+    Object.entries(cs).map(([k, v]) => `${k}: ${fmt(v)}`).join("   ·   ");
+}
+
+async function poll() {
+  try { render(await (await fetch("/api/status")).json()); } catch (e) {}
+}
+document.getElementById("pull").onclick = async () => {
+  document.getElementById("pull").disabled = true;
+  await fetch("/api/pull", {method:"POST"});
+};
+poll();
+setInterval(poll, 1500);
+</script>
+</body>
+</html>

@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Data Exploration — Oracle Property Intel</title>
+<link rel="stylesheet" href="/app.css">
+<style>
+  .panel { display:flex; gap:10px; flex-wrap:wrap; margin:6px 0 14px; }
+  .fcard { display:flex; align-items:center; gap:8px; background:var(--card);
+           border:1px solid var(--border); border-radius:10px; padding:8px 12px;
+           font-size:13px; cursor:default; }
+  .fcard.on { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .fcard input[type=checkbox] { accent-color:var(--accent); cursor:pointer; }
+  .fcard label { cursor:pointer; user-select:none; }
+  select, .searchbar input {
+    background:#0d1117; border:1px solid var(--border); color:var(--fg);
+    border-radius:6px; padding:5px 8px; font-size:13px; }
+  .searchbar { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:0 0 14px; }
+  .searchbar input { min-width:240px; padding:8px 10px; }
+  .searchbar .lbl { color:var(--dim); font-size:12px; }
+  .tabs { display:flex; gap:8px; margin:0 0 12px; flex-wrap:wrap; }
+  .tabs button { background:var(--card); border:1px solid var(--border); color:var(--fg);
+                 padding:7px 14px; font-size:13px; border-radius:8px; cursor:pointer; }
+  .tabs button.active { background:var(--accent); border-color:var(--accent); }
+  .basis { color:var(--dim); font-size:12px; margin:0 0 10px; line-height:1.5; }
+  th { cursor:pointer; }
+  th .arrow { color:var(--accent); }
+  #clear { background:none; border:1px solid var(--border); color:var(--dim);
+           border-radius:10px; padding:8px 12px; font-size:13px; cursor:pointer; }
+  #count { font-size:13px; color:var(--ok); margin-left:auto; }
+</style>
+</head>
+<body>
+<script src="/common.js"></script>
+<script>sidebar('data');</script>
+<div class="main">
+  <h1>Data Exploration</h1>
+  <div class="sub">Combine intelligence filters (same question bank as the chat) with dynamic thresholds,
+    city and address search. Multiple filters intersect by normalized address. Click a column to sort.
+    With no filters active, browse the raw DuckDB tables below.</div>
+
+  <div class="panel" id="filters"></div>
+  <div class="searchbar">
+    <span class="lbl">City</span><select id="city"><option value="">Any</option></select>
+    <span class="lbl">Address contains</span><input id="q" placeholder="e.g. BLEWETT AVE">
+    <button id="clear">Clear all</button>
+    <span id="count"></span>
+  </div>
+  <div class="basis" id="basis"></div>
+
+  <div class="tabs" id="tabs"></div>
+  <div class="tablewrap"><table id="grid"><thead></thead><tbody></tbody></table></div>
+  <div class="pager">
+    <button id="prev">‹ Prev</button>
+    <span id="pageinfo">–</span>
+    <button id="next">Next ›</button>
+  </div>
+</div>
+<script>
+const PAGE = 50;
+let DEFS = {}, active = new Set(), values = {}, curTable = null, offset = 0;
+let sortCol = null, sortOrder = "asc";
+let debounce = null;
+
+async function loadOptions() {
+  const o = await (await fetch("/api/filter/options")).json();
+  DEFS = o.filters;
+  const fEl = document.getElementById("filters");
+  for (const [key, d] of Object.entries(DEFS)) {
+    values[key] = d.default;
+    const card = document.createElement("div");
+    card.className = "fcard"; card.dataset.key = key; card.title = d.basis;
+    const opts = d.choices.map(c =>
+      `<option value="${c}" ${String(c)===String(d.default)?"selected":""}>${c}${d.unit? " "+d.unit:""}</option>`).join("");
+    card.innerHTML = `
+      <input type="checkbox" id="cb_${key}">
+      <label for="cb_${key}">${esc(d.label)}</label>
+      <select id="sel_${key}">${opts}</select>`;
+    fEl.appendChild(card);
+    card.querySelector("input").onchange = e => {
+      e.target.checked ? active.add(key) : active.delete(key);
+      card.classList.toggle("on", e.target.checked);
+      offset = 0; sortCol = null; load();
+    };
+    card.querySelector("select").onchange = e => {
+      values[key] = e.target.value;
+      if (!active.has(key)) { active.add(key); card.classList.add("on");
+        card.querySelector("input").checked = true; }
+      offset = 0; load();
+    };
+  }
+  const citySel = document.getElementById("city");
+  for (const c of o.cities)
+    citySel.insertAdjacentHTML("beforeend", `<option>${esc(c)}</option>`);
+  citySel.onchange = () => { offset = 0; load(); };
+  document.getElementById("q").oninput = () => {
+    clearTimeout(debounce);
+    debounce = setTimeout(() => { offset = 0; load(); }, 350);
+  };
+}
+
+document.getElementById("clear").onclick = () => {
+  active.clear(); offset = 0; sortCol = null;
+  document.querySelectorAll(".fcard").forEach(c => {
+    c.classList.remove("on"); c.querySelector("input").checked = false; });
+  document.getElementById("city").value = "";
+  document.getElementById("q").value = "";
+  load();
+};
+
+async function loadTabs() {
+  const tables = await (await fetch("/api/tables")).json();
+  const tabs = document.getElementById("tabs");
+  tabs.innerHTML = "";
+  for (const t of tables) {
+    const b = document.createElement("button");
+    b.textContent = t; b.dataset.table = t;
+    b.onclick = () => { curTable = t; offset = 0; load(); };
+    tabs.appendChild(b);
+  }
+  if (tables.length && !curTable) curTable = tables[0];
+  load();
+}
+
+function renderGrid(r, sortable) {
+  document.querySelector("#grid thead").innerHTML =
+    "<tr>" + r.columns.map(c => {
+      const arrow = sortable && c === sortCol ? ` <span class="arrow">${sortOrder==="asc"?"▲":"▼"}</span>` : "";
+      return `<th data-col="${esc(c)}">${esc(c)}${arrow}</th>`;
+    }).join("") + "</tr>";
+  if (sortable) document.querySelectorAll("#grid th").forEach(th => th.onclick = () => {
+    const c = th.dataset.col;
+    if (sortCol === c) sortOrder = sortOrder === "asc" ? "desc" : "asc";
+    else { sortCol = c; sortOrder = "asc"; }
+    offset = 0; load();
+  });
+  document.querySelector("#grid tbody").innerHTML =
+    r.rows.map(row => "<tr>" + row.map(v => `<td title="${esc(v)}">${esc(v)}</td>`).join("") + "</tr>").join("")
+    || "<tr><td style='color:var(--dim)'>No matching records.</td></tr>";
+  const label = active.size ? [...active].join(" + ") : curTable;
+  document.getElementById("pageinfo").textContent =
+    `${label}: rows ${r.total ? offset+1 : 0}–${Math.min(offset+PAGE, r.total)} of ${fmt(r.total)}`;
+  document.getElementById("prev").disabled = offset === 0;
+  document.getElementById("next").disabled = offset + PAGE >= r.total;
+  document.getElementById("count").textContent = active.size ? `${fmt(r.total)} matches` : "";
+}
+
+async function load() {
+  const basis = document.getElementById("basis");
+  const tabsEl = document.getElementById("tabs");
+  document.querySelectorAll("#tabs button").forEach(b =>
+    b.classList.toggle("active", !active.size && b.dataset.table === curTable));
+  const city = document.getElementById("city").value;
+  const q = document.getElementById("q").value.trim();
+  if (active.size) {
+    tabsEl.style.opacity = .35;
+    basis.textContent = "running filter queries…";
+    let url = `/api/filter?f=${[...active].join(",")}&limit=${PAGE}&offset=${offset}`;
+    for (const k of active) url += `&p_${k}=${encodeURIComponent(values[k])}`;
+    if (city) url += `&city=${encodeURIComponent(city)}`;
+    if (q) url += `&q=${encodeURIComponent(q)}`;
+    if (sortCol) url += `&sort=${encodeURIComponent(sortCol)}&order=${sortOrder}`;
+    const r = await (await fetch(url)).json();
+    if (r.error) { basis.textContent = r.error; return; }
+    basis.textContent = r.basis || "";
+    renderGrid(r, true);
+  } else {
+    tabsEl.style.opacity = 1;
+    basis.textContent = "";
+    document.getElementById("count").textContent = "";
+    if (!curTable) return;
+    const r = await (await fetch(`/api/data?table=${curTable}&limit=${PAGE}&offset=${offset}`)).json();
+    if (r.error) return;
+    sortCol = null;
+    renderGrid(r, false);
+  }
+}
+document.getElementById("prev").onclick = () => { offset = Math.max(0, offset - PAGE); load(); };
+document.getElementById("next").onclick = () => { offset += PAGE; load(); };
+loadOptions().then(loadTabs);
+</script>
+</body>
+</html>
