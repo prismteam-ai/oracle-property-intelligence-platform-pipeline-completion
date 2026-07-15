@@ -79,7 +79,177 @@ Complete the Oracle pipeline by loading all available county property, permit, o
 
 ---
 
-## Implementation (this PR)
+## Submission (Oracle assignment — this repo only)
+
+This submission covers **Oracle Property Intelligence Platform Pipeline Completion** only. Chief of Staff Communication Agent is out of scope.
+
+### Pull request
+
+| Item | Value |
+|------|-------|
+| **Repository** | `prismteam-ai/oracle-property-intelligence-platform-pipeline-completion` |
+| **Branch** | `eran/property_pipeline` |
+| **Base** | `main` |
+
+**If you have write access to the org repo:**
+```bash
+git push -u origin eran/property_pipeline
+gh pr create --base main --head eran/property_pipeline \
+  --title "Complete Santa Clara Oracle property intelligence pipeline"
+```
+
+**If push is denied (fork workflow):**
+```bash
+# 1. Fork the repo on GitHub to your account
+# 2. Add your fork as a remote and push
+git remote add fork https://github.com/<your-github-user>/oracle-property-intelligence-platform-pipeline-completion.git
+git push -u fork eran/property_pipeline
+
+# 3. Open PR from fork → upstream main
+gh pr create --repo prismteam-ai/oracle-property-intelligence-platform-pipeline-completion \
+  --base main --head <your-github-user>:eran/property_pipeline \
+  --title "Complete Santa Clara Oracle property intelligence pipeline"
+```
+
+**Include in the PR description:**
+1. Link to demo video (below)
+2. Runtime access instructions (below)
+3. One-line summary of architecture and tradeoffs
+
+### Demo video (required)
+
+Short walkthrough (~35s) of the working local solution:
+
+| | |
+|--|--|
+| **File** | [`demo/oracle-property-intelligence-demo.webm`](demo/oracle-property-intelligence-demo.webm) |
+| **Re-record** | `./scripts/run.sh record-demo` (UI must be running) |
+
+**What the video shows:** dashboard → run summary (6 sources) → IPFS/about → interactive sandbox (roof + transit filters) → explore → agent/MCP prompts.
+
+Attach the file to the PR or link to it in the repo. Reviewers can also download and play locally.
+
+### Live / working runtime access
+
+**Primary runtime (local — no AWS account required):**
+
+```bash
+git clone <fork-or-org-repo-url>
+cd oracle-property-intelligence-platform-pipeline-completion
+git checkout eran/property_pipeline
+
+cp .env.example .env
+./scripts/run.sh setup               # once: Python deps + Node 22
+./scripts/run.sh pipeline              # builds data/properties.parquet (~5–15 min first run)
+./scripts/run.sh ui-start              # → http://localhost:3000
+./scripts/run.sh ui-mcp-start          # → http://localhost:8000/mcp  (second terminal)
+```
+
+**Demo pages:**
+
+| URL | Purpose |
+|-----|---------|
+| http://localhost:3000/ | Dashboard — pipeline stats |
+| http://localhost:3000/run | Run summary — source counts + constraints |
+| http://localhost:3000/sandbox | **Interactive demo** — live filters |
+| http://localhost:3000/explore | README demo questions (static) |
+| http://localhost:3000/about | IPFS artifacts + MCP config |
+| http://localhost:3000/ask | Agent prompts for Cursor MCP |
+| http://localhost:8000/mcp | MCP HTTP endpoint (`queryProperties`) |
+
+**If dataset is empty:** open http://localhost:3000 and click **Load dataset** (runs pipeline in background).
+
+**Agent demo (Cursor):**
+```bash
+./scripts/fix-cursor-elephant-mcp.sh   # generates .mcp.json locally
+# Reload Cursor → enable Soofi elephant MCP → ask queryProperties on santa-clara
+```
+
+**Docker smoke test (optional, same images as AWS):**
+```bash
+./scripts/run.sh pipeline
+docker compose up --build
+# UI at http://localhost:3000
+```
+
+**Hosted runtime (optional — reviewer AWS account):** see [AWS deployment](#aws-deployment--what-is-ready-vs-what-you-need) below. Not required for this submission; built and demoed locally.
+
+### Self-assessment before submit
+
+Use the **slowking** agent from the [Soofi XYZ Team Kit](https://github.com/soofi-xyz/soofi-xyz-team-kit) to self-evaluate against assignment criteria before opening the PR.
+
+```bash
+# From soofi-xyz-team-kit — run slowking against this repo + deployed/local runtime
+```
+
+Checklist slowking will probe: working outcome, reproducibility, kit usage, demo evidence, access boundaries.
+
+### What assessors will evaluate
+
+| Criterion | How this submission addresses it |
+|-----------|----------------------------------|
+| **Speed of delivery** | Hybrid path: Elephant IPFS backbone + targeted Socrata/OSM connectors instead of full `onboard-county` (needs company Neon/Filebase/AWS). Pipeline reruns in minutes when artifacts are cached. |
+| **Architectural clarity** | Layered design: ingest → transform (DuckDB parquet) → publish (IPFS/S3) → serve (Flask UI + elephant-mcp). No hosted DB by default. |
+| **Working implementation** | 487k properties, 98k permits, 100k coordinates; all 6 README demo questions answerable in UI sandbox. |
+| **Reproducibility** | `./scripts/run.sh pipeline` + 38 acceptance tests; `.env.example` + documented assumptions. |
+| **Practical agentic AI** | Cursor + Soofi Elephant MCP (`queryProperties`); MCP HTTP serve for agents; skills referenced for county onboarding path. |
+| **Tradeoffs explained** | Assumptions table below; basis notes in UI; constraints in `run_summary.json`. |
+| **Demo quality** | Recorded video + interactive sandbox for live filter changes during review. |
+| **Evolves without rebuild** | Modular `pipeline/connectors/`, parameterized sandbox queries, CloudFormation deploy, Elephant 37-col schema — add counties/sources without rewriting core. |
+
+### Architecture
+
+```mermaid
+flowchart LR
+  subgraph ingest [Ingest]
+    IPFS[Elephant IPFS seeds]
+    SOC[Socrata parcels]
+    OSM[OpenStreetMap POIs]
+  end
+  subgraph transform [Transform]
+    DUCK[DuckDB parquet\n487k properties]
+  end
+  subgraph serve [Serve — no hosted DB]
+    UI[Flask UI :3000]
+    MCP[elephant-mcp :8000]
+  end
+  subgraph optional [Optional publish]
+    FB[Filebase IPFS]
+    AWS[S3 + ECS Fargate]
+  end
+  IPFS --> DUCK
+  SOC --> DUCK
+  OSM --> DUCK
+  DUCK --> UI
+  DUCK --> MCP
+  DUCK -.-> FB
+  DUCK -.-> AWS
+```
+
+**Repo layout:**
+
+| Path | Role |
+|------|------|
+| `pipeline/` | Ingest, transform, publish orchestration |
+| `pipeline/connectors/` | Socrata + Overpass (extensible per county) |
+| `ui/` | Flask demo UI + interactive sandbox |
+| `mcp/` | `@elephant-xyz/mcp` HTTP wrapper |
+| `tests/acceptance/` | 38 README + Cursor MCP tests |
+| `deploy/aws/` | Optional CloudFormation + Docker images |
+| `demo/` | Demo video for PR |
+
+### Tradeoffs (explicit)
+
+| Decision | Chosen | Alternative | Why |
+|----------|--------|-------------|-----|
+| Ingest path | Direct IPFS + Socrata + OSM | Full `onboard-county` Elephant skill | Skill path needs company Neon, Filebase, AWS — not available for candidate account |
+| Coordinates | Socrata APN join (~100k matched) | Assessor GIS bulk | Free open-data coverage is partial; documented |
+| Ownership tenure | Permit dormancy proxy | Assessor sale dates | CA bulk data withholds owner names and sales |
+| IPFS CIDs | Local SHA-256 without Filebase keys | Filebase publish | Keys not in candidate `.env`; manifest documents placeholder |
+| Demo runtime | Local Flask + DuckDB | AWS ALB | No company AWS account; deploy templates included for reviewers |
+| UI explore vs sandbox | Sandbox = live filters; Explore = snapshot | Single page | Snapshot pages pass acceptance tests; sandbox enables live demo |
+
+### Implementation (this PR)
 
 Santa Clara County pipeline completion with hybrid ingest (Elephant IPFS seeds + SCC Socrata parcels + OpenStreetMap POIs), DuckDB parquet query table, Flask demo UI, `@elephant-xyz/mcp` HTTP serve, and optional AWS CloudFormation deploy.
 
@@ -136,37 +306,40 @@ Deploy templates and scripts are included (`deploy/aws/`, `./scripts/run.sh depl
 - `docker-compose.yml` for local prod smoke test
 - `scripts/deploy-aws.sh` — build, push ECR, deploy stack, upload parquet/manifest
 
-**What a reviewer must add to deploy**
+**What a reviewer must add to deploy to AWS**
 
 | Requirement | Action |
 |-------------|--------|
-| **AWS account** | `aws configure` or env credentials; `aws sts get-caller-identity` must succeed |
+| **AWS account** | `aws configure`; `aws sts get-caller-identity` must succeed |
 | **Docker** | Running locally for image build/push |
-| **Pipeline artifacts** | Run `./scripts/run.sh pipeline` first (creates `data/properties.parquet`, `manifest.json`) |
+| **Pipeline artifacts** | `./scripts/run.sh pipeline` first |
 | **Deploy** | `./scripts/run.sh deploy-aws` |
-| **Post-deploy URL** | Note ALB DNS from stack outputs; open `http://<alb>/` for demo |
+| **Live URL for assessors** | Put ALB DNS in PR: `http://<alb-dns>/` and `http://<alb-dns>/mcp` |
 
-**Optional — real IPFS CIDs (not required for AWS UI)**
+**Still missing for production-grade AWS (not blocking local demo)**
 
-Fill in `.env` (from `.env.example`):
+| Gap | What to add |
+|-----|-------------|
+| **Real IPFS CIDs** | Filebase `S3_*` keys in `.env` → re-run pipeline publish |
+| **HTTPS** | ACM certificate + ALB listener on 443 |
+| **Custom domain** | Route 53 + ACM for reviewer domain |
+| **CI/CD** | GitHub Actions to build/push images and deploy stack on merge |
+| **Secrets** | AWS Secrets Manager for Filebase keys in ECS task defs |
+| **Cost control** | EventBridge schedule to scale ECS `DesiredCount` to 0 off-hours |
+
+**Optional — real IPFS CIDs**
 
 ```bash
+# .env (from .env.example)
 S3_ENDPOINT=https://s3.filebase.io
 S3_BUCKET=<your-bucket>
 S3_ACCESS_KEY_ID=<key>
 S3_SECRET_ACCESS_KEY=<secret>
 FILEBASE_IPNS_LABEL=oracle-query-table-santa-clara
+./scripts/run.sh pipeline   # re-publish with real CIDs in manifest.json
 ```
 
-Then re-run pipeline publish so `manifest.json` has Filebase/IPFS gateway URLs instead of `local-sha256-*` placeholders.
-
-**Optional — HTTPS**
-
-Add ACM certificate + ALB listener on 443 (template currently serves HTTP on 80).
-
-**Cost if left running**
-
-~$15–25/mo Fargate (2 small tasks) + ~$16/mo ALB + S3 storage. Scale ECS `DesiredCount` to 0 or delete the stack after review.
+**Cost if left running:** ~$15–25/mo Fargate + ~$16/mo ALB + S3. Delete stack or scale to 0 after review.
 
 See [`deploy/aws/README.md`](deploy/aws/README.md) for full deploy steps.
 
@@ -176,4 +349,24 @@ See [`deploy/aws/README.md`](deploy/aws/README.md) for full deploy steps.
 ./scripts/run.sh servers   # check UI :3000 and MCP :8000
 ./scripts/run.sh test      # 38 tests (31 README + 7 Cursor Elephant MCP)
 ```
+
+**Expected:** `38 passed`
+
+### Agentic AI tools used
+
+| Tool | Role in this project |
+|------|---------------------|
+| [Soofi XYZ Team Kit](https://github.com/soofi-xyz/soofi-xyz-team-kit) | Engineering patterns, MCP setup, slowking self-assessment |
+| [Elephant Oracle Skills](https://github.com/elephant-xyz/skills) | County onboarding reference (`onboard-county`, stage skills) |
+| `@elephant-xyz/mcp` | `queryProperties`, `getPropertyQuerySchema`, `getOracleDatasetInfo` |
+| Cursor + Soofi Elephant plugin | Agent demo via MCP stdio |
+| Claude/Cursor agent | Pipeline design, connector implementation, UI, tests |
+
+### Evolving without rebuild
+
+- **New county:** add connector under `pipeline/connectors/`, extend `ingest.py`, map in `PROPERTY_QUERY_TABLE_MAP`
+- **New enrichment:** add columns in `pipeline/transform.py` (Elephant 37-col compatible)
+- **New demo question:** add preset in `ui/sandbox_queries.py` + `QUERY_SPECS` in `ui/app.py`
+- **New deploy target:** reuse `deploy/aws/template.yaml` or `docker-compose.yml` — parquet artifact unchanged
+- **Full Elephant skill path:** run `onboard-county` when Neon + Filebase + AWS credentials are available — replaces manual connectors without schema change
 
