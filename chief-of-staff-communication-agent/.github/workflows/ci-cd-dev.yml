@@ -1,0 +1,18 @@
+name: DEV CI/CD
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  dev:
+    uses: Spring-Oaks-Capital-LLC/github-workflows/.github/workflows/ci-cd-dev.yml@main
+    with:
+      env-vars: |
+        TARGET_ENV=dev
+    permissions:
+      id-token: write
+      contents: read

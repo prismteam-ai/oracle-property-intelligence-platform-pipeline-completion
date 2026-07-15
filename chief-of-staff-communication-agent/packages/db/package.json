@@ -1,0 +1,27 @@
+{
+  "name": "@indeedee/db",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.848.0",
+    "@indeedee/shared": "workspace:*",
+    "@libsql/client": "^0.15.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.32",
+    "typescript": "^5.8.3"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "indeedee": {
+      "url": "${INDEEDEE_MCP_URL:-http://localhost:8787/mcp}",
+      "headers": {
+        "Authorization": "Bearer ${INDEEDEE_MCP_TOKEN}"
+      }
+    }
+  }
+}

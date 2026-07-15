@@ -1,0 +1,7 @@
+{
+  "name": "indeedee",
+  "description": "Chief of Staff Communication Agent — multi-channel inbox, RAG, approval-gated sends, Asana linking.",
+  "version": "0.1.0",
+  "agents": "agents",
+  "skills": "skills"
+}

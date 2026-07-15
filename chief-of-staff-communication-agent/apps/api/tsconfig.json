@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "composite": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../../packages/shared" },
+    { "path": "../../packages/connectors" },
+    { "path": "../../packages/db" },
+    { "path": "../../packages/brain" },
+    { "path": "../../packages/asana" }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@indeedee/rag-cli",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "indeedee-retrieve": "./dist/retrieve.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "retrieve": "node dist/retrieve.js"
+  },
+  "dependencies": {
+    "@indeedee/shared": "workspace:*",
+    "@libsql/client": "^0.15.9",
+    "dotenv": "^16.5.0",
+    "zod": "^3.25.67"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.32",
+    "typescript": "^5.8.3"
+  }
+}

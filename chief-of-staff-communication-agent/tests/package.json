@@ -1,0 +1,23 @@
+{
+  "name": "@indeedee/acceptance-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:acceptance": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@indeedee/api": "workspace:*",
+    "@indeedee/brain": "workspace:*",
+    "@indeedee/connectors": "workspace:*",
+    "@indeedee/db": "workspace:*",
+    "@indeedee/shared": "workspace:*",
+    "@libsql/client": "^0.15.9",
+    "@trpc/server": "^11.4.3",
+    "@types/node": "^22.15.32",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4",
+    "zod": "^3.25.67"
+  }
+}

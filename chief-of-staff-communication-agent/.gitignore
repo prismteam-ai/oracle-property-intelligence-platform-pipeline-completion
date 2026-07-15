@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.turbo/
+.env
+.env.local
+*.db
+data/
+cdk.out/
+coverage/
+demo/frames/
+demo/.narration-indeedee/

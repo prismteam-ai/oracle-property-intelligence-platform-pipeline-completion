@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📬</text></svg>">
+  <title>Indeedee — Chief of Staff</title>
+  <style>
+    :root {
+      --page: #f9f9f7; --surface: #fcfcfb;
+      --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+      --grid: #e1e0d9; --border: rgba(11,11,11,0.10);
+      --ch-gmail: #2a78d6; --ch-email: #1baf7a; --ch-sms: #eda100;
+      --ch-whatsapp: #008300; --ch-x: #4a3aa7; --ch-linkedin: #e34948;
+      --good: #0ca30c; --critical: #d03b3b; --good-text: #006300; --accent: #2a78d6;
+      --badge-reply: #e8f2ff; --badge-task: #f0ebff; --badge-context: #fff6e5;
+      --badge-muted: #f0f0ee;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #0d0d0d; --surface: #1a1a19;
+        --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+        --grid: #2c2c2a; --border: rgba(255,255,255,0.10);
+        --ch-gmail: #3987e5; --ch-email: #199e70; --ch-sms: #c98500;
+        --ch-whatsapp: #008300; --ch-x: #9085e9; --ch-linkedin: #e66767;
+        --good-text: #0ca30c; --accent: #3987e5;
+        --badge-reply: #1a2a40; --badge-task: #2a2240; --badge-context: #3a2e10;
+        --badge-muted: #2a2a28;
+      }
+    }
+    * { box-sizing: border-box; margin: 0; }
+    body { background: var(--page); color: var(--ink);
+           font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    main { max-width: 1240px; margin: 0 auto; padding: 20px 20px 64px; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 16px;
+             flex-wrap: wrap; margin-bottom: 16px; }
+    h1 { font-size: 17px; font-weight: 650; white-space: nowrap; }
+    .subtitle { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    nav { display: flex; gap: 4px; flex-wrap: wrap; }
+    nav button { border: none; background: none; color: var(--ink-2); font: inherit; cursor: pointer;
+                 padding: 7px 12px; border-radius: 8px; }
+    nav button.active { background: var(--surface); color: var(--ink); font-weight: 600;
+                        border: 1px solid var(--border); }
+    nav button:hover { color: var(--ink); }
+    .hbtns { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .iconbtn, .pillbtn { border: 1px solid var(--border); background: var(--surface); color: var(--ink-2);
+             border-radius: 999px; padding: 6px 12px; font: inherit; font-size: 12px;
+             display: inline-flex; align-items: center; justify-content: center; gap: 6px; cursor: pointer; }
+    .iconbtn { width: 34px; height: 34px; padding: 0; border-radius: 999px; }
+    .iconbtn:hover, .pillbtn:hover { color: var(--ink); }
+    .pillbtn.active { background: var(--accent); color: #fff; border-color: transparent; }
+    .pillbtn:disabled { opacity: .5; cursor: default; }
+    .spin { animation: spin .9s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    h2 { font-size: 12px; font-weight: 600; color: var(--ink-2); text-transform: uppercase;
+         letter-spacing: .04em; margin: 22px 0 10px; }
+    h2:first-child { margin-top: 0; }
+    .panel { display: none; }
+    .panel.active { display: block; }
+    .chip { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; vertical-align: middle; }
+    .meta { color: var(--muted); font-size: 12px; }
+    .empty { color: var(--muted); padding: 16px 2px; }
+    .banner { margin-bottom: 12px; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border);
+              background: var(--surface); font-size: 13px; color: var(--ink-2); }
+    .banner.error { border-color: var(--critical); color: var(--critical); }
+    #role-badge { font-size: 11px; padding: 2px 8px; border-radius: 20px; border: 1px solid var(--border); color: var(--muted); }
+
+    .kanban { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap: 12px; align-items: start; }
+    .kcol { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+            padding: 10px; max-height: 78vh; overflow-y: auto; }
+    .kcol h3 { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+               color: var(--ink-2); margin-bottom: 10px; display: flex; justify-content: space-between; }
+    .kcount { color: var(--muted); font-weight: 500; }
+    .kcard { background: var(--page); border: 1px solid var(--border); border-radius: 8px;
+             padding: 10px 11px; margin-bottom: 8px; cursor: pointer; }
+    .kcard:hover { border-color: var(--accent); }
+    .kc-top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+    .kc-who { font-weight: 600; font-size: 13px; }
+    .kc-t { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .kc-snip { color: var(--ink-2); font-size: 12px; margin-top: 3px; overflow: hidden;
+               text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+    .kc-badge { display: inline-block; margin-top: 7px; font-size: 10.5px; padding: 2px 8px; border-radius: 20px;
+                border: 1px solid var(--border); color: var(--ink-2); }
+    .kc-badge.sent { color: var(--good-text); border-color: var(--good); }
+    .kc-badge.task { color: var(--accent); border-color: var(--accent); }
+    .kc-badge.od { color: var(--critical); border-color: var(--critical); }
+    .kc-badge.reply { background: var(--badge-reply); }
+    .kc-badge.create_task { background: var(--badge-task); }
+    .kc-badge.needs_context { background: var(--badge-context); }
+    .kempty { color: var(--muted); font-size: 12px; padding: 6px 2px; }
+
+    .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+    .tile { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+    .tile .v { font-size: 25px; font-weight: 650; }
+    .tile .l { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .tile .s { color: var(--muted); font-size: 11px; margin-top: 4px; }
+    .tile.alert .v { color: var(--critical); }
+    .tile.good .v { color: var(--good-text); }
+    .tile.clickable { cursor: pointer; }
+    .tile.clickable:hover { border-color: var(--accent); }
+
+    .bars { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+    .barrow { display: grid; grid-template-columns: 84px 1fr 84px; align-items: center; gap: 10px; padding: 5px 0; }
+    .barrow .name { color: var(--ink-2); font-size: 13px; text-transform: capitalize; }
+    .track { height: 14px; display: flex; align-items: center; }
+    .bar { height: 14px; border-radius: 4px; min-width: 2px; }
+    .barrow .n { font-variant-numeric: tabular-nums; color: var(--ink); font-size: 13px; text-align: right; }
+
+    .rec-list { display: flex; flex-direction: column; gap: 8px; }
+    .rec-row { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start;
+               background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; }
+    .rec-row .title { font-size: 13px; font-weight: 500; }
+    .rec-row .sub { font-size: 12px; color: var(--muted); margin-top: 3px; }
+
+    .rows { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+    .row { display: flex; align-items: center; justify-content: space-between; gap: 10px;
+           padding: 13px 16px; border-bottom: 1px solid var(--border); }
+    .row:last-child { border-bottom: none; }
+    .row .name { font-weight: 600; }
+    .row .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .pill { font-size: 11px; padding: 2px 8px; border-radius: 20px; border: 1px solid var(--border); color: var(--ink-2); }
+    .pill.live { color: var(--good-text); border-color: var(--good); }
+    .pill.na { color: var(--muted); }
+    .row-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .row button, .actions button { font: inherit; border-radius: 8px; padding: 6px 12px; cursor: pointer;
+                border: 1px solid var(--border); background: var(--page); color: var(--ink); font-size: 13px; }
+    .row button.cta, .actions button.approve { background: var(--accent); border-color: transparent; color: #fff; }
+    .actions button.approve { background: var(--good); }
+    .row button.primary, .actions button.primary { background: var(--accent); border-color: transparent; color: #fff; }
+    .actions button.reject { background: transparent; color: var(--ink-2); }
+
+    .approval-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+                     padding: 14px 16px; margin-bottom: 10px; }
+    .approval-card .hdr { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+    .approval-card textarea { width: 100%; font: inherit; border: 1px solid var(--grid); border-radius: 8px;
+                              background: var(--page); color: var(--ink); padding: 10px; min-height: 100px; resize: vertical; }
+    .actions { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+
+    .box { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin: 10px 0; }
+    .box .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin-bottom: 5px; }
+    .msgbody, .draft { white-space: pre-wrap; font-size: 13px; line-height: 1.5; }
+    .sent-note { color: var(--good-text); font-size: 13px; margin-top: 10px; }
+
+    .kb-add { display: flex; gap: 8px; margin: 8px 0 4px; flex-wrap: wrap; }
+    .kb-add input, .kb-add select { flex: 1; min-width: 120px; padding: 8px 10px; font: inherit;
+                                    border: 1px solid var(--grid); border-radius: 8px;
+                                    background: var(--page); color: var(--ink); }
+    .kb-add textarea { width: 100%; min-height: 70px; padding: 8px 10px; font: inherit;
+                       border: 1px solid var(--grid); border-radius: 8px; background: var(--page); color: var(--ink); }
+
+    .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: none;
+               align-items: flex-start; justify-content: center; z-index: 20; padding: 40px 16px; overflow-y: auto; }
+    .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+             padding: 22px 24px; width: 680px; max-width: 100%; }
+    .modal .x { float: right; border: none; background: none; color: var(--muted); font-size: 18px; cursor: pointer; }
+    .modal h3 { font-size: 16px; margin-bottom: 8px; }
+
+    .mcp-code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+                background: var(--page); border: 1px solid var(--grid); border-radius: 8px;
+                padding: 12px; overflow-x: auto; white-space: pre; margin-top: 10px; }
+
+    /* Connect modal (PR-1 pattern, catalog-driven) */
+    .cx-help { color: var(--ink-2); font-size: 13px; line-height: 1.5; margin-bottom: 14px; }
+    .cx-help a, .cx-fhint a { color: var(--accent); }
+    .cx-help code, .cx-note code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+                                   background: var(--page); padding: 1px 5px; border-radius: 4px; }
+    .cx-steps { margin: 0 0 14px; padding-left: 18px; color: var(--ink-2); font-size: 12.5px; line-height: 1.65; }
+    .cx-note { font-size: 12px; color: var(--ink-2); background: var(--page); border: 1px solid var(--grid);
+               border-radius: 8px; padding: 8px 10px; margin-bottom: 14px; line-height: 1.6; }
+    .cx-field { margin-bottom: 10px; }
+    .cx-field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .cx-field input { width: 100%; padding: 8px 10px; font: inherit; border: 1px solid var(--grid);
+                       border-radius: 8px; background: var(--page); color: var(--ink); }
+    .cx-fhint { font-size: 11px; color: var(--muted); margin-top: 4px; line-height: 1.45; }
+    #cx-msg { color: var(--critical); font-size: 12px; min-height: 16px; }
+    .cx-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+    .cx-actions button { font: inherit; border-radius: 8px; padding: 8px 16px; cursor: pointer; border: 1px solid var(--border); }
+    .cx-connect { background: var(--accent); color: #fff; border-color: transparent; }
+    .cx-cancel { background: transparent; color: var(--ink-2); }
+    .row button.danger { color: var(--critical); background: transparent; }
+
+    .people-split { display: grid; grid-template-columns: minmax(220px, 280px) 1fr; gap: 12px; align-items: start; }
+    .people-list { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; max-height: 78vh; overflow-y: auto; }
+    .prow { padding: 12px 14px; border-bottom: 1px solid var(--border); cursor: pointer; }
+    .prow:last-child { border-bottom: none; }
+    .prow:hover { background: var(--page); }
+    .prow.active { background: var(--page); box-shadow: inset 3px 0 0 var(--accent); }
+    .prow .name { font-weight: 600; font-size: 13px; }
+    .prow .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .people-thread { background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+                     padding: 14px 16px; max-height: 78vh; overflow-y: auto; }
+    .thread-msg { border-bottom: 1px solid var(--border); padding: 12px 0; cursor: pointer; }
+    .thread-msg:last-child { border-bottom: none; }
+    .thread-msg:hover .title { color: var(--accent); }
+
+    #login-overlay { display: none; align-items: center; justify-content: center; z-index: 30; }
+    .login-card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+                  padding: 32px 36px; width: 400px; max-width: calc(100% - 32px); text-align: center; }
+    .login-card h2 { font-size: 20px; font-weight: 650; margin-bottom: 8px; text-transform: none; letter-spacing: 0; color: var(--ink); }
+    .login-card p { color: var(--ink-2); font-size: 13px; line-height: 1.5; margin-bottom: 20px; }
+    .login-google { background: var(--accent); color: #fff; border: none; border-radius: 999px;
+                    padding: 10px 20px; font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; width: 100%; }
+    .login-google:hover { filter: brightness(1.05); }
+    #user-email { font-size: 12px; color: var(--muted); max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    @media (max-width: 900px) { .kanban { grid-template-columns: repeat(2, 1fr); } .people-split { grid-template-columns: 1fr; } }
+    @media (max-width: 560px) { .kanban { grid-template-columns: 1fr; } header { flex-direction: column; align-items: flex-start; } }
+  </style>
+</head>
+<body>
+<div id="dt-overlay" class="overlay" onclick="if(event.target===this)closeDetail()">
+  <div id="dt-card" class="modal"></div>
+</div>
+
+<div id="cx-overlay" class="overlay" onclick="if(event.target===this)closeConnect()">
+  <form id="cx-card" class="modal" onsubmit="submitConnect(event)">
+    <button type="button" class="x" onclick="closeConnect()">✕</button>
+    <h3 id="cx-title"></h3>
+    <div id="cx-help" class="cx-help"></div>
+    <ol id="cx-steps" class="cx-steps"></ol>
+    <div id="cx-note" class="cx-note" style="display:none"></div>
+    <div id="cx-fields"></div>
+    <div id="cx-msg"></div>
+    <div class="cx-actions">
+      <button type="button" class="cx-cancel" onclick="closeConnect()">Cancel</button>
+      <button type="submit" class="cx-connect">Connect</button>
+    </div>
+  </form>
+</div>
+
+<div id="login-overlay" class="overlay">
+  <div class="login-card">
+    <h2>Indeedee</h2>
+    <p>Sign in with your Google workspace account to manage communications, approvals, and connections.</p>
+    <button type="button" class="login-google" onclick="signInWithGoogle()">Sign in with Google</button>
+    <p id="login-error" class="meta" style="margin-top:14px;color:var(--critical);display:none"></p>
+  </div>
+</div>
+
+<main id="app-main">
+  <header>
+    <div>
+      <h1>Indeedee — Chief of Staff</h1>
+      <div class="subtitle">Every communication answered in under five minutes</div>
+    </div>
+    <nav id="nav">
+      <button data-tab="dashboard" class="active">Dashboard</button>
+      <button data-tab="incoming">Incoming</button>
+      <button data-tab="people">People</button>
+      <button data-tab="approvals">Approvals</button>
+      <button data-tab="knowledge">Knowledge</button>
+      <button data-tab="connections">Connections</button>
+      <button data-tab="mcp">MCP</button>
+    </nav>
+    <span class="hbtns">
+      <span id="user-email" class="meta" style="display:none"></span>
+      <span id="role-badge">owner</span>
+      <button class="pillbtn" id="role-toggle" onclick="toggleRole()">Switch to viewer</button>
+      <button class="pillbtn" id="sign-out" style="display:none" onclick="signOut()">Sign out</button>
+      <button class="pillbtn primary" onclick="seedDemo()">Demo channels</button>
+      <button id="sync" class="iconbtn" title="Sync & run agents" aria-label="Sync">
+        <svg id="sync-ico" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>
+      </button>
+    </span>
+  </header>
+
+  <div id="banner" class="banner" style="display:none"></div>
+
+  <section class="panel active" id="panel-dashboard">
+    <div class="tiles" id="tiles"></div>
+    <h2>Channel breakdown</h2>
+    <div class="bars" id="bars"></div>
+    <h2>Recommended actions</h2>
+    <div class="rec-list" id="rec-list"></div>
+  </section>
+
+  <section class="panel" id="panel-incoming">
+    <div class="kanban" id="kanban"></div>
+  </section>
+
+  <section class="panel" id="panel-people">
+    <p class="meta" style="margin-bottom:12px">Contacts grouped by sender — select a person to browse their thread across channels.</p>
+    <div class="people-split">
+      <div class="people-list" id="people-list"></div>
+      <div class="people-thread" id="people-thread"><div class="empty">Select a contact to view messages.</div></div>
+    </div>
+  </section>
+
+  <section class="panel" id="panel-approvals">
+    <p class="meta" style="margin-bottom:12px">Review style-matched drafts before anything sends. Owner role required to approve.</p>
+    <div id="approvals"></div>
+  </section>
+
+  <section class="panel" id="panel-knowledge">
+    <p class="meta" style="margin-bottom:12px">Preferences and org facts feed every recommendation and draft via RAG.</p>
+    <div id="knowledge"></div>
+    <h2>RAG search</h2>
+    <div class="kb-add">
+      <input id="rag-q" placeholder="Search knowledge — e.g. board deck, press policy" style="flex:2" />
+      <button class="primary" onclick="searchRag()">Search</button>
+    </div>
+    <div id="rag-hits" class="rec-list" style="margin-top:10px"></div>
+  </section>
+
+  <section class="panel" id="panel-connections">
+    <p class="meta" style="margin-bottom:12px">Connect communication channels. Demo mode seeds five channels instantly; live OAuth/credentials follow the same connector protocol.</p>
+    <div id="connections"></div>
+  </section>
+
+  <section class="panel" id="panel-mcp">
+    <p class="meta">Use Indeedee inside Cursor via MCP. Tools: retrieve_context, list_pending, recommend_and_draft, approve_and_send, create_asana_task, sync, dashboard_stats.</p>
+    <div class="box" style="margin-top:14px">
+      <div class="lbl">Local MCP endpoint</div>
+      <code id="mcp-url"></code>
+    </div>
+    <div class="lbl" style="margin-top:16px">Add to <code>~/.cursor/mcp.json</code></div>
+    <pre class="mcp-code" id="mcp-snippet"></pre>
+  </section>
+</main>
+
+<script>
+const CH = ["gmail","email","sms","whatsapp","x"];
+const chColor = c => `var(--ch-${c}, var(--accent))`;
+const esc = s => String(s ?? "").replace(/[&<>"']/g, m => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
+const ago = t => { const d=(Date.now()-new Date(t))/1000; return d<60?Math.round(d)+"s":d<3600?Math.round(d/60)+"m":d<86400?Math.round(d/3600)+"h":Math.round(d/86400)+"d"; };
+const OVERDUE = t => (Date.now() - new Date(t)) / 1000 > 300;
+
+const ACTION_LABEL = {
+  reply: "Reply", create_task: "Asana task", link_task: "Link task",
+  delegate: "Delegate", archive: "Archive", needs_context: "Needs you",
+};
+
+let role = localStorage.getItem("indeedee_role") || "owner";
+let TAB = "dashboard";
+let DATA = {};
+let CATALOG = null;
+let CX_CHANNEL = null;
+let CX_ACCOUNT = null;
+let PEOPLE_HANDLE = null;
+let AUTH = { ssoEnabled: false, devMode: true, user: null };
+
+function headers() {
+  const h = { "Content-Type": "application/json" };
+  if (AUTH.ssoEnabled && AUTH.user) {
+    h["X-Role"] = AUTH.user.role;
+  } else {
+    h["X-Owner-Id"] = AUTH.user?.ownerId || "demo-owner";
+    h["X-Role"] = role;
+  }
+  return h;
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(path, { credentials: "same-origin", ...opts, headers: { ...headers(), ...(opts.headers || {}) } });
+  if (res.status === 401 && AUTH.ssoEnabled) {
+    showLogin();
+    throw new Error("Sign in required");
+  }
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+async function initAuth() {
+  try {
+    AUTH = await fetch("/api/auth/config", { credentials: "same-origin" }).then(r => r.json());
+  } catch {
+    AUTH = { ssoEnabled: false, devMode: true, user: null };
+  }
+  if (AUTH.user) {
+    role = AUTH.user.role;
+    updateAuthUi();
+    document.getElementById("login-overlay").style.display = "none";
+    document.getElementById("app-main").style.display = "block";
+    return true;
+  }
+  if (AUTH.ssoEnabled) {
+    showLogin();
+    return false;
+  }
+  role = localStorage.getItem("indeedee_role") || "owner";
+  updateAuthUi();
+  return true;
+}
+
+function showLogin() {
+  document.getElementById("login-overlay").style.display = "flex";
+  document.getElementById("app-main").style.display = "none";
+}
+
+async function signInWithGoogle() {
+  try {
+    const r = await fetch("/api/auth/google/start?returnTo=" + encodeURIComponent(location.pathname + location.search), { credentials: "same-origin" }).then(r => r.json());
+    location.href = r.url;
+  } catch (e) {
+    const el = document.getElementById("login-error");
+    el.style.display = "block";
+    el.textContent = e.message;
+  }
+}
+
+async function signOut() {
+  await fetch("/api/auth/logout", { method: "POST", credentials: "same-origin" });
+  AUTH = { ssoEnabled: true, devMode: false, user: null };
+  showLogin();
+}
+
+function updateAuthUi() {
+  document.getElementById("role-badge").textContent = role;
+  const toggle = document.getElementById("role-toggle");
+  const signOutBtn = document.getElementById("sign-out");
+  const emailEl = document.getElementById("user-email");
+  if (AUTH.ssoEnabled) {
+    toggle.style.display = "none";
+    signOutBtn.style.display = AUTH.user ? "inline-flex" : "none";
+    if (AUTH.user) {
+      emailEl.style.display = "inline";
+      emailEl.textContent = AUTH.user.name || AUTH.user.email;
+      role = AUTH.user.role;
+      document.getElementById("role-badge").textContent = role;
+    }
+  } else {
+    toggle.style.display = "inline-flex";
+    signOutBtn.style.display = "none";
+    emailEl.style.display = "none";
+    toggle.textContent = role === "owner" ? "Switch to viewer" : "Switch to owner";
+  }
+}
+
+function showBanner(text, isError) {
+  const el = document.getElementById("banner");
+  if (!text) { el.style.display = "none"; return; }
+  el.style.display = "block";
+  el.className = "banner" + (isError ? " error" : "");
+  el.textContent = text;
+}
+
+function updateRoleUi() { updateAuthUi(); }
+
+function toggleRole() {
+  role = role === "owner" ? "viewer" : "owner";
+  localStorage.setItem("indeedee_role", role);
+  updateAuthUi();
+  renderTab();
+}
+
+document.getElementById("nav").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b || !b.dataset.tab) return;
+  TAB = b.dataset.tab;
+  document.querySelectorAll("#nav button").forEach(x => x.classList.toggle("active", x === b));
+  ["dashboard","incoming","people","approvals","knowledge","connections","mcp"].forEach(t =>
+    document.getElementById("panel-"+t).classList.toggle("active", t === TAB));
+  renderTab();
+});
+
+function renderTab() {
+  if (TAB === "dashboard") renderDashboard();
+  else if (TAB === "incoming") renderIncoming();
+  else if (TAB === "people") renderPeople();
+  else if (TAB === "approvals") renderApprovals();
+  else if (TAB === "knowledge") renderKnowledge();
+  else if (TAB === "connections") renderConnections();
+  else if (TAB === "mcp") renderMcp();
+}
+
+async function loadAll() {
+  try {
+    const [dash, inbox, approvals, connections, knowledge, catalog, people] = await Promise.all([
+      api("/api/dashboard"), api("/api/inbox"), api("/api/approvals"),
+      api("/api/connections"), api("/api/knowledge"), api("/api/connections/catalog"),
+      api("/api/people"),
+    ]);
+    DATA = {
+      dash, msgs: inbox.messages || [], drafts: approvals.drafts || [],
+      channels: connections.channels || [], knowledge: knowledge.items || [],
+      people: people.people || [],
+      draftByMsg: Object.fromEntries((approvals.drafts || []).map(d => [d.messageId, d])),
+    };
+    CATALOG = catalog;
+    showBanner("");
+    renderTab();
+  } catch (e) {
+    showBanner("Failed to load: " + e.message, true);
+  }
+}
+
+/* ---- Dashboard ---- */
+function renderDashboard() {
+  const d = DATA.dash; if (!d) return;
+  const tiles = [
+    { v: d.totalInbound, l: "Inbound messages", s: "all channels" },
+    { v: d.pending, l: "Awaiting response", s: `${d.overdue} overdue (>5 min)`, alert: d.overdue > 0 },
+    { v: d.answered, l: "Answered", s: "replied or handled" },
+    { v: d.pendingApprovals, l: "Pending approvals", s: "drafts waiting", tab: "approvals" },
+    { v: d.overdue, l: "Overdue SLA", s: "goal: under 5 min", alert: d.overdue > 0 },
+  ];
+  document.getElementById("tiles").innerHTML = tiles.map(x =>
+    `<div class="tile${x.alert?' alert':''}${x.tab?' clickable':''}" ${x.tab?`onclick="goTab('${x.tab}')"`:''}>
+      <div class="v">${esc(x.v)}</div><div class="l">${esc(x.l)}</div><div class="s">${esc(x.s)}</div></div>`).join("");
+
+  const chans = Object.keys(d.byChannel || {});
+  const max = Math.max(1, ...chans.map(c => d.byChannel[c] || 0));
+  document.getElementById("bars").innerHTML = chans.length ? chans.map(c =>
+    `<div class="barrow"><span class="name"><span class="chip" style="background:${chColor(c)}"></span>${esc(c)}</span>
+      <span class="track"><span class="bar" style="width:${(d.byChannel[c]/max)*100}%;background:${chColor(c)}"></span></span>
+      <span class="n">${d.byChannel[c]}</span></div>`).join("")
+    : `<div class="empty">No messages yet — connect demo channels and sync.</div>`;
+
+  const recs = (DATA.msgs || []).filter(m => m.recommendation).slice(0, 8);
+  document.getElementById("rec-list").innerHTML = recs.length ? recs.map(m => {
+    const r = m.recommendation;
+    const who = m.sender.displayName || m.sender.handle;
+    return `<div class="rec-row" onclick="openDetail('${m.id}')" style="cursor:pointer">
+      <div><div class="title"><span class="chip" style="background:${chColor(m.channel)}"></span>${esc(who)} — ${esc(m.subject || m.bodyText.slice(0,50))}</div>
+        <div class="sub">${esc(r.rationale)}</div></div>
+      <span class="kc-badge ${esc(r.action)}">${esc(ACTION_LABEL[r.action] || r.action)}</span></div>`;
+  }).join("") : `<div class="empty">No recommendations yet — sync to ingest messages.</div>`;
+}
+
+function goTab(t) {
+  TAB = t;
+  document.querySelectorAll("#nav button").forEach(b => b.classList.toggle("active", b.dataset.tab === t));
+  ["dashboard","incoming","people","approvals","knowledge","connections","mcp"].forEach(x =>
+    document.getElementById("panel-"+x).classList.toggle("active", x === t));
+  renderTab();
+}
+
+/* ---- Incoming kanban (PR-1 pattern) ---- */
+const COLS = [
+  { k: "new", label: "New" },
+  { k: "context", label: "Needs context" },
+  { k: "approval", label: "Awaiting approval" },
+  { k: "done", label: "Done" },
+];
+
+function bucketOf(m) {
+  const rec = m.recommendation, draft = DATA.draftByMsg[m.id];
+  if (m.answeredStatus === "answered" || (draft && draft.status === "sent")) return "done";
+  if (draft && draft.status === "pending_approval") return "approval";
+  if (rec && rec.needsContext) return "context";
+  if (draft && draft.status === "rejected") return "done";
+  if (rec && ["archive","create_task","link_task","delegate"].includes(rec.action)) return "done";
+  return "new";
+}
+
+function badgeFor(m, bucket) {
+  const rec = m.recommendation, draft = DATA.draftByMsg[m.id];
+  if (bucket === "done") {
+    if (m.answeredStatus === "answered" || (draft && draft.status === "sent"))
+      return `<span class="kc-badge sent">✓ replied</span>`;
+    if (rec) return `<span class="kc-badge ${esc(rec.action)}">${esc(ACTION_LABEL[rec.action] || rec.action)}</span>`;
+  }
+  if (bucket === "approval") return `<span class="kc-badge">draft ready</span>`;
+  if (rec) return `<span class="kc-badge ${esc(rec.action)}">${esc(ACTION_LABEL[rec.action] || rec.action)}</span>`;
+  if (OVERDUE(m.sentAt)) return `<span class="kc-badge od">overdue</span>`;
+  return "";
+}
+
+function renderIncoming() {
+  const msgs = [...(DATA.msgs || [])].sort((a,b) => new Date(b.sentAt) - new Date(a.sentAt));
+  const buckets = { new: [], context: [], approval: [], done: [] };
+  msgs.forEach(m => buckets[bucketOf(m)].push(m));
+  document.getElementById("kanban").innerHTML = COLS.map(col => {
+    const items = buckets[col.k];
+    return `<div class="kcol"><h3>${col.label}<span class="kcount">${items.length}</span></h3>
+      ${items.length ? items.map(m => {
+        const who = m.sender.displayName || m.sender.handle;
+        return `<div class="kcard" onclick="openDetail('${m.id}')">
+          <div class="kc-top"><span class="kc-who"><span class="chip" style="background:${chColor(m.channel)}"></span>${esc(who)}</span>
+            <span class="kc-t">${ago(m.sentAt)}</span></div>
+          <div class="kc-snip">${esc(m.subject || m.bodyText)}</div>${badgeFor(m, col.k)}</div>`;
+      }).join("") : `<div class="kempty">Nothing here</div>`}</div>`;
+  }).join("");
+}
+
+/* ---- People (PR-1 / PR-3 thread split) ---- */
+async function selectPerson(handle) {
+  PEOPLE_HANDLE = handle;
+  renderPeopleList();
+  const el = document.getElementById("people-thread");
+  el.innerHTML = `<div class="empty">Loading thread…</div>`;
+  try {
+    const thread = await api("/api/people/" + encodeURIComponent(handle));
+    if (!thread.messages?.length) {
+      el.innerHTML = `<div class="empty">No messages for this contact.</div>`;
+      return;
+    }
+    el.innerHTML = `<h3 style="font-size:15px;font-weight:650;margin-bottom:10px">${esc(thread.messages[0].sender.displayName || handle)}</h3>` +
+      thread.messages.map(m => {
+        const r = m.recommendation;
+        return `<div class="thread-msg" onclick="openDetail('${m.id}')">
+          <div class="kc-top"><span class="title"><span class="chip" style="background:${chColor(m.channel)}"></span>${esc(m.channel)} · ${esc(m.subject || m.bodyText.slice(0,40))}</span>
+            <span class="kc-t">${ago(m.sentAt)}</span></div>
+          <div class="kc-snip">${esc(m.bodyText)}</div>
+          ${r ? `<span class="kc-badge ${esc(r.action)}">${esc(ACTION_LABEL[r.action] || r.action)}</span>` : ""}
+        </div>`;
+      }).join("");
+  } catch (e) {
+    el.innerHTML = `<div class="empty">Failed to load thread: ${esc(e.message)}</div>`;
+  }
+}
+
+function renderPeopleList() {
+  const people = DATA.people || [];
+  const el = document.getElementById("people-list");
+  if (!people.length) {
+    el.innerHTML = `<div class="empty" style="padding:14px">No contacts yet — sync to ingest messages.</div>`;
+    return;
+  }
+  el.innerHTML = people.map(p => {
+    const who = p.displayName || p.handle;
+    const active = PEOPLE_HANDLE === p.handle ? " active" : "";
+    return `<div class="prow${active}" onclick='selectPerson(${JSON.stringify(p.handle)})'>
+      <div class="name">${esc(who)}</div>
+      <div class="sub">${p.messageCount} msg · ${p.channels.map(c => esc(c)).join(", ")} · ${ago(p.lastMessageAt)}</div>
+    </div>`;
+  }).join("");
+}
+
+function renderPeople() {
+  renderPeopleList();
+  if (PEOPLE_HANDLE && !(DATA.people || []).some(p => p.handle === PEOPLE_HANDLE)) {
+    PEOPLE_HANDLE = null;
+    document.getElementById("people-thread").innerHTML = `<div class="empty">Select a contact to view messages.</div>`;
+  }
+}
+
+/* ---- Approvals (PR-3 ActionsView pattern) ---- */
+function renderApprovals() {
+  const drafts = DATA.drafts || [];
+  const el = document.getElementById("approvals");
+  if (!drafts.length) {
+    el.innerHTML = `<div class="empty">No drafts awaiting approval.</div>`;
+    return;
+  }
+  el.innerHTML = drafts.map(d => {
+    const msg = (DATA.msgs || []).find(m => m.id === d.messageId);
+    const who = msg ? (msg.sender.displayName || msg.sender.handle) : d.messageId.slice(0,8);
+    const canAct = role === "owner";
+    return `<div class="approval-card" data-draft="${esc(d.id)}">
+      <div class="hdr"><div><div class="name">${esc(who)}</div>
+        <div class="sub">${msg ? esc(msg.channel) + " · " + esc(msg.subject || "") : ""}</div></div>
+        <span class="kc-badge">${esc(d.status)}</span></div>
+      <textarea id="body-${esc(d.id)}">${esc(d.body)}</textarea>
+      <div class="actions">${canAct
+        ? `<button class="approve" onclick="approveDraft('${esc(d.id)}')">Approve & send</button>
+           <button class="reject" onclick="rejectDraft('${esc(d.id)}')">Reject</button>`
+        : `<span class="meta">Viewer mode — read only</span>`}</div></div>`;
+  }).join("");
+}
+
+async function approveDraft(id) {
+  const bodyEl = document.getElementById("body-" + id) || document.getElementById("modal-body");
+  const body = bodyEl?.value;
+  try {
+    await api("/api/approve", { method: "POST", body: JSON.stringify({ draftId: id, editedBody: body }) });
+    showBanner("Draft approved and sent.");
+    await loadAll();
+  } catch (e) { showBanner("Approve failed: " + e.message, true); }
+}
+
+async function rejectDraft(id) {
+  try {
+    await api("/api/reject", { method: "POST", body: JSON.stringify({ draftId: id }) });
+    showBanner("Draft rejected.");
+    await loadAll();
+  } catch (e) { showBanner("Reject failed: " + e.message, true); }
+}
+
+/* ---- Detail modal ---- */
+async function openDetail(id) {
+  try {
+    const d = await api("/api/messages/" + id);
+    const m = d.message, r = d.recommendation;
+    let html = `<button class="x" onclick="closeDetail()">✕</button>
+      <h3>${esc(m.subject || "Message")}</h3>
+      <div class="meta"><span class="chip" style="background:${chColor(m.channel)}"></span>${esc(m.channel)} · ${new Date(m.sentAt).toLocaleString()} · ${esc(m.answeredStatus)}</div>
+      <div class="box"><div class="lbl">Message</div><div class="msgbody">${esc(m.bodyText)}</div></div>`;
+    if (r) {
+      html += `<div class="box"><div class="lbl">Recommendation</div>
+        <span class="kc-badge ${esc(r.action)}">${esc(ACTION_LABEL[r.action] || r.action)}</span>
+        <div class="meta" style="margin-top:6px">${esc(r.rationale)}</div></div>`;
+    }
+    if (d.draft) {
+      html += `<div class="box"><div class="lbl">Draft</div>
+        <textarea id="modal-body">${esc(d.draft.body)}</textarea>
+        <div class="actions">${role === "owner"
+          ? `<button class="approve" onclick="approveDraft('${esc(d.draft.id)}'); closeDetail();">Approve & send</button>
+             <button class="reject" onclick="rejectDraft('${esc(d.draft.id)}'); closeDetail();">Reject</button>`
+          : `<span class="meta">Viewer — cannot approve</span>`}</div></div>`;
+    }
+    if (r && r.needsContext) {
+      html += `<div class="box"><div class="lbl">${esc(r.contextQuestion || "Provide context")}</div>
+        <textarea id="ctx-input" placeholder="Your answer…"></textarea>
+        <div class="actions"><button class="primary" onclick="submitContext('${esc(id)}')">Submit context</button></div></div>`;
+    }
+    if (d.asanaLinks && d.asanaLinks.length) {
+      html += `<div class="box"><div class="lbl">Asana</div>` +
+        d.asanaLinks.map(a => `<div class="meta">📋 ${esc(a.taskGid)} ${a.taskUrl ? `<a href="${esc(a.taskUrl)}" target="_blank" rel="noopener">open</a>` : ""}</div>`).join("") + `</div>`;
+    }
+    if (d.related && d.related.length) {
+      html += `<div class="box"><div class="lbl">Related across channels</div>` +
+        d.related.map(rm => `<div class="meta" style="margin-top:4px"><span class="chip" style="background:${chColor(rm.channel)}"></span>${esc(rm.sender?.displayName || rm.sender?.handle || "")} — ${esc(rm.bodyText?.slice(0,80) || "")}</div>`).join("") + `</div>`;
+    }
+    document.getElementById("dt-card").innerHTML = html;
+    document.getElementById("dt-overlay").style.display = "flex";
+  } catch (e) { showBanner("Failed to open message: " + e.message, true); }
+}
+
+function closeDetail() {
+  document.getElementById("dt-overlay").style.display = "none";
+}
+
+async function submitContext(msgId) {
+  const ctx = document.getElementById("ctx-input")?.value?.trim();
+  if (!ctx) { showBanner("Type context first.", true); return; }
+  try {
+    await api("/api/context", { method: "POST", body: JSON.stringify({ messageId: msgId, context: ctx }) });
+    showBanner("Context submitted — draft regenerated.");
+    closeDetail();
+    await loadAll();
+  } catch (e) { showBanner("Context failed: " + e.message, true); }
+}
+
+/* ---- Knowledge ---- */
+function renderKnowledge() {
+  const items = DATA.knowledge || [];
+  const kinds = [
+    { id: "preference", title: "Preferences", hint: "Standing rules — e.g. keep replies short" },
+    { id: "org", title: "Organizational knowledge", hint: "Facts to cite — e.g. Q3 launch date" },
+  ];
+  document.getElementById("knowledge").innerHTML = kinds.map(k => {
+    const list = items.filter(i => i.kind === k.id);
+    return `<h2>${k.title}</h2><div class="meta" style="margin:-4px 0 8px">${k.hint}</div>
+      <div class="rows">${list.length ? list.map(i =>
+        `<div class="row"><div><div class="name">${esc(i.title)}</div><div class="sub">${esc(i.body)}</div></div></div>`).join("")
+        : `<div class="row"><div class="sub">Nothing yet.</div></div>`}</div>`;
+  }).join("") + `
+    <h2>Add knowledge</h2>
+    <div class="kb-add">
+      <select id="k-kind"><option value="preference">Preference</option><option value="org">Org fact</option></select>
+      <input id="k-title" placeholder="Title" style="flex:1" />
+    </div>
+    <div class="kb-add"><textarea id="k-body" placeholder="Content…"></textarea></div>
+    <button class="primary" onclick="addKnowledge()" ${role !== "owner" ? "disabled" : ""}>Add to knowledge</button>`;
+}
+
+async function addKnowledge() {
+  const kind = document.getElementById("k-kind").value;
+  const title = document.getElementById("k-title").value.trim();
+  const body = document.getElementById("k-body").value.trim();
+  if (!title || !body) { showBanner("Title and body required.", true); return; }
+  try {
+    await api("/api/knowledge", { method: "POST", body: JSON.stringify({ kind, title, body }) });
+    showBanner("Knowledge added.");
+    await loadAll();
+  } catch (e) { showBanner("Add failed: " + e.message, true); }
+}
+
+async function searchRag() {
+  const q = document.getElementById("rag-q").value.trim();
+  if (!q) return;
+  try {
+    const r = await api("/api/rag/search", { method: "POST", body: JSON.stringify({ query: q, topK: 5 }) });
+    document.getElementById("rag-hits").innerHTML = (r.hits || []).length ? r.hits.map(h =>
+      `<div class="rec-row"><div><div class="title">${esc(h.title || h.sourceType)}</div>
+        <div class="sub">${esc(h.textForContext?.slice(0,200) || "")}</div></div>
+        <span class="pill">${esc(h.sourceType)}</span></div>`).join("")
+      : `<div class="empty">No hits.</div>`;
+  } catch (e) { showBanner("Search failed: " + e.message, true); }
+}
+
+/* ---- Connections (catalog-driven modals) ---- */
+function renderConnections() {
+  const el = document.getElementById("connections");
+  if (!CATALOG) {
+    el.innerHTML = `<div class="empty">Loading channel catalog…</div>`;
+    return;
+  }
+  const origin = location.origin;
+  const row = (entry) => {
+    const conns = entry.connections || [];
+    const isLive = conns.length > 0;
+    const sub = isLive
+      ? conns.map(c => esc(c.accountHandle)).join(", ")
+      : entry.description;
+    let actions = "";
+    const testBtn = (channelId, handle) =>
+      `<button onclick="testConnection('${esc(channelId)}'${handle ? `,'${esc(handle)}'` : ""})">Test</button>`;
+    if (entry.kind === "unavailable") {
+      actions = `<span class="pill na">unavailable</span>`;
+    } else if (entry.kind === "oauth") {
+      if (!CATALOG.googleOAuthConfigured) {
+        actions = `<span class="pill na">needs GOOGLE_CLIENT_ID</span>`;
+      } else if (isLive) {
+        actions = `<span class="pill live">live</span>
+          ${conns.map(c => testBtn(entry.id, c.accountHandle)).join("")}
+          <button onclick="oauthConnect()">Re-authorize</button>
+          ${conns.map(c => `<button class="danger" onclick="disconnectChannel('${esc(entry.id)}','${esc(c.accountHandle)}')">Disconnect</button>`).join("")}`;
+      } else {
+        actions = `<button class="cta" onclick="oauthConnect()">Connect with Google</button>`;
+      }
+    } else if (entry.kind === "credentials") {
+      if (isLive) {
+        actions = `<span class="pill live">live</span>
+          ${entry.id === "asana" ? testBtn("asana", "") : conns.map(c => testBtn(entry.id, c.accountHandle)).join("")}
+          <button onclick="openConnect('${esc(entry.id)}','${esc(conns[0]?.accountHandle || "")}')">Reconfigure</button>
+          ${entry.id === "asana"
+            ? `<button class="danger" onclick="disconnectAsana()">Disconnect</button>`
+            : conns.map(c => `<button class="danger" onclick="disconnectChannel('${esc(entry.id)}','${esc(c.accountHandle)}')">Disconnect</button>`).join("")}`;
+      } else {
+        actions = `<button onclick="openConnect('${esc(entry.id)}')">Connect</button>`;
+      }
+    }
+    return `<div class="row"><div>
+      <div class="name"><span class="chip" style="background:${chColor(entry.id)}"></span>${esc(entry.label)}</div>
+      <div class="sub">${sub}</div></div><div class="row-actions">${actions}</div></div>`;
+  };
+  const live = CATALOG.channels.filter(c => (c.connections || []).length > 0);
+  const avail = CATALOG.channels.filter(c => !(c.connections || []).length && c.kind !== "unavailable");
+  const blocked = CATALOG.channels.filter(c => c.kind === "unavailable");
+  el.innerHTML =
+    (live.length ? `<h2>Connected</h2><div class="rows">${live.map(row).join("")}</div>` : "") +
+    `<h2>Available</h2><div class="rows">${avail.map(row).join("")}</div>` +
+    `<h2>Unavailable</h2><div class="rows">${blocked.map(row).join("")}</div>` +
+    `<p class="meta" style="margin-top:12px">OAuth uses a browser redirect (not a modal). Credential channels open a connect form. Secrets are encrypted at rest (local AES-256-GCM or AWS Secrets Manager in production) — never logged.</p>`;
+}
+
+async function oauthConnect() {
+  if (role !== "owner") { showBanner("Owner role required.", true); return; }
+  try {
+    const r = await api("/api/oauth/google/start");
+    location.href = r.url;
+  } catch (e) { showBanner("Google OAuth failed: " + e.message, true); }
+}
+
+function openConnect(channelId, accountHandle) {
+  if (role !== "owner") { showBanner("Owner role required.", true); return; }
+  const entry = (CATALOG?.channels || []).find(c => c.id === channelId);
+  if (!entry || !entry.fields?.length) {
+    showBanner("No connect form for this channel.", true);
+    return;
+  }
+  CX_CHANNEL = channelId;
+  CX_ACCOUNT = accountHandle || null;
+  const reconf = Boolean(accountHandle);
+  document.getElementById("cx-title").textContent = reconf
+    ? "Reconfigure " + entry.label
+    : "Connect " + entry.label;
+  document.getElementById("cx-help").innerHTML = (entry.helpHtml || entry.description || "")
+    .replaceAll("{origin}", location.origin);
+  document.getElementById("cx-steps").innerHTML = (entry.steps || [])
+    .map(s => `<li>${s.replaceAll("{origin}", location.origin)}</li>`).join("");
+  const noteEl = document.getElementById("cx-note");
+  const parts = [];
+  if (reconf) parts.push(`<b>Updating ${esc(accountHandle)}.</b> Re-enter credentials — stored secrets are never shown back.`);
+  if (entry.noteHtml) parts.push(entry.noteHtml);
+  if (parts.length) { noteEl.innerHTML = parts.join("<br><br>"); noteEl.style.display = "block"; }
+  else { noteEl.style.display = "none"; }
+  document.getElementById("cx-fields").innerHTML = entry.fields.map(f => {
+    const prefill = reconf && f.handleField && accountHandle ? ` value="${esc(accountHandle)}"` : "";
+    return `<div class="cx-field"><label>${esc(f.label)}</label>
+      <input data-k="${esc(f.key)}" type="${f.type}" placeholder="${esc(f.placeholder || "")}" ${f.required ? "required" : ""}${prefill}>
+      ${f.hint ? `<div class="cx-fhint">${esc(f.hint)}</div>` : ""}</div>`;
+  }).join("");
+  document.getElementById("cx-msg").textContent = "";
+  document.getElementById("cx-overlay").style.display = "flex";
+}
+
+function closeConnect() {
+  document.getElementById("cx-overlay").style.display = "none";
+  CX_CHANNEL = null;
+  CX_ACCOUNT = null;
+}
+
+async function submitConnect(ev) {
+  ev.preventDefault();
+  if (!CX_CHANNEL) return;
+  const values = {};
+  document.querySelectorAll("#cx-fields input").forEach(i => { values[i.dataset.k] = i.value.trim(); });
+  const msg = document.getElementById("cx-msg");
+  msg.textContent = "Connecting…";
+  try {
+    await api("/api/connect/form", {
+      method: "POST",
+      body: JSON.stringify({ channelId: CX_CHANNEL, values }),
+    });
+    closeConnect();
+    showBanner(`${CX_CHANNEL} connected.`);
+    await loadAll();
+  } catch (e) { msg.textContent = e.message; }
+}
+
+async function disconnectChannel(channel, accountHandle) {
+  if (!confirm(`Disconnect ${channel} (${accountHandle})?`)) return;
+  try {
+    await api(`/api/connect/${encodeURIComponent(channel)}/${encodeURIComponent(accountHandle)}`, { method: "DELETE" });
+    showBanner(`${channel} disconnected.`);
+    await loadAll();
+  } catch (e) { showBanner("Disconnect failed: " + e.message, true); }
+}
+
+async function testConnection(channelId, accountHandle) {
+  if (role !== "owner") { showBanner("Owner role required.", true); return; }
+  showBanner(`Testing ${channelId}…`);
+  try {
+    const body = { channelId };
+    if (accountHandle) body.accountHandle = accountHandle;
+    const r = await api("/api/connect/test", { method: "POST", body: JSON.stringify(body) });
+    showBanner(`${channelId} OK — ${r.label}${r.mode === "demo" ? " (demo)" : ""}`);
+  } catch (e) { showBanner(`${channelId} test failed: ${e.message}`, true); }
+}
+
+async function disconnectAsana() {
+  if (!confirm("Disconnect Asana?")) return;
+  try {
+    await api("/api/connect/asana", { method: "DELETE" });
+    showBanner("Asana disconnected.");
+    await loadAll();
+  } catch (e) { showBanner("Disconnect failed: " + e.message, true); }
+}
+
+async function connectDemo(channel) {
+  if (role !== "owner") { showBanner("Owner role required.", true); return; }
+  try {
+    await api("/api/connect", { method: "POST", body: JSON.stringify({
+      channel, accountHandle: `demo-${channel}@indeedee.local`, credentials: { mode: "demo" },
+    })});
+    showBanner(`${channel} connected (demo).`);
+    await loadAll();
+  } catch (e) { showBanner("Connect failed: " + e.message, true); }
+}
+
+async function seedDemo() {
+  if (role !== "owner") { showBanner("Owner role required.", true); return; }
+  try {
+    await api("/api/seed-demo", { method: "POST" });
+    await syncNow();
+    showBanner("Demo channels connected and synced.");
+  } catch (e) { showBanner("Seed failed: " + e.message, true); }
+}
+
+/* ---- MCP ---- */
+function renderMcp() {
+  const url = location.origin + "/mcp/tools/call";
+  document.getElementById("mcp-url").textContent = url;
+  const ownerId = AUTH.user?.ownerId || "demo-owner";
+  document.getElementById("mcp-snippet").textContent = JSON.stringify({
+    mcpServers: {
+      indeedee: {
+        url: location.origin + "/mcp",
+        headers: { "X-Owner-Id": ownerId, "X-Role": role },
+      },
+    },
+  }, null, 2);
+}
+
+/* ---- Sync ---- */
+document.getElementById("sync").onclick = syncNow;
+async function syncNow() {
+  if (role !== "owner") { showBanner("Owner role required to sync.", true); return; }
+  const btn = document.getElementById("sync");
+  const ico = document.getElementById("sync-ico");
+  btn.disabled = true; ico.classList.add("spin");
+  try {
+    const r = await api("/api/sync", { method: "POST" });
+    showBanner(`Synced — ${r.ingest?.ingested ?? 0} ingested, ${r.brainProcessed?.length ?? 0} processed.`);
+    await loadAll();
+  } catch (e) { showBanner("Sync failed: " + e.message, true); }
+  finally { btn.disabled = false; ico.classList.remove("spin"); }
+}
+
+updateAuthUi();
+applyUrlParams();
+(async () => {
+  const ready = await initAuth();
+  if (ready) {
+    await loadAll();
+    setInterval(loadAll, 30000);
+  }
+})();
+
+function applyUrlParams() {
+  const p = new URLSearchParams(location.search);
+  const tab = p.get("tab");
+  const err = p.get("error");
+  const connected = p.get("connected");
+  if (tab) goTab(tab);
+  if (err) showBanner(decodeURIComponent(err), true);
+  if (connected) showBanner(`${connected} connected successfully.`);
+  if (tab || err || connected) history.replaceState({}, "", location.pathname);
+}
+</script>
+</body>
+</html>

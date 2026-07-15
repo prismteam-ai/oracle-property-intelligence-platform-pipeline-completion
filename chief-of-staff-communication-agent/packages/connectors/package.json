@@ -1,0 +1,30 @@
+{
+  "name": "@indeedee/connectors",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@indeedee/shared": "workspace:*",
+    "@indeedee/db": "workspace:*",
+    "imapflow": "^1.0.164",
+    "mailparser": "^3.7.2",
+    "nodemailer": "^6.9.16"
+  },
+  "devDependencies": {
+    "@types/nodemailer": "^6.4.17",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}

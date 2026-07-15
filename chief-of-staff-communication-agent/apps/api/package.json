@@ -1,0 +1,38 @@
+{
+  "name": "@indeedee/api",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/handler.js",
+  "exports": {
+    "./trpc/router": {
+      "types": "./dist/trpc/router.d.ts",
+      "default": "./dist/trpc/router.js"
+    },
+    "./agent/tools": {
+      "types": "./dist/agent/tools.d.ts",
+      "default": "./dist/agent/tools.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx --env-file=../../.env src/local-server.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@indeedee/asana": "workspace:*",
+    "@indeedee/brain": "workspace:*",
+    "@indeedee/connectors": "workspace:*",
+    "@indeedee/db": "workspace:*",
+    "@indeedee/shared": "workspace:*",
+    "@trpc/server": "^11.4.3",
+    "zod": "^3.25.67"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.152",
+    "@types/node": "^22.15.32",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
+  }
+}
