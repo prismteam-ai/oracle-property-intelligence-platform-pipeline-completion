@@ -73,6 +73,110 @@ Complete the Oracle pipeline by loading all available county property, permit, o
 - Presenter: “Finally, I will show that the system is MCP-ready.”
   - Expected Result: The system demonstrates an MCP-ready interface or documented MCP-compatible query structure that agents can use without changing the data model.
 
+## Demo walkthrough (run the transcript locally)
+
+### Before you start
+
+```bash
+cp .env.example .env
+./scripts/run.sh setup               # once: Python + MCP npm deps
+./scripts/run.sh pipeline              # builds data/properties.parquet
+./scripts/run.sh ui-start              # terminal 1 → http://localhost:3000
+./scripts/run.sh ui-mcp-start          # terminal 2 → http://localhost:8000/mcp
+```
+
+If `data/properties.parquet` is missing, open the UI and click **Load dataset**, or run `./scripts/run.sh pipeline`.
+
+For the **agent** steps, also run:
+
+```bash
+./scripts/run.sh cursor-mcp-fix        # generates .mcp.json for Cursor
+# Reload Cursor → enable Soofi elephant MCP server
+```
+
+### Transcript → URL map
+
+| Presenter says | Open | Status |
+|----------------|------|--------|
+| Opening statement (Palo Alto, DuckDB, IPFS, UI + agent) | http://localhost:3000/ | Works — dashboard shows county stats |
+| “First, I am opening the pipeline run summary.” | http://localhost:3000/run | Works — `completed` badge, timing, constraints |
+| “Show the total uploaded records by source.” | Same `/run` page | Works — 6 sources with counts, timestamps, provenance |
+| “Now I am opening the DuckDB-backed query layer.” | http://localhost:3000/sandbox | Works — live DuckDB queries on parquet, no hosted DB |
+| “Show the IPFS artifacts…” | http://localhost:3000/about | Works — CIDs shown; see caveat below on Filebase |
+| “Properties with roofs older than 15 years” | http://localhost:3000/sandbox?preset=roofs | Works — permit-based roof age + `source_system` |
+| “Properties with a view of water” | http://localhost:3000/sandbox?preset=water | Works — OSM proximity; basis note on page |
+| “Not exchanged ownership in more than 10 years” | http://localhost:3000/sandbox?preset=ownership | Works with caveat — see narration below |
+| “Properties with regional owners” | http://localhost:3000/sandbox?preset=regional | Works |
+| “Walking distance of public transportation” | http://localhost:3000/sandbox?preset=transit | Works — haversine meters from parcel coords |
+| “Walking distance of Starbucks” | http://localhost:3000/sandbox?preset=starbucks | Works — haversine meters from parcel coords |
+| “Asking the same questions through the agent” | Cursor + http://localhost:8000/mcp | Works live — not one-click in UI; see agent steps below |
+| “System is MCP-ready” | http://localhost:3000/about | Works — MCP config + `queryProperties` endpoint |
+
+Static snapshots of all six UI questions are also on http://localhost:3000/explore. Use **Sandbox** for the live demo (sliders update results automatically).
+
+### What to say during caveats
+
+**Ownership (10+ years)** — California bulk assessor data does not include sale dates. Say:
+
+> “We use permit dormancy and owner-text signals as a proxy — not recorded deed transfers. The UI basis note documents this.”
+
+**IPFS artifacts** — Without Filebase `S3_*` keys, manifest uses local content hashes. Say:
+
+> “The publish contract is IPFS-ready. With Filebase credentials in `.env`, real gateway URLs appear here after re-running the pipeline.”
+
+### Agent demo (transcript steps 66–72)
+
+The `/ask` page lists the README prompts. To satisfy the transcript, run at least one query in **Cursor** with the elephant MCP connected:
+
+1. `./scripts/run.sh ui-mcp-start` (or enable Soofi plugin elephant MCP)
+2. In Cursor, use `queryProperties` on county `santa-clara`
+
+**Prompt 1** (from transcript):
+
+> Which properties have roofs older than 15 years and have not exchanged ownership in more than 10 years?
+
+Example tool call the agent should produce:
+
+```sql
+SELECT parcel_id, address_street, address_city, roof_age_years,
+       years_since_ownership_change, source_system
+FROM properties
+WHERE roof_age_years >= 15
+  AND (years_since_ownership_change >= 10 OR last_sale_date IS NULL)
+LIMIT 25
+```
+
+**Prompt 2:**
+
+> Which properties are near public transportation and also have regional owners?
+
+```sql
+SELECT parcel_id, address_street, address_city,
+       distance_to_public_transit_m, is_regional_owner, source_system
+FROM properties
+WHERE distance_to_public_transit_m <= 800
+  AND is_regional_owner = true
+LIMIT 25
+```
+
+**Prompt 3:**
+
+> Which properties appear to be strong candidates for further review based on ownership age, roof age, and location signals?
+
+Ask the agent to rank/filter using `roof_age_years`, `years_since_ownership_change`, and distance columns — and to state any missing assessor fields.
+
+### Recommended demo order (~5 min)
+
+1. `/run` — pipeline completed, six sources, constraints  
+2. `/about` — DuckDB layer, IPFS CIDs, MCP endpoint  
+3. `/sandbox` — walk all six presets; change roof age and transit distance live  
+4. **Cursor** — run Prompt 1 via `queryProperties`  
+5. `/about` — close with MCP-ready config  
+
+### Demo video
+
+Pre-recorded walkthrough (steps 1–3 + `/ask` prompts): [`demo/oracle-property-intelligence-demo.webm`](demo/oracle-property-intelligence-demo.webm). Add ~2 min of live Cursor MCP (step 4) for full transcript coverage.
+
 ## Reference
 - [Soofi XYZ Team Kit](https://github.com/soofi-xyz/soofi-xyz-team-kit)
 - [Elephant Oracle Skills](https://github.com/elephant-xyz/skills)
