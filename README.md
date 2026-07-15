@@ -175,7 +175,9 @@ Ask the agent to rank/filter using `roof_age_years`, `years_since_ownership_chan
 
 ### Demo video
 
-Pre-recorded walkthrough (steps 1–3 + `/ask` prompts): [`demo/oracle-property-intelligence-demo.webm`](demo/oracle-property-intelligence-demo.webm). Add ~2 min of live Cursor MCP (step 4) for full transcript coverage.
+Pre-recorded walkthrough with **voiceover** narrating the README transcript (steps 1–3 + `/ask` prompts): [`demo/oracle-property-intelligence-demo.webm`](demo/oracle-property-intelligence-demo.webm). Add ~2 min of live Cursor MCP (step 4) for full transcript coverage.
+
+Regenerate narration: `python3 scripts/add-demo-narration.py` (requires `edge-tts`, `imageio-ffmpeg`).
 
 ## Reference
 - [Soofi XYZ Team Kit](https://github.com/soofi-xyz/soofi-xyz-team-kit)
@@ -227,7 +229,7 @@ Short walkthrough (~35s) of the working local solution:
 | | |
 |--|--|
 | **File** | [`demo/oracle-property-intelligence-demo.webm`](demo/oracle-property-intelligence-demo.webm) |
-| **Format** | WebM (~35s) — play in browser or VLC |
+| **Format** | WebM (~34s) with voiceover — play in browser or VLC |
 
 **What the video shows:** dashboard → run summary (6 sources) → IPFS/about → interactive sandbox (roof + transit filters) → explore → agent/MCP prompts.
 
@@ -375,7 +377,7 @@ If the dataset is missing, open the UI and click **Load dataset** (runs the pipe
 
 Short local walkthrough (~35s) following the README demo transcript:
 
-- **File:** [`demo/oracle-property-intelligence-demo.webm`](demo/oracle-property-intelligence-demo.webm)
+- **File:** [`demo/oracle-property-intelligence-demo.webm`](demo/oracle-property-intelligence-demo.webm) (includes README transcript voiceover)
 
 Scenes: dashboard stats → run summary → IPFS/about → interactive sandbox (roof + transit filters) → explore → agent prompts.
 

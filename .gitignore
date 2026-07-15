@@ -18,8 +18,9 @@ data/
 ingest/
 *.parquet
 
-# Demo video (submitted with PR; no re-record tooling in repo)
+# Demo video (submitted with PR)
 demo/.capture/
+demo/.narration/
 
 # Python
 __pycache__/
