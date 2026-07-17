@@ -13,8 +13,13 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@oracle/agent": "workspace:*",
+    "@oracle/artifacts": "workspace:*",
     "@oracle/contracts": "workspace:*",
+    "@oracle/data-runtime": "workspace:*",
+    "@oracle/features": "workspace:*",
     "@oracle/observability": "workspace:*",
+    "@oracle/query-core": "workspace:*",
     "@trpc/server": "11.18.0"
   },
   "devDependencies": {

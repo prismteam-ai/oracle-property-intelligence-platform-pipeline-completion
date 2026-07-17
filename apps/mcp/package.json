@@ -13,8 +13,14 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@oracle/agent": "workspace:*",
+    "@oracle/artifacts": "workspace:*",
     "@oracle/contracts": "workspace:*",
-    "@oracle/observability": "workspace:*"
+    "@oracle/data-runtime": "workspace:*",
+    "@oracle/observability": "workspace:*",
+    "@oracle/query-core": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@oracle/tsconfig": "workspace:*",
