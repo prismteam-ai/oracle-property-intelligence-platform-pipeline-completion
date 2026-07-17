@@ -1,0 +1,15 @@
+.assessment
+.git
+.config
+cdk.out
+coverage
+node_modules
+pnpm-lock.yaml
+README.md
+config/dependencies
+config/team-kit-applicability
+docs/operations
+tools
+.env.example
+.gitleaks.toml
+.gitignore

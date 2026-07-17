@@ -1,0 +1,12 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/contracts" },
+    { "path": "./packages/observability" },
+    { "path": "./apps/api" },
+    { "path": "./apps/mcp" },
+    { "path": "./apps/pipeline" },
+    { "path": "./apps/web" },
+    { "path": "./infra/cdk" }
+  ]
+}
