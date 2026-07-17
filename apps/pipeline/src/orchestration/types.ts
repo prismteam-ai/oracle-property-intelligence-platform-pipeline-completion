@@ -1,0 +1,192 @@
+import type { ArtifactStore, StoredArtifact } from '@oracle/artifacts/artifact-store';
+import type { CheckpointStore } from '@oracle/artifacts/checkpoint-store';
+import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
+import type { RunId, SnapshotId, SourceId } from '@oracle/contracts/ids';
+import type { AcquiredArtifact, SourceRunSummary } from '@oracle/contracts/source';
+import type { AnalyticalRuntime } from '@oracle/data-runtime/analytical-runtime';
+import type {
+  Clock,
+  Delay,
+  DiscoveryResult,
+  SourceAdapter,
+} from '@oracle/source-adapters/spi/adapter';
+import type { HttpTransport } from '@oracle/source-adapters/spi/http';
+
+export const ORCHESTRATION_PHASES = Object.freeze([
+  'discover',
+  'plan',
+  'acquire',
+  'decode',
+  'validate',
+  'normalize',
+  'summarize',
+  'reconcile',
+  'derive_features',
+  'build_marts',
+  'finalize',
+] as const);
+
+export type OrchestrationPhase = (typeof ORCHESTRATION_PHASES)[number];
+export type RunProfileName = 'discovery' | 'pilot' | 'full' | 'incremental';
+export type SourceTerminalState = 'complete' | 'partial' | 'blocked' | 'failed';
+
+export type RunProfile = Readonly<{
+  name: RunProfileName;
+  recordCap: number | null;
+  maxConcurrentSources: number;
+  maxBufferedRecords: number;
+}>;
+
+export type SourceConfiguration = Readonly<{
+  adapter: SourceAdapter;
+  snapshotId: SnapshotId;
+  expectedRecords?: number | null;
+  limitations?: readonly string[];
+}>;
+
+export type PipelineConfiguration = Readonly<{
+  runId: RunId;
+  pipelineVersion: string;
+  requestedAt: string;
+  profile: RunProfile;
+  sources: readonly SourceConfiguration[];
+  maximumPhaseAttempts: number;
+}>;
+
+export type PhaseTiming = Readonly<{
+  phase: OrchestrationPhase;
+  startedAt: string;
+  completedAt: string;
+  durationMs: number;
+  attempts: number;
+}>;
+
+export type SourceCoverage = Readonly<{
+  expectedRecords: number | null;
+  observedRecords: number;
+  acceptedRecords: number;
+  quarantinedRecords: number;
+  denominatorMethod: 'configured' | 'discovered' | 'unavailable';
+  ratio: number | null;
+}>;
+
+export type PhaseArtifact = Readonly<{
+  phase: OrchestrationPhase;
+  logicalKey: string;
+  uri: string;
+  mediaType: string;
+  byteSize: number;
+  sha256: string;
+}>;
+
+export type SourceExecutionManifest = Readonly<{
+  sourceId: SourceId;
+  snapshotId: SnapshotId;
+  terminalState: SourceTerminalState;
+  sourceHash: string;
+  schemaHashes: readonly string[];
+  checkpointRevision: string | null;
+  coverage: SourceCoverage;
+  timings: readonly PhaseTiming[];
+  artifacts: readonly PhaseArtifact[];
+  limitations: readonly string[];
+  errorCodes: readonly string[];
+  summary: SourceRunSummary | null;
+}>;
+
+export type PipelineRunManifest = Readonly<{
+  schemaVersion: '1.0.0';
+  runId: RunId;
+  pipelineVersion: string;
+  profile: RunProfileName;
+  status: 'succeeded' | 'partial' | 'failed' | 'aborted';
+  requestedAt: string;
+  completedAt: string;
+  configurationHash: string;
+  coverageDenominators: Readonly<{
+    expectedRecords: number | null;
+    observedRecords: number;
+    acceptedRecords: number;
+    quarantinedRecords: number;
+  }>;
+  backpressure: Readonly<{
+    maxConcurrentSources: number;
+    maxBufferedRecords: number;
+  }>;
+  sources: readonly SourceExecutionManifest[];
+  artifacts: readonly PhaseArtifact[];
+  limitations: readonly string[];
+}>;
+
+export type PipelineResult = Readonly<{
+  manifest: PipelineRunManifest;
+  manifestArtifact: StoredArtifact;
+}>;
+
+export type ReconciliationOutput = Readonly<{
+  canonical: unknown;
+  links: unknown;
+}>;
+
+export interface PipelineProcessors {
+  reconcile(
+    mutations: readonly CanonicalMutation[],
+    signal: AbortSignal,
+  ): Promise<ReconciliationOutput>;
+  deriveFeatures(reconciled: ReconciliationOutput, signal: AbortSignal): Promise<unknown>;
+  buildMarts(
+    input: Readonly<{ reconciled: ReconciliationOutput; features: unknown }>,
+    signal: AbortSignal,
+  ): Promise<unknown>;
+}
+
+export type OrchestrationDependencies = Readonly<{
+  artifactStore: ArtifactStore;
+  checkpointStore: CheckpointStore;
+  analyticalRuntime: AnalyticalRuntime;
+  http: HttpTransport;
+  clock: Clock;
+  delay: Delay;
+  processors: PipelineProcessors;
+  signal: AbortSignal;
+  beforePhase?: (phase: OrchestrationPhase, sourceId: SourceId | null) => void | Promise<void>;
+}>;
+
+export type PersistedSourceState = Readonly<{
+  sourceId: SourceId;
+  snapshotId: SnapshotId;
+  completedPhase: OrchestrationPhase | null;
+  discoveryArtifact: PhaseArtifact | null;
+  planArtifact: PhaseArtifact | null;
+  acquiredArtifact: PhaseArtifact | null;
+  mutationArtifact: PhaseArtifact | null;
+  summaryArtifact: PhaseArtifact | null;
+  manifestArtifact: PhaseArtifact | null;
+  decodedRecords: number;
+  acceptedRecords: number;
+  rejectedRecords: number;
+  validationIssues: readonly unknown[];
+  timings: readonly PhaseTiming[];
+  terminalState: SourceTerminalState | null;
+  limitations: readonly string[];
+  errorCodes: readonly string[];
+}>;
+
+export type PersistedRunState = Readonly<{
+  schemaVersion: 1;
+  runId: RunId;
+  configurationHash: string;
+  sources: readonly PersistedSourceState[];
+  reconcileArtifact: PhaseArtifact | null;
+  featureArtifact: PhaseArtifact | null;
+  martArtifact: PhaseArtifact | null;
+  manifestArtifact: PhaseArtifact | null;
+  completedPhase: OrchestrationPhase | null;
+}>;
+
+export type SourceRuntimeData = Readonly<{
+  discovery: DiscoveryResult;
+  acquired: readonly AcquiredArtifact[];
+  mutations: readonly CanonicalMutation[];
+  summary: SourceRunSummary;
+}>;
