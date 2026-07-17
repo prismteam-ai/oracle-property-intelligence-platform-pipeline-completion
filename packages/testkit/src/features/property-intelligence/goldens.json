@@ -1,0 +1,87 @@
+{
+  "schemaVersion": "1.0.0",
+  "asOf": "2026-07-17T00:00:00.000Z",
+  "cases": [
+    {
+      "id": "roof-strict-finaled",
+      "feature": "roof_age",
+      "evidenceState": "complete",
+      "expectedSupport": "supported",
+      "expectedMode": "explicit_completed_roof_work",
+      "positiveClaimAllowed": true
+    },
+    {
+      "id": "roof-issued-proxy",
+      "feature": "roof_age",
+      "evidenceState": "complete",
+      "expectedSupport": "proxy",
+      "expectedMode": "issued_roof_permit_proxy",
+      "positiveClaimAllowed": false
+    },
+    {
+      "id": "roof-blocked-unknown",
+      "feature": "roof_age",
+      "evidenceState": "blocked",
+      "expectedSupport": "unknown",
+      "expectedMode": null,
+      "positiveClaimAllowed": false
+    },
+    {
+      "id": "water-clear-terrain-candidate",
+      "feature": "water_view_candidate",
+      "evidenceState": "complete",
+      "expectedSupport": "supported",
+      "expectedMode": "terrain_and_proximity",
+      "positiveClaimAllowed": true,
+      "actualViewClaimAllowed": false
+    },
+    {
+      "id": "water-proximity-only-proxy",
+      "feature": "water_view_candidate",
+      "evidenceState": "partial",
+      "expectedSupport": "proxy",
+      "expectedMode": "proximity_only_proxy",
+      "positiveClaimAllowed": false,
+      "actualViewClaimAllowed": false
+    },
+    {
+      "id": "ownership-complete-strict",
+      "feature": "ownership_age",
+      "evidenceState": "complete",
+      "expectedSupport": "supported",
+      "expectedMode": "verified_transfer_and_current_owner",
+      "positiveClaimAllowed": true
+    },
+    {
+      "id": "ownership-partial-denial",
+      "feature": "ownership_age",
+      "evidenceState": "partial",
+      "expectedSupport": "unknown",
+      "expectedMode": null,
+      "positiveClaimAllowed": false
+    },
+    {
+      "id": "regional-owner-blocked-denial",
+      "feature": "regional_owner",
+      "evidenceState": "blocked",
+      "expectedSupport": "unknown",
+      "expectedMode": null,
+      "positiveClaimAllowed": false
+    }
+  ],
+  "prohibitedPublicOwnerFields": [
+    "ownerName",
+    "rawOwnerName",
+    "mailingAddress",
+    "streetAddress",
+    "email",
+    "phone"
+  ],
+  "requiredWaterLimitations": [
+    "buildings",
+    "trees",
+    "windows",
+    "orientation",
+    "actual view is not proven"
+  ]
+}
