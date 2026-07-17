@@ -181,6 +181,31 @@ strictly ordered; retain the small boundary-layer timestamp difference rather th
 This path is local evaluator evidence only. It contains a `restricted/` subtree and must not be
 copied, uploaded, pinned, or treated as a public release.
 
+## Owner-free p8 public serving closure
+
+The accepted p7 San Jose ACTIVE permit snapshot is CC0-1.0 and contains 34 non-null APN
+observations across 50 accepted rows, representing 19 distinct APNs. The fixed
+`buildOwnerFreePublicServingRelease` projection publishes only those APNs, deterministic
+county-scoped property IDs, and explicit lineage. It publishes no address, coordinate, owner,
+applicant, contractor, contact, raw payload, or positive criterion fact.
+
+The full local verification bundle is ignored at
+`.cache/oracle-real-county/p8-public-serving-verification/`. It contains 19 public
+`property_query` rows, 114 public `property_evidence` rows (six unknown/unsupported criteria per
+property), 40 `field_coverage` rows, eight `relation_coverage` rows, 14 `source_coverage` rows, one
+`pipeline_runs` row, and the generated 83-row dictionary. Its restricted comparison contains 107
+observations and 61 distinct sensitive-value hashes; public overlap is zero.
+
+The deployment closure is ignored at `.cache/oracle-real-county/p8-public-serving/` and contains
+exactly `release-manifest.json`, `serving-config.json`, and the seven public Parquet files. The
+public-only manifest self-hash is
+`29b424b88d9a63cd852dc9bbf1dd9c91d46bc8f024005c3dedca63b46376b7ba`, its file SHA-256 is
+`df24a663efb3c1c4b32923a53b6052ce5d5f6e9bd56fadf164c2165b41e9d8e2`, and its reproducible
+CIDv1/raw/sha2-256 is `bafkreig7estgh35tyhclgkjduu5wauwolvpw5g6vn6w7czgccznud2oy4i`.
+The closure has no restricted directory, evidence sidecar, DuckDB catalog, checkpoint, credential,
+or extra file. County completion remains false. Computing this CID did not publish or upload the
+manifest; publication and deployment remain separate authorized promotion actions.
+
 ## Uncapped profile outcome
 
 The `f1` uncapped run terminated before `build_marts` after 285.5 seconds with a Node fatal heap

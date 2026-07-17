@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { cp, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -8,6 +9,8 @@ import { DuckDBInstance } from '@duckdb/node-api';
 
 import type { PortableServingBuildInput } from './builder.js';
 import {
+  buildOwnerFreePublicServingClosure,
+  buildOwnerFreePublicServingRelease,
   buildRealCountyReleaseBundle,
   buildRealCountyReleaseFromPipelineArtifact,
   REAL_COUNTY_CAPABILITIES,
@@ -172,6 +175,35 @@ describe('real Santa Clara release bundle', () => {
     }
   });
 
+  it('rejects prohibited nested privacy keys without relying on restricted value overlap', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oracle-real-county-json-privacy-'));
+    try {
+      const candidate = input(join(root, 'bundle'));
+      const profiles = candidate.build.profiles.map((profile) =>
+        profile.visibility === 'public'
+          ? {
+              ...profile,
+              relations: {
+                ...profile.relations,
+                property_evidence: (profile.relations.property_evidence ?? []).map((row) => ({
+                  ...row,
+                  source_references_json: '[{"owner_text":"Never in restricted comparison"}]',
+                })),
+              },
+            }
+          : profile,
+      );
+      await expect(
+        buildRealCountyReleaseBundle({
+          ...candidate,
+          build: { ...candidate.build, profiles },
+        }),
+      ).rejects.toBeInstanceOf(ReleasePrivacyError);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('rejects a self-consistent evidence document whose catalog path escapes the bundle', async () => {
     const root = await mkdtemp(join(tmpdir(), 'oracle-real-county-path-'));
     try {
@@ -279,6 +311,201 @@ describe('real Santa Clara release bundle', () => {
     }
   });
 });
+
+const REPOSITORY_ROOT = existsSync(resolve('.cache/oracle-real-county/p7.manifest.json'))
+  ? resolve('.')
+  : resolve('../..');
+const P7_ROOT = resolve(REPOSITORY_ROOT, '.cache/oracle-real-county/p7');
+const P7_INPUTS = Object.freeze({
+  pipelineManifestPath: resolve(REPOSITORY_ROOT, '.cache/oracle-real-county/p7.manifest.json'),
+  pipelineMartPath: join(
+    P7_ROOT,
+    'artifacts/objects/5c8cb23c83824eedd56047180c4fe5bb0f6f99cf68982a4559d7e3c0658c0d38/body',
+  ),
+  normalizedMutationArtifactPath: join(
+    P7_ROOT,
+    'artifacts/objects/bed575f31f4431e28253a42abf0267da642fe01d111fb4d7af9dc4d7e5bbbd23/body',
+  ),
+  rawSourceArtifactPath: join(
+    P7_ROOT,
+    'artifacts/objects/129756d97feafa6548ba64a54797010a0997a79be76c2f06830ed382cf25e7dd/body',
+  ),
+  sourceAcquisitionReceiptPath: join(
+    P7_ROOT,
+    'artifacts/objects/43b83e68aec646201476ee2c04188abbf1fbaa00259316b344b91a3406441155/body',
+  ),
+});
+const HAS_ACCEPTED_P7 = Object.values(P7_INPUTS).every(existsSync);
+
+describe('accepted p7 owner-free serving recovery', () => {
+  it.runIf(HAS_ACCEPTED_P7)(
+    'rejects immutable p7 input drift',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'oracle-owner-free-p8-pin-'));
+      try {
+        const driftedReceipt = join(root, 'receipt.json');
+        await writeFile(driftedReceipt, '{}\n');
+        await expect(
+          buildOwnerFreePublicServingRelease({
+            ...P7_INPUTS,
+            sourceAcquisitionReceiptPath: driftedReceipt,
+            outputDirectory: join(root, 'output'),
+          }),
+        ).rejects.toThrow(/acquisition receipt/iu);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    30_000,
+  );
+
+  it.runIf(HAS_ACCEPTED_P7)(
+    'rebuilds deterministic p8 bytes and stages only the public production closure',
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), 'oracle-owner-free-p8-'));
+      try {
+        const first = await buildOwnerFreePublicServingRelease({
+          ...P7_INPUTS,
+          outputDirectory: join(root, 'first'),
+        });
+        const second = await buildOwnerFreePublicServingRelease({
+          ...P7_INPUTS,
+          outputDirectory: join(root, 'second'),
+        });
+        expect(first.manifest).toEqual(second.manifest);
+        expect(first.evidence.gates).toMatchObject({
+          ownerBearingPublicValues: 0,
+          restrictedSensitiveValueHashes: 61,
+        });
+        expect(
+          first.manifest.artifacts.find(
+            ({ relation, visibility }) => relation === 'property_query' && visibility === 'public',
+          )?.rowCount,
+        ).toBe(19);
+        expect(
+          first.manifest.artifacts.find(
+            ({ relation, visibility }) =>
+              relation === 'property_evidence' && visibility === 'public',
+          )?.rowCount,
+        ).toBe(114);
+        const publicCatalog = await DuckDBInstance.create(
+          join(first.outputDirectory, 'public/oracle-public.duckdb'),
+          { threads: '1' },
+        );
+        const publicConnection = await publicCatalog.connect();
+        try {
+          const rows = (
+            await publicConnection.runAndReadAll(
+              'SELECT property_id, parcel_identifier FROM property_query',
+            )
+          ).getRowObjects();
+          expect(rows).toHaveLength(19);
+          for (const row of rows) {
+            const parcelIdentifier = String(row.parcel_identifier);
+            expect(parcelIdentifier).toMatch(/^\d{3}-\d{2}-\d{3}$/u);
+            expect(row.property_id).toBe(
+              `sc:entity:property:${createHash('sha256')
+                .update(`santa-clara-ca|apn|${parcelIdentifier}`)
+                .digest('hex')}`,
+            );
+          }
+        } finally {
+          publicConnection.closeSync();
+          publicCatalog.closeSync();
+        }
+        for (const artifact of first.manifest.artifacts) {
+          const firstBytes = await readFile(resolve(first.outputDirectory, artifact.relativePath));
+          const secondBytes = await readFile(
+            resolve(second.outputDirectory, artifact.relativePath),
+          );
+          expect(firstBytes.equals(secondBytes), artifact.relativePath).toBe(true);
+        }
+        await verifyRealCountyReleaseBundle(first.outputDirectory);
+
+        const closure = await buildOwnerFreePublicServingClosure(
+          first.outputDirectory,
+          join(root, 'first-closure'),
+        );
+        const secondClosure = await buildOwnerFreePublicServingClosure(
+          second.outputDirectory,
+          join(root, 'second-closure'),
+        );
+        expect(closure.manifestCid).toMatch(/^bafkrei[a-z2-7]{52}$/u);
+        expect(closure).toMatchObject({
+          manifestSha256: secondClosure.manifestSha256,
+          manifestFileSha256: secondClosure.manifestFileSha256,
+          manifestCid: secondClosure.manifestCid,
+        });
+        for (const path of await recursiveFiles(closure.outputDirectory)) {
+          expect(
+            (await readFile(join(closure.outputDirectory, path))).equals(
+              await readFile(join(secondClosure.outputDirectory, path)),
+            ),
+            path,
+          ).toBe(true);
+        }
+        expect((await recursiveFiles(closure.outputDirectory)).sort()).toEqual([
+          'public/data-dictionary.parquet',
+          'public/field-coverage.parquet',
+          'public/pipeline-runs.parquet',
+          'public/property-evidence.parquet',
+          'public/property-query.parquet',
+          'public/relation-coverage.parquet',
+          'public/source-coverage.parquet',
+          'release-manifest.json',
+          'serving-config.json',
+        ]);
+        const closureManifest = JSON.parse(
+          await readFile(join(closure.outputDirectory, 'release-manifest.json'), 'utf8'),
+        ) as { artifacts: readonly { visibility: string }[] };
+        expect(closureManifest.artifacts).toHaveLength(7);
+        expect(closureManifest.artifacts.every(({ visibility }) => visibility === 'public')).toBe(
+          true,
+        );
+
+        const alteredBundle = join(root, 'altered-operator-bundle');
+        await cp(first.outputDirectory, alteredBundle, { recursive: true });
+        const alteredManifestPath = join(alteredBundle, 'release-manifest.json');
+        const alteredManifest = JSON.parse(await readFile(alteredManifestPath, 'utf8')) as Record<
+          string,
+          unknown
+        >;
+        const alteredArtifacts = alteredManifest.artifacts as Record<string, unknown>[];
+        alteredArtifacts[0] = {
+          ...alteredArtifacts[0],
+          limitations: ['Self-consistent but not the accepted p8 operator manifest.'],
+        };
+        await writeRehashedManifest(alteredManifestPath, alteredManifest);
+        const alteredEvidencePath = join(alteredBundle, 'release-evidence.json');
+        const alteredEvidence = JSON.parse(await readFile(alteredEvidencePath, 'utf8')) as Record<
+          string,
+          unknown
+        >;
+        alteredEvidence.manifestSha256 = alteredManifest.manifestSha256;
+        alteredEvidence.manifestFileSha256 = createHash('sha256')
+          .update(await readFile(alteredManifestPath))
+          .digest('hex');
+        await writeRehashedEvidence(alteredEvidencePath, alteredEvidence);
+        await expect(
+          buildOwnerFreePublicServingClosure(alteredBundle, join(root, 'rejected-closure')),
+        ).rejects.toThrow(/exact accepted p8/iu);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+});
+
+async function recursiveFiles(root: string, prefix = ''): Promise<string[]> {
+  const files: string[] = [];
+  for (const entry of await readdir(join(root, prefix), { withFileTypes: true })) {
+    const relativePath = prefix.length === 0 ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isDirectory()) files.push(...(await recursiveFiles(root, relativePath)));
+    else files.push(relativePath);
+  }
+  return files;
+}
 
 async function writeRehashedManifest(
   path: string,

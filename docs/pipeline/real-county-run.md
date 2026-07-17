@@ -119,7 +119,7 @@ Multi-artifact schema identity binds the complete sorted unique schema-hash set.
 
 Checkpoints and immutable artifacts are stored below the chosen output directory. Re-running the identical command resumes durable phases and returns an already completed immutable manifest without replay. If a source blocks, its terminal state, stable error code, limitations, and checkpoint remain available while other lanes continue.
 
-The `build_marts` artifact contains `portableReleaseInput`, including all 15 capability states. The public profile contains only redacted `source_coverage` and `pipeline_runs` capability metadata. Property query and evidence rows are restricted. Missing 511 configuration is preserved as `not_configured`; blocked ownership and FBN capability states remain explicit. Feed that input to the portable release bridge with a new output directory under `.cache/oracle-real-county/`. The bridge performs license/privacy checks, deterministic manifest generation, Parquet verification, public/restricted segregation, and clean DuckDB reopen/parity checks. It does not publish or update IPFS/IPNS pointers.
+The `build_marts` artifact contains `portableReleaseInput`, including all 15 capability states. Its original p7 public profile contains only redacted `source_coverage` and `pipeline_runs` metadata; its original property and evidence rows remain restricted. The fixed p8 recovery path separately derives public property identity only from the frozen CC0 San Jose APN observations. Missing 511 configuration is preserved as `not_configured`; blocked ownership and FBN capability states remain explicit. The portable release bridge performs license/privacy checks, deterministic manifest generation, Parquet verification, public/restricted segregation, and clean DuckDB reopen/parity checks. It does not publish or update IPFS/IPNS pointers.
 
 Public IPFS publication is a separate human-gated operation and is outside this runbook.
 
@@ -132,3 +132,12 @@ The accepted final-code bounded pilot is `p7` under `.cache/oracle-real-county/`
 `p5` is immutable but superseded because its 30-second live NOAA request timed out before acquisition. `p6` is immutable but superseded because its operator-supplied `requestedAt` was later than its wall-clock completion. `p7` used the same pilot item/record bounds with a secret-free 120-second request timeout. Its requested instant, `2026-07-17T21:29:36.037Z`, precedes its completion at `2026-07-17T21:30:33.928Z`. The NOAA lane completed with 50 accepted records and the same source aggregate hash proven in `p6`. The exact previously preserved NOAA archive also passed the corrected strict CRS decoder with 1,880 unique clipped features.
 
 The uncapped `f1` evidence remains the terminal full-run resource result: it ended before `build_marts` with a fatal Node heap OOM near 4.14 GB. It has no full mart, portable release, or county-completion claim.
+
+The accepted owner-free serving recovery is `p8-public-serving`. Its verification bundle proves 19
+real APN-grain properties, 114 evidence rows, all seven required public relations, zero prohibited
+public privacy-key/value overlap, and a 107-row restricted comparison with 61 distinct sensitive
+hashes. The final deployment closure contains only a public-only canonical manifest, the frozen
+serving configuration, and seven public Parquet files. Its manifest self-hash is
+`29b424b88d9a63cd852dc9bbf1dd9c91d46bc8f024005c3dedca63b46376b7ba` and its local raw CIDv1 is
+`bafkreig7estgh35tyhclgkjduu5wauwolvpw5g6vn6w7czgccznud2oy4i`. This is still a bounded,
+partial San Jose pilot and never a county-completion claim.
