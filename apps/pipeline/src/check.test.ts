@@ -13,9 +13,9 @@ describe('pipeline foundation check', () => {
     });
   });
 
-  it('accepts only --check', () => {
+  it('rejects unsupported commands', async () => {
     const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    expect(main(['--run'])).toBe(2);
+    await expect(main(['--run'])).resolves.toBe(2);
     expect(write).toHaveBeenCalledOnce();
     write.mockRestore();
   });

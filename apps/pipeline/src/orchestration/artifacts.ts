@@ -33,7 +33,8 @@ export async function writeJsonArtifact(
   const sha256 = await crypto.subtle
     .digest('SHA-256', bytes)
     .then((digest) => Buffer.from(digest).toString('hex'));
-  const logicalKey = `runs/${input.runId.replace('sc:run:', '')}/${input.owner}/${input.phase}/${sha256}.json`;
+  const owner = input.owner.replaceAll(/[^a-zA-Z0-9._~-]/gu, '-');
+  const logicalKey = `runs/${input.runId.replace('sc:run:', '')}/${owner}/${input.phase}/${sha256}.json`;
   const stored = await input.store.putImmutable({
     logicalKey,
     mediaType: 'application/json',

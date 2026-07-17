@@ -1,4 +1,10 @@
-import type { CanonicalEntity, CanonicalMutation } from '@oracle/contracts/canonical/mutation';
+import { createHash } from 'node:crypto';
+
+import {
+  canonicalMutationSchema,
+  type CanonicalEntity,
+  type CanonicalMutation,
+} from '@oracle/contracts/canonical/mutation';
 import {
   reduceCanonicalMutations,
   type CanonicalReduction,
@@ -32,6 +38,74 @@ const RELATIONS = Object.freeze([
   'ownership_party',
   'transfer_property',
 ] as const satisfies readonly LinkRelation[]);
+
+const ENTITY_METADATA_KEYS = new Set([
+  'id',
+  'entityKind',
+  'version',
+  'validFrom',
+  'validTo',
+  'recordedAt',
+  'visibility',
+  'sourceIds',
+  'lineage',
+]);
+
+/**
+ * Provider mutations sometimes carry immutable core values only on the entity upsert.
+ * The reducer deliberately requires an observation for every domain value, so the
+ * orchestration boundary materializes those missing observations from the upsert's
+ * own immutable value and lineage. No value is inferred or sourced externally.
+ */
+function completeImmutableObservations(
+  mutations: readonly CanonicalMutation[],
+): readonly CanonicalMutation[] {
+  const observed = new Set(
+    mutations
+      .filter((mutation) => mutation.kind === 'field_observation')
+      .map(({ observation }) => `${observation.entityId}\0${observation.fieldPath}`),
+  );
+  const additions: CanonicalMutation[] = [];
+  for (const mutation of mutations) {
+    if (mutation.kind !== 'entity_upsert') continue;
+    const entity = mutation.entity as unknown as Readonly<Record<string, unknown>>;
+    const lineage = mutation.entity.lineage[0];
+    if (lineage === undefined) throw new Error(`Entity ${mutation.entity.id} has no lineage`);
+    const missing = Object.keys(entity)
+      .filter((key) => !ENTITY_METADATA_KEYS.has(key))
+      .filter((key) => !observed.has(`${mutation.entity.id}\0/${key}`))
+      .sort();
+    for (const [index, key] of missing.entries()) {
+      const digest = createHash('sha256').update(`${mutation.mutationId}|/${key}`).digest('hex');
+      additions.push(
+        canonicalMutationSchema.parse({
+          kind: 'field_observation',
+          mutationId: `sc:mutation:${digest}`,
+          runId: mutation.runId,
+          sourceId: mutation.sourceId,
+          snapshotId: mutation.snapshotId,
+          sequence: mutation.sequence + 900 + index,
+          emittedAt: mutation.emittedAt,
+          visibility: mutation.visibility,
+          observation: {
+            observationId: `sc:observation:${digest}`,
+            entityId: mutation.entity.id,
+            entityKind: mutation.entity.entityKind,
+            fieldPath: `/${key}`,
+            value: entity[key],
+            observedAt: mutation.entity.recordedAt,
+            sourceAsOf: mutation.entity.validFrom,
+            authorityRank: 1,
+            confidence: 1,
+            visibility: mutation.visibility,
+            lineage,
+          },
+        }),
+      );
+    }
+  }
+  return Object.freeze([...mutations, ...additions]);
+}
 
 function normalizedKeys(entity: CanonicalEntity): readonly NormalizedExactKey[] {
   switch (entity.entityKind) {
@@ -209,7 +283,7 @@ export function createDefaultPipelineProcessors(): PipelineProcessors {
   return Object.freeze({
     reconcile: (mutations: readonly CanonicalMutation[], signal: AbortSignal) => {
       signal.throwIfAborted();
-      const canonical = reduceCanonicalMutations(mutations);
+      const canonical = reduceCanonicalMutations(completeImmutableObservations(mutations));
       const output: DefaultReconciliation = Object.freeze({
         canonical,
         links: reconcile(canonical),
