@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "taskId": "ORA-004",
+  "state": "satisfied",
+  "roster": "planning",
+  "nativeChild": "/root/arceus",
+  "nativeWait": "observed",
+  "model": "gpt-5.6-sol",
+  "reasoning": "ultra",
+  "parentThreadId": "019f6f2a-ae4e-7a92-a011-defd56e7b3c9",
+  "childThreadId": "019f6f2b-9f21-7df0-9893-0f13e4f02600",
+  "promptSha256": "7A362750CAF22C6E22B410CC0EE9D9708C35AD4A099F1F3AAA73B76BEF51FD50",
+  "routeOutputSha256": "04710ABCA6B2385A8378034942D3DB419DF8A14A3CC0143BAD5D6394D2CE71FD",
+  "parentRolloutSha256": "44EB2BF585A1CB4D3BC50AED89DC5B6DFCDF824AD6D139D0CCC05FC6C17766D1",
+  "childRolloutSha256": "8993F6A61011D3429E32965422392FB587530E21B6009E9FE05D52326D657171",
+  "routeStatus": "READY",
+  "primaryFoundationAgent": "/root/metagross",
+  "domainAgent": "/root/oracle",
+  "deferredAgents": [
+    "/root/donphan",
+    "/root/machamp",
+    "/root/audino",
+    "/root/smeargle",
+    "/root/sylveon",
+    "/root/slowking"
+  ],
+  "externalEffects": "denied"
+}

@@ -1,0 +1,106 @@
+{
+  "schemaVersion": 1,
+  "taskId": "ORA-003",
+  "state": "implemented_verified_local_uncommitted",
+  "repositoryRoot": "E:\\Coding\\Soofi\\oracle-property-intelligence-platform-pipeline-completion",
+  "branch": "assessment/oracle-santa-clara",
+  "baseHead": "877fb036491af8c8a8ac71e31de9ae0f40b921a6",
+  "nativeChild": "/root/oracle",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol",
+  "reasoning": "ultra",
+  "selectedBoundary": "exact_upstream_pin_plus_assessment_owned_adapter",
+  "sourceCount": 6,
+  "filesWritten": [
+    {
+      "path": "config/dependencies/dependency-lock.contract.json",
+      "bytes": 4072,
+      "sha256": "e9973c7db8337311a7fae209801bc691a300b9ad4f11bb16dcb70974e0193ff4"
+    },
+    {
+      "path": "config/dependencies/elephant-dependencies.lock.json",
+      "bytes": 12363,
+      "sha256": "123773a1692a6b36efc068b0d23482be4daaf0d7f09cf9fceaacf646eaa21b96"
+    },
+    {
+      "path": "config/dependencies/validate-dependency-lock.mts",
+      "bytes": 24797,
+      "sha256": "89c38f8c43be3f1f26411050cbd95978c81788311d9af1ecb1aadded5a31d8b5"
+    },
+    {
+      "path": "config/dependencies/validate-dependency-lock.self-test.mts",
+      "bytes": 6956,
+      "sha256": "8a3183718f942421bd8f982c8d661807999d4f64fcbfd84c227bfb1ab16542ce"
+    },
+    {
+      "path": "docs/adr/0001-elephant-dependency-reproducibility-boundary.md",
+      "bytes": 5718,
+      "sha256": "a4fd5fcd4bfc7352203dd6ba6edcea1f7db87c1579fd99e2ab6af7d47541d96f"
+    },
+    {
+      "path": "docs/operations/dependency-reproduction.md",
+      "bytes": 6396,
+      "sha256": "14ed34ef117794043a81b737c862977bb2bbd8a4bb6e89db004a5d74b7663473"
+    },
+    {
+      "path": ".assessment/changes/ORA-003.json",
+      "bytes": null,
+      "sha256": null
+    }
+  ],
+  "validation": {
+    "nodeExecutable": "E:\\nvm\\v22.18.0\\node.exe",
+    "nodeVersion": "v22.18.0",
+    "validator": {
+      "result": "pass",
+      "sourceCount": 6
+    },
+    "selfTest": {
+      "result": "pass",
+      "caseCount": 13,
+      "temporaryFixturesRestrictedTo": "config/dependencies"
+    },
+    "ownedJsonParse": "pass_3_files",
+    "gitDiffCheck": "pass_tracked_and_7_owned_untracked_files",
+    "scopeAudit": "pass_7_owned_files_no_residual_fixtures",
+    "determinismReplay": "pass_identical_validator_and_self_test_outputs",
+    "suppliedIdentityAudit": "pass_6_exact_pins",
+    "externalImportAndAnyScan": "pass"
+  },
+  "review": {
+    "state": "pass",
+    "model": "gpt-5.6-sol",
+    "reasoning": "ultra",
+    "reviewedAt": "2026-07-17",
+    "materialFindings": 0,
+    "unresolvedFindings": 0,
+    "checks": [
+      "requirements_and_exact_identity",
+      "validator_bypass_and_adversarial_failures",
+      "ownership_license_and_redistribution_separation",
+      "mcp_caller_sql_exposure_boundary",
+      "node_standard_library_and_typescript_boundary",
+      "operator_documentation_truthfulness",
+      "concurrent_work_preservation_and_write_scope"
+    ]
+  },
+  "securityBoundary": {
+    "officialElephantMcpPinPreserved": "0aa1ede8406819e341a58d3abcb3593e5cd3ba94",
+    "directCallerSqlState": "blocked_pending_ORA-069",
+    "upstreamSourceMaterialized": false,
+    "redistributionClaimMade": false
+  },
+  "externalEffects": {
+    "networkAccess": false,
+    "credentialRead": false,
+    "providerMutation": false,
+    "awsMutation": false,
+    "deployment": false,
+    "publication": false,
+    "teamKitWrite": false,
+    "elephantWrite": false,
+    "commit": false,
+    "push": false,
+    "pullRequest": false
+  }
+}

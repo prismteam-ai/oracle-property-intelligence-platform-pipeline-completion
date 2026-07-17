@@ -1,0 +1,73 @@
+title = "Oracle assessment secret policy"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "oracle-aws-access-key-id"
+description = "AWS access key identifier"
+regex = '''(AKIA|ASIA|AIDA|AROA|AIPA|ANPA|ANVA|AGPA|A3T[A-Z0-9])[A-Z0-9]{16}'''
+tags = ["aws", "credential"]
+
+[[rules]]
+id = "oracle-aws-secret-assignment"
+description = "AWS secret access key assignment"
+regex = '''(AWS_SECRET_ACCESS_KEY|aws_secret_access_key|SecretAccessKey)[\t \"'=,:]{1,16}[A-Za-z0-9/+=]{40}'''
+tags = ["aws", "credential"]
+
+[[rules]]
+id = "oracle-github-token"
+description = "GitHub token"
+regex = '''(gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})'''
+tags = ["github", "token"]
+
+[[rules]]
+id = "oracle-openai-token"
+description = "OpenAI token"
+regex = '''sk-(proj-|svcacct-)?[A-Za-z0-9_-]{20,}'''
+tags = ["openai", "token"]
+
+[[rules]]
+id = "oracle-google-api-key"
+description = "Google API key"
+regex = '''AIza[0-9A-Za-z_-]{35}'''
+tags = ["google", "credential"]
+
+[[rules]]
+id = "oracle-google-oauth-token"
+description = "Google OAuth token"
+regex = '''ya29\.[0-9A-Za-z_-]{20,}'''
+tags = ["google", "token"]
+
+[[rules]]
+id = "oracle-slack-token"
+description = "Slack token"
+regex = '''xox[baprs]-[0-9A-Za-z-]{10,}'''
+tags = ["slack", "token"]
+
+[[rules]]
+id = "oracle-jwt"
+description = "JSON Web Token"
+regex = '''eyJ[0-9A-Za-z_-]{8,}\.[0-9A-Za-z_-]{8,}\.[0-9A-Za-z_-]{8,}'''
+tags = ["jwt", "token"]
+
+[[rules]]
+id = "oracle-pem-private-key"
+description = "PEM private-key header"
+regex = '''-----BEGIN[\t ]+(RSA[\t ]+|EC[\t ]+|OPENSSH[\t ]+|DSA[\t ]+|ENCRYPTED[\t ]+)?PRIVATE[\t ]+KEY-----'''
+tags = ["private-key", "credential"]
+
+[[rules]]
+id = "oracle-presigned-signature"
+description = "AWS, Google, or CDN presigned URL signature"
+regex = '''(X-Amz-Signature=[0-9A-Fa-f]{64}|X-Goog-Signature=[0-9A-Fa-f]{64}[0-9A-Fa-f]*|[?&](Signature|sig)=[A-Za-z0-9%+/_~=-]{32,})'''
+tags = ["presigned-url", "credential"]
+
+[allowlist]
+description = "Known non-secret generated and vendored paths"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)coverage/''',
+  '''(^|/)cdk\.out/'''
+]

@@ -1,0 +1,107 @@
+{
+  "schemaVersion": 1,
+  "policyVersion": "1.0.0",
+  "chunkBytes": 65536,
+  "overlapBytes": 4096,
+  "pathRules": [
+    {
+      "id": "PROHIBITED_ENV_FILE",
+      "pattern": "(?:^|/)\\.env(?:$|\\.)",
+      "allowedBasenames": [
+        ".env.example"
+      ]
+    },
+    {
+      "id": "PROHIBITED_ACCESS_KEY_CSV",
+      "pattern": "(?:^|/)[^/]*(?:access[-_]?keys?|aws[-_]?credentials)[^/]*\\.csv$",
+      "allowedBasenames": []
+    },
+    {
+      "id": "PROHIBITED_PRIVATE_KEY_FILE",
+      "pattern": "(?:^|/)(?:id_(?:rsa|dsa|ecdsa|ed25519)|[^/]*(?:private[-_]?key|privatekey)[^/]*|[^/]+\\.(?:pem|key|p12|pfx))$",
+      "allowedBasenames": []
+    },
+    {
+      "id": "PROHIBITED_TOKEN_FILE",
+      "pattern": "(?:^|/)[^/]*(?:access[-_]?token|refresh[-_]?token|auth[-_]?token|tokens?)[^/]*\\.(?:txt|json|csv|env|yaml|yml)$",
+      "allowedBasenames": []
+    },
+    {
+      "id": "PROHIBITED_CREDENTIAL_EXPORT",
+      "pattern": "(?:^|/)[^/]*(?:credentials?|credential[-_]?export|client[-_]?secret|service[-_]?account)[^/]*\\.(?:txt|json|csv|env|yaml|yml)$",
+      "allowedBasenames": []
+    }
+  ],
+  "contentRules": [
+    {
+      "id": "AWS_ACCESS_KEY_ID",
+      "pattern": "(?:^|[^A-Z0-9])(?:AKIA|ASIA|AIDA|AROA|AIPA|ANPA|ANVA|AGPA|A3T[A-Z0-9])[A-Z0-9]{16}(?:[^A-Z0-9]|$)",
+      "flags": "g"
+    },
+    {
+      "id": "AWS_SECRET_ACCESS_KEY",
+      "pattern": "(?:AWS_SECRET_ACCESS_KEY|aws_secret_access_key|SecretAccessKey)[\\s\\\"'=:,]{1,16}[A-Za-z0-9/+=]{40}(?:[^A-Za-z0-9/+=]|$)",
+      "flags": "g"
+    },
+    {
+      "id": "AWS_SESSION_TOKEN",
+      "pattern": "AWS_SESSION_TOKEN[\\s\\\"'=:,]{1,16}[A-Za-z0-9/+=_-]{32,}",
+      "flags": "g"
+    },
+    {
+      "id": "GITHUB_TOKEN",
+      "pattern": "(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{22,255})",
+      "flags": "g"
+    },
+    {
+      "id": "OPENAI_API_KEY",
+      "pattern": "sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}",
+      "flags": "g"
+    },
+    {
+      "id": "GOOGLE_API_KEY",
+      "pattern": "AIza[0-9A-Za-z_-]{35}",
+      "flags": "g"
+    },
+    {
+      "id": "GOOGLE_OAUTH_TOKEN",
+      "pattern": "ya29\\.[0-9A-Za-z_-]{20,}",
+      "flags": "g"
+    },
+    {
+      "id": "SLACK_TOKEN",
+      "pattern": "xox[baprs]-[0-9A-Za-z-]{10,}",
+      "flags": "g"
+    },
+    {
+      "id": "JWT",
+      "pattern": "eyJ[0-9A-Za-z_-]{8,}\\.[0-9A-Za-z_-]{8,}\\.[0-9A-Za-z_-]{8,}",
+      "flags": "g"
+    },
+    {
+      "id": "PEM_PRIVATE_KEY",
+      "pattern": "-----BEGIN[ \\t]+(?:RSA[ \\t]+|EC[ \\t]+|OPENSSH[ \\t]+|DSA[ \\t]+|ENCRYPTED[ \\t]+)?PRIVATE[ \\t]+KEY-----",
+      "flags": "g"
+    },
+    {
+      "id": "AWS_PRESIGNED_SIGNATURE",
+      "pattern": "(?:X-Amz-Signature|x-amz-signature)=[0-9A-Fa-f]{64}",
+      "flags": "g"
+    },
+    {
+      "id": "GOOGLE_PRESIGNED_SIGNATURE",
+      "pattern": "(?:X-Goog-Signature|x-goog-signature)=[0-9A-Fa-f]{64,1024}",
+      "flags": "g"
+    },
+    {
+      "id": "CLOUD_PRESIGNED_SIGNATURE",
+      "pattern": "[?&](?:Signature|sig)=[A-Za-z0-9%+/_~=-]{32,}",
+      "flags": "g"
+    },
+    {
+      "id": "NAMED_PROVIDER_SECRET",
+      "pattern": "(?:GITHUB_TOKEN|OPENAI_API_KEY|GOOGLE_API_KEY|SLACK_BOT_TOKEN|SLACK_APP_TOKEN)[\\s\\\"'=:]{1,16}[A-Za-z0-9_./+=-]{16,}",
+      "flags": "g"
+    }
+  ]
+}

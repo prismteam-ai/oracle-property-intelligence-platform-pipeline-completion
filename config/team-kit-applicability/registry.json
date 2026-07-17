@@ -1,0 +1,139 @@
+{
+  "$schema": "./schema.json",
+  "schemaVersion": 1,
+  "assessment": "oracle-property-intelligence-platform-pipeline-completion",
+  "decisionScope": "Applicability disposition only. Operational status and liveClaim are separate evidence fields; no disposition by itself proves an integration is implemented or live.",
+  "sourcePins": {
+    "teamKitCommit": "8deb92b416d4971d37470725fbce48956813d0bc",
+    "operatingModel": "plan/gpt/02-team-kit-operating-model.md section 2.1",
+    "oracleTasks": "plan/gpt/oracle/tasks.md ORA-008, ORA-012, ORA-013, and ORA-015"
+  },
+  "allowedStates": [
+    "adopted",
+    "adapted",
+    "not_applicable",
+    "exception_pending"
+  ],
+  "entries": [
+    {
+      "id": "agentcore-memory",
+      "name": "AgentCore Memory",
+      "sourceContract": "Team Kit build-ai-agents memory guidance",
+      "state": "not_applicable",
+      "operationalStatus": "not_used",
+      "liveClaim": false,
+      "owner": "Oracle agent architecture owner",
+      "evidenceOrTrigger": "The Oracle agent performs release-bound queries over immutable evidence. Reassess only if a persistent cross-turn conversational session becomes an approved product requirement.",
+      "dataHandlingImpact": "No conversational history, property-query memory, or evaluator identity state is copied into AgentCore Memory.",
+      "releaseConsequence": "No release dependency. Adding persistent conversational memory requires a new data-retention, authorization, deletion, and tenancy decision before implementation."
+    },
+    {
+      "id": "aws-oidc",
+      "name": "AWS OIDC for GitHub Actions",
+      "sourceContract": "Team Kit integrate-ci-cd permissions and AWS credential stage",
+      "state": "exception_pending",
+      "operationalStatus": "unverified_external",
+      "liveClaim": false,
+      "owner": "Oracle deployment owner with target AWS and repository administrators",
+      "evidenceOrTrigger": "Resolve when repository workflow-sharing authority, target-account trust policy, least-privilege role ownership, and a separately approved deployment path are verified, or when Ruslan approves the documented assessment exception.",
+      "dataHandlingImpact": "Validation-only pull-request CI receives no id-token permission, provider secret, or deployment authority. A later OIDC role must use short-lived credentials and an exact trust boundary.",
+      "releaseConsequence": "Blocks any claim of automated AWS deployment through shared CI/CD. Local validation may proceed; deployment remains a separate approval-gated operation."
+    },
+    {
+      "id": "build-frontend-backends",
+      "name": "Team Kit frontend/backend architecture",
+      "sourceContract": "Team Kit build-frontend-backends skill",
+      "state": "adapted",
+      "operationalStatus": "not_started",
+      "liveClaim": false,
+      "owner": "Metagross implementation owner",
+      "evidenceOrTrigger": "ORA-010 and ORA-090 must prove shared TypeScript contracts, CDK, typed API boundaries, and deployment tests while using the approved private S3 plus CloudFront web host instead of the skill's Amplify example.",
+      "dataHandlingImpact": "One query and evidence contract shapes UI, API, MCP, and agent output; public and restricted fields remain separated at typed boundaries.",
+      "releaseConsequence": "Blocks the hosted product release until the adapted topology is implemented, synthesized, security-tested, and deep-link verified."
+    },
+    {
+      "id": "chat-sdk",
+      "name": "Chat SDK and Asana adapter state",
+      "sourceContract": "Team Kit build-ai-agents Chat SDK and Asana guidance",
+      "state": "not_applicable",
+      "operationalStatus": "not_used",
+      "liveClaim": false,
+      "owner": "Oracle agent architecture owner",
+      "evidenceOrTrigger": "The Oracle web, API, MCP, and named-tool agent path has no Asana-triggered chat surface. Reassess only if that surface is explicitly added.",
+      "dataHandlingImpact": "No property evidence, prompts, approvals, or evaluator state is copied into Chat SDK or Asana operational state.",
+      "releaseConsequence": "No release dependency for the approved Oracle scope. Introducing an Asana-triggered chat surface reopens architecture, access, data-handling, and test gates."
+    },
+    {
+      "id": "engineering-guidelines",
+      "name": "Team Kit engineering guidelines",
+      "sourceContract": "Team Kit apply-engineering-guidelines skill",
+      "state": "adopted",
+      "operationalStatus": "not_started",
+      "liveClaim": false,
+      "owner": "Oracle platform implementation owner",
+      "evidenceOrTrigger": "ORA-010 through ORA-015 must implement strict TypeScript service boundaries, CDK, tests, structured observability, and explicit exceptions for unavailable external operations integrations.",
+      "dataHandlingImpact": "Typed boundaries, secret redaction, public versus restricted data separation, and bounded telemetry are mandatory implementation controls.",
+      "releaseConsequence": "Blocks release until the applicable local controls pass. External Lexicon, dashboard, PagerDuty, and OIDC clauses remain governed by their separate pending entries."
+    },
+    {
+      "id": "langsmith",
+      "name": "LangSmith telemetry",
+      "sourceContract": "Team Kit build-ai-agents prompt-iteration telemetry guidance",
+      "state": "exception_pending",
+      "operationalStatus": "unverified_external",
+      "liveClaim": false,
+      "owner": "Oracle agent owner with privacy and telemetry account owners",
+      "evidenceOrTrigger": "Resolve only after package compatibility, account access, redaction, retention, regional handling, and approved property-data fields are verified, or after Ruslan approves the documented assessment exception.",
+      "dataHandlingImpact": "Prompts, named-tool inputs, citations, addresses, and restricted ownership evidence must not leave the approved boundary without field-level redaction and retention controls.",
+      "releaseConsequence": "Blocks calling prompt iteration fully Team Kit-conformant and blocks the full agent release until integration or an explicit exception is approved. Deterministic named queries remain unaffected."
+    },
+    {
+      "id": "lexicon",
+      "name": "Lexicon metric registration",
+      "sourceContract": "Team Kit observability-metrics rule",
+      "state": "exception_pending",
+      "operationalStatus": "unverified_external",
+      "liveClaim": false,
+      "owner": "Oracle observability owner with the Lexicon repository owner",
+      "evidenceOrTrigger": "Resolve when change authority and the exact metric catalog destination are verified and registration evidence exists, or when Ruslan approves the documented assessment exception.",
+      "dataHandlingImpact": "Only metric definitions, units, dimensions, and ownership metadata may enter the catalog; no property row, prompt, credential, or personal identifier may be registered.",
+      "releaseConsequence": "Blocks unqualified Golden Path metric conformance and any metric-bearing production claim until the entry is resolved. No local stub counts as registration."
+    },
+    {
+      "id": "main-dashboard",
+      "name": "Main Dashboard metric visualization",
+      "sourceContract": "Team Kit observability-metrics rule",
+      "state": "exception_pending",
+      "operationalStatus": "unverified_external",
+      "liveClaim": false,
+      "owner": "Oracle observability owner with the Main Dashboard repository owner",
+      "evidenceOrTrigger": "Resolve when dashboard change authority, target environment, metric identifiers, and widget verification are available, or when Ruslan approves the documented assessment exception.",
+      "dataHandlingImpact": "Dashboard widgets may contain aggregate operational metrics and release identifiers only; property details, prompts, credentials, and personal data are excluded.",
+      "releaseConsequence": "Blocks unqualified Golden Path dashboard conformance for emitted custom metrics. A screenshot, local JSON, or placeholder widget is not live-dashboard evidence."
+    },
+    {
+      "id": "pagerduty",
+      "name": "PagerDuty critical-failure alerting",
+      "sourceContract": "Team Kit observability-pagerduty-alerting and observability-dlq-alarms rules",
+      "state": "exception_pending",
+      "operationalStatus": "unverified_external",
+      "liveClaim": false,
+      "owner": "Oracle operations owner with the PagerDuty service owner",
+      "evidenceOrTrigger": "Resolve when service ownership, production routing secret reference, target account, trigger and resolve tests, and on-call acknowledgement are verified, or when Ruslan approves the documented assessment exception.",
+      "dataHandlingImpact": "Alerts must contain redacted run, source, artifact, and failure-class identifiers only. Routing values live in an approved secret store and never in environment examples, logs, or evidence.",
+      "releaseConsequence": "Blocks a production claim for any critical workflow that can fail silently. Local fake endpoints or placeholder routing values do not satisfy the integration."
+    },
+    {
+      "id": "shared-ci-cd",
+      "name": "Shared CI/CD workflows",
+      "sourceContract": "Team Kit integrate-ci-cd skill",
+      "state": "adapted",
+      "operationalStatus": "not_started",
+      "liveClaim": false,
+      "owner": "Oracle CI owner",
+      "evidenceOrTrigger": "ORA-012 and ORA-015 implement the exact six-recipe interface and a validation-only pull-request caller after workflow access is confirmed; deploy must fail closed outside a separately approved exact context.",
+      "dataHandlingImpact": "Pull-request CI receives read-only repository contents and no provider credentials, OIDC token, deployment context, publication key, or restricted dataset.",
+      "releaseConsequence": "Blocks release until local CI-equivalent checks and the least-permission validation caller pass. The adapted caller never treats a no-op deploy as successful conformance."
+    }
+  ]
+}

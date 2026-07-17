@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "variables": [
+    {
+      "name": "NODE_ENV",
+      "classification": "configuration"
+    },
+    {
+      "name": "AWS_PROFILE",
+      "classification": "operator_selector"
+    },
+    {
+      "name": "AWS_REGION",
+      "classification": "configuration"
+    },
+    {
+      "name": "AWS_ACCOUNT_ID",
+      "classification": "deployment_identity"
+    },
+    {
+      "name": "AWS_ROLE_ARN",
+      "classification": "deployment_identity"
+    },
+    {
+      "name": "ORACLE_RELEASE_ID",
+      "classification": "release_identity"
+    },
+    {
+      "name": "ORACLE_PUBLIC_ARTIFACT_MANIFEST_URL",
+      "classification": "public_configuration"
+    },
+    {
+      "name": "ORACLE_PUBLIC_ARTIFACT_MANIFEST_SHA256",
+      "classification": "integrity_metadata"
+    },
+    {
+      "name": "ORACLE_PUBLIC_MIRROR_BASE_URL",
+      "classification": "public_configuration"
+    },
+    {
+      "name": "ORACLE_IPNS_NAME",
+      "classification": "public_configuration"
+    },
+    {
+      "name": "BEDROCK_MODEL_ID",
+      "classification": "model_configuration"
+    },
+    {
+      "name": "FILEBASE_S3_ENDPOINT",
+      "classification": "provider_configuration"
+    },
+    {
+      "name": "FILEBASE_BUCKET",
+      "classification": "provider_configuration"
+    },
+    {
+      "name": "FILEBASE_ACCESS_KEY_ID",
+      "classification": "secret"
+    },
+    {
+      "name": "FILEBASE_SECRET_ACCESS_KEY",
+      "classification": "secret"
+    },
+    {
+      "name": "LANGSMITH_TRACING",
+      "classification": "conditional_configuration"
+    },
+    {
+      "name": "LANGSMITH_API_KEY",
+      "classification": "conditional_secret"
+    },
+    {
+      "name": "PAGERDUTY_ROUTING_KEY_SECRET_ARN",
+      "classification": "secret_reference"
+    }
+  ],
+  "forbiddenVariables": [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "GITHUB_TOKEN",
+    "OPENAI_API_KEY",
+    "PAGERDUTY_ROUTING_KEY",
+    "SLACK_BOT_TOKEN",
+    "SLACK_APP_TOKEN"
+  ]
+}

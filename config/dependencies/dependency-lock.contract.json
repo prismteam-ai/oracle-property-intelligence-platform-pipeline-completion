@@ -1,0 +1,175 @@
+{
+  "contractVersion": 1,
+  "lockSchemaVersion": 1,
+  "lockId": "oracle-elephant-upstreams",
+  "expectedSourceCount": 6,
+  "requiredRepositories": [
+    "elephant-xyz/skills",
+    "elephant-xyz/oracle-node",
+    "elephant-xyz/elephant-query-db",
+    "elephant-xyz/Counties-trasform-scripts",
+    "elephant-xyz/elephant-cli",
+    "elephant-xyz/elephant-mcp"
+  ],
+  "shapes": {
+    "lock": [
+      "schemaVersion",
+      "lockId",
+      "verification",
+      "boundary",
+      "sources"
+    ],
+    "verification": [
+      "observedAt",
+      "method",
+      "evidenceId",
+      "networkAccessInThisWave"
+    ],
+    "boundary": [
+      "activeState",
+      "currentWaveState",
+      "assessmentAdapterOwner",
+      "upstreamSourceCopied",
+      "upstreamSourceInstalled",
+      "upstreamSourceExecuted",
+      "futureModificationForms",
+      "prohibitedForms"
+    ],
+    "futureModificationForm": [
+      "kind",
+      "requirements"
+    ],
+    "source": [
+      "repository",
+      "canonicalUrl",
+      "observedDefaultBranch",
+      "commitSha",
+      "pinnedRef",
+      "intendedUse",
+      "consumptionMode",
+      "dependencyState",
+      "materializationState",
+      "ownershipBoundary",
+      "license",
+      "redistribution",
+      "securityExposure",
+      "verificationCommand",
+      "driftPolicy"
+    ],
+    "ownershipBoundary": [
+      "state",
+      "upstreamOwner",
+      "assessmentIntegrationOwner",
+      "modificationBoundary",
+      "upstreamRuntimeResourcesAssumed"
+    ],
+    "license": [
+      "state",
+      "identifier",
+      "evidence"
+    ],
+    "redistribution": [
+      "state",
+      "claim",
+      "approvalAuthority",
+      "approvalEvidence"
+    ],
+    "securityExposure": [
+      "state",
+      "note"
+    ],
+    "driftPolicy": [
+      "state",
+      "defaultBranchHeadChange",
+      "pinnedCommitUnavailable",
+      "lockUpdate"
+    ]
+  },
+  "identityRules": {
+    "repositoryPattern": "^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$",
+    "fullShaPattern": "^[0-9a-f]{40}$",
+    "canonicalUrlTemplate": "https://github.com/{repository}.git",
+    "observedDefaultBranch": "main",
+    "verificationCommandTemplate": "git ls-remote --symref {canonicalUrl} HEAD"
+  },
+  "allowedStates": {
+    "boundary": [
+      "exact_upstream_pin_plus_assessment_owned_adapter"
+    ],
+    "currentWave": [
+      "identity_only_no_materialization"
+    ],
+    "dependency": [
+      "identity_locked"
+    ],
+    "consumption": [
+      "exact_pin_reference_for_assessment_owned_adapter"
+    ],
+    "materialization": [
+      "not_copied_installed_or_executed"
+    ],
+    "ownership": [
+      "explicit_split"
+    ],
+    "license": [
+      "not_verified_in_this_wave",
+      "verified",
+      "restricted"
+    ],
+    "redistribution": [
+      "not_approved",
+      "approved",
+      "prohibited"
+    ],
+    "redistributionClaim": [
+      "none",
+      "source_copy",
+      "binary_distribution",
+      "patch_distribution"
+    ],
+    "exposure": [
+      "not_runtime_exposed",
+      "compatibility_evidence_only_caller_sql_blocked"
+    ],
+    "drift": [
+      "fail_closed"
+    ]
+  },
+  "redistributionRules": {
+    "noClaimValue": "none",
+    "approvedState": "approved",
+    "approvalFields": [
+      "approvalAuthority",
+      "approvalEvidence"
+    ],
+    "approvalEvidenceRequiredWhenClaimed": true,
+    "identityDoesNotConferPermission": true
+  },
+  "futureModificationRules": {
+    "requiredForms": {
+      "hash_bound_vendored_patch_apply_manifest": [
+        "canonicalHttpsUrl",
+        "exactUpstreamBaseSha",
+        "patchSha256",
+        "deterministicApplyCommand",
+        "resultTreeHash",
+        "approvalEvidence"
+      ],
+      "approved_reachable_fork_sha": [
+        "canonicalHttpsUrl",
+        "fullCommitSha",
+        "exactUpstreamBaseSha",
+        "baseRelationshipEvidence",
+        "approvalEvidence"
+      ]
+    },
+    "prohibitedForms": [
+      "moving_branch_ref",
+      "moving_tag_ref",
+      "workstation_path",
+      "unhashed_patch",
+      "unapproved_source_copy",
+      "unreachable_fork_commit"
+    ]
+  }
+}

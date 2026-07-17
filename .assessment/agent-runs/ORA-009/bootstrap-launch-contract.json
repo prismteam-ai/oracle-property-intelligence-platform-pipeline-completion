@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "taskId": "ORA-009",
+  "state": "satisfied_for_first_native_writer",
+  "executionMode": "native_team_kit",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol",
+  "reasoning": "ultra",
+  "roster": "oracle",
+  "freshProcessRequired": true,
+  "persistentRolloutRequired": true,
+  "fallbackAllowed": false,
+  "repositoryRoot": "E:\\Coding\\Soofi\\oracle-property-intelligence-platform-pipeline-completion",
+  "branch": "assessment/oracle-santa-clara",
+  "baseHead": "877fb036491af8c8a8ac71e31de9ae0f40b921a6",
+  "firstWaveTaskIds": [
+    "ORA-003",
+    "ORA-006",
+    "ORA-008"
+  ],
+  "expectedNativeChildren": [
+    "/root/oracle",
+    "/root/metagross"
+  ],
+  "writableDescendants": [
+    ".assessment",
+    ".gitignore",
+    ".env.example",
+    ".gitleaks.toml",
+    "config/dependencies",
+    "config/team-kit-applicability",
+    "docs/adr",
+    "docs/operations/integration-exceptions",
+    "tools/secret-policy"
+  ],
+  "requiredEvidence": [
+    "rendered_prompt_sha256",
+    "parent_thread_id",
+    "parent_rollout_sha256",
+    "child_thread_ids",
+    "child_agent_paths",
+    "child_rollout_sha256",
+    "parent_and_child_turn_context",
+    "native_wait_observed",
+    "output_sha256",
+    "changed_paths",
+    "verification_results"
+  ],
+  "denied": [
+    "credential_read",
+    "provider_mutation",
+    "aws_mutation",
+    "deployment",
+    "publication",
+    "purchase",
+    "team_kit_write",
+    "elephant_write",
+    "commit",
+    "push",
+    "pull_request"
+  ]
+}
