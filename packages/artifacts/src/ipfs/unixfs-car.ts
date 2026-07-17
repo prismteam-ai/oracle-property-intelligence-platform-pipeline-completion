@@ -41,6 +41,7 @@ export type PropertyRootIndex = Readonly<{
   eligiblePropertyCount: number;
   shardCount: number;
   maximumPropertiesPerShard: number;
+  maximumShardBytes: number;
   shards: readonly Readonly<{
     shard: string;
     rootCid: string;
@@ -68,6 +69,10 @@ export type PropertyCarRelease = Readonly<{
 
 function concat(parts: readonly Uint8Array[]): Uint8Array {
   return Buffer.concat(parts);
+}
+
+function compareUtf8(left: string, right: string): number {
+  return Buffer.from(left, 'utf8').compare(Buffer.from(right, 'utf8'));
 }
 
 function sha256Bytes(bytes: Uint8Array): Uint8Array {
@@ -311,7 +316,7 @@ function buildShard(shard: string, properties: readonly CanonicalPropertyJson[])
     offset += record.byteLength;
   }
   const bytes = concat(records);
-  entries.sort((left, right) => left.propertyId.localeCompare(right.propertyId));
+  entries.sort((left, right) => compareUtf8(left.propertyId, right.propertyId));
   return Object.freeze({
     shard,
     rootCid: cidString(rootCidBytes),
@@ -337,7 +342,7 @@ function assignShards(
     if (values.length <= maximumPropertiesPerShard) {
       output.set(
         prefix,
-        Object.freeze([...values].sort((a, b) => a.propertyId.localeCompare(b.propertyId))),
+        Object.freeze([...values].sort((a, b) => compareUtf8(a.propertyId, b.propertyId))),
       );
       return;
     }
@@ -350,7 +355,7 @@ function assignShards(
       groups.set(next, group);
     }
     for (const [next, group] of [...groups.entries()].sort(([left], [right]) =>
-      left.localeCompare(right),
+      compareUtf8(left, right),
     )) {
       split(next, group);
     }
@@ -363,7 +368,7 @@ function assignShards(
     initial.set(prefix, group);
   }
   for (const [prefix, group] of [...initial.entries()].sort(([left], [right]) =>
-    left.localeCompare(right),
+    compareUtf8(left, right),
   )) {
     split(prefix, group);
   }
@@ -376,7 +381,11 @@ function canonicalIndexBytes(index: PropertyRootIndex): Uint8Array {
 
 export function buildPropertyCarRelease(
   properties: readonly CanonicalPropertyJson[],
-  options: Readonly<{ initialPrefixLength?: number; maximumPropertiesPerShard: number }>,
+  options: Readonly<{
+    initialPrefixLength?: number;
+    maximumPropertiesPerShard: number;
+    maximumShardBytes?: number;
+  }>,
 ): PropertyCarRelease {
   const initialPrefixLength = options.initialPrefixLength ?? 2;
   if (
@@ -392,6 +401,10 @@ export function buildPropertyCarRelease(
   ) {
     throw new RangeError('maximumPropertiesPerShard must be a positive integer');
   }
+  const maximumShardBytes = options.maximumShardBytes ?? 4 * 1024 * 1024 * 1024;
+  if (!Number.isSafeInteger(maximumShardBytes) || maximumShardBytes < 1) {
+    throw new RangeError('maximumShardBytes must be a positive safe integer');
+  }
   const identifiers = properties.map(({ propertyId }) => propertyId);
   if (new Set(identifiers).size !== identifiers.length) {
     throw new TypeError('Property identifiers must be unique before CAR construction');
@@ -404,6 +417,12 @@ export function buildPropertyCarRelease(
   const shards = Object.freeze(
     [...assignments.entries()].map(([shard, values]) => buildShard(shard, values)),
   );
+  const oversized = shards.find(({ byteLength }) => byteLength > maximumShardBytes);
+  if (oversized !== undefined) {
+    throw new RangeError(
+      `CAR shard ${oversized.shard} exceeds maximumShardBytes: ${oversized.byteLength} > ${maximumShardBytes}`,
+    );
+  }
   const rootIndex: PropertyRootIndex = Object.freeze({
     schemaVersion: '1.0.0',
     unixFsProfile: Object.freeze({
@@ -416,6 +435,7 @@ export function buildPropertyCarRelease(
     eligiblePropertyCount: properties.length,
     shardCount: shards.length,
     maximumPropertiesPerShard: options.maximumPropertiesPerShard,
+    maximumShardBytes,
     shards: Object.freeze(
       shards.map(({ shard, rootCid, sha256, byteLength, propertyCount }) =>
         Object.freeze({ shard, rootCid, sha256, byteLength, propertyCount }),
@@ -436,7 +456,7 @@ export function buildPropertyCarRelease(
             }),
           ),
         )
-        .sort((left, right) => left.propertyId.localeCompare(right.propertyId)),
+        .sort((left, right) => compareUtf8(left.propertyId, right.propertyId)),
     ),
   });
   const rootIndexBytes = canonicalIndexBytes(rootIndex);

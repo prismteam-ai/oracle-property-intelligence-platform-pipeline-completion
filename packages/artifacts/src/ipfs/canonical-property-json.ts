@@ -34,8 +34,120 @@ const ALWAYS_PROHIBITED_FIELDS = Object.freeze([
   'streetAddress',
 ]);
 
+const PROHIBITED_NORMALIZED_FIELD_NAMES = new Set([
+  'applicant',
+  'applicantaddress',
+  'applicantemail',
+  'applicantname',
+  'applicantphone',
+  'birthdate',
+  'contact',
+  'contactdetails',
+  'dateofbirth',
+  'dob',
+  'email',
+  'fbnpartyaddress',
+  'fbnpartyidentifier',
+  'fbnregistrant',
+  'fbnregistrantaddress',
+  'fbnregistrantname',
+  'fbnregistrantresidence',
+  'grantee',
+  'granteeaddress',
+  'grantor',
+  'grantoraddress',
+  'mailingaddress',
+  'mailingstreet',
+  'owneraddress',
+  'owneremail',
+  'owneridentity',
+  'ownername',
+  'ownerphone',
+  'owners',
+  'ownerstext',
+  'partyaddress',
+  'partyidentifier',
+  'phone',
+  'prohibitedpublic',
+  'protectedaddress',
+  'rawownername',
+  'restricted',
+  'socialsecuritynumber',
+  'sosagentresidentialaddress',
+  'sosofficerresidentialaddress',
+  'ssn',
+  'streetaddress',
+]);
+
 function sha256(bytes: Uint8Array | string): string {
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+function compareUtf8(left: string, right: string): number {
+  return Buffer.from(left, 'utf8').compare(Buffer.from(right, 'utf8'));
+}
+
+function normalizedFieldName(value: string): string {
+  return value.toLowerCase().replaceAll(/[^a-z0-9]/gu, '');
+}
+
+function assertPublicFieldName(field: string, path: string, prohibited: ReadonlySet<string>): void {
+  const normalized = normalizedFieldName(field);
+  const containsSensitiveOwnerDetail =
+    normalized.includes('owner') &&
+    ['address', 'email', 'identity', 'mailing', 'name', 'phone', 'text'].some((token) =>
+      normalized.includes(token),
+    );
+  const containsDirectContact = ['email', 'phone', 'contact'].some((token) =>
+    normalized.includes(token),
+  );
+  const containsRestrictedPartyDetail =
+    normalized.includes('party') &&
+    ['address', 'identifier', 'identity'].some((token) => normalized.includes(token));
+  const containsRestrictedBusinessIdentity =
+    normalized.includes('registrant') ||
+    (normalized.includes('residen') && normalized.includes('address')) ||
+    ((normalized.includes('officer') || normalized.includes('agent')) &&
+      normalized.includes('address'));
+  const containsSensitiveIdentity =
+    normalized.includes('socialsecurity') ||
+    normalized.includes('dateofbirth') ||
+    normalized.includes('birthdate');
+  if (
+    field === '__proto__' ||
+    field === 'constructor' ||
+    field === 'prototype' ||
+    prohibited.has(normalized) ||
+    PROHIBITED_NORMALIZED_FIELD_NAMES.has(normalized) ||
+    containsSensitiveOwnerDetail ||
+    containsDirectContact ||
+    containsRestrictedPartyDetail ||
+    containsRestrictedBusinessIdentity ||
+    containsSensitiveIdentity ||
+    normalized.includes('mailingaddress') ||
+    normalized.includes('protectedaddress') ||
+    normalized.includes('grantor') ||
+    normalized.includes('grantee') ||
+    normalized.includes('applicant')
+  ) {
+    throw new TypeError(`${path} contains prohibited public field: ${field}`);
+  }
+}
+
+function assertPublicValue(value: unknown, path: string, prohibited: ReadonlySet<string>): void {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertPublicValue(item, `${path}[${index}]`, prohibited));
+    return;
+  }
+  if (value === null || typeof value !== 'object') return;
+  const prototype = Object.getPrototypeOf(value) as unknown;
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`${path} must contain only plain JSON objects`);
+  }
+  for (const [key, item] of Object.entries(value)) {
+    assertPublicFieldName(key, `${path}.${key}`, prohibited);
+    assertPublicValue(item, `${path}.${key}`, prohibited);
+  }
 }
 
 function canonicalize(value: unknown, path: string): CanonicalJson {
@@ -48,9 +160,16 @@ function canonicalize(value: unknown, path: string): CanonicalJson {
     return Object.freeze(value.map((item, index) => canonicalize(item, `${path}[${index}]`)));
   }
   if (typeof value === 'object') {
-    const output: Record<string, CanonicalJson> = {};
+    const prototype = Object.getPrototypeOf(value) as unknown;
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError(`${path} must be a plain JSON object`);
+    }
+    const output: Record<string, CanonicalJson> = Object.create(null) as Record<
+      string,
+      CanonicalJson
+    >;
     for (const [key, item] of Object.entries(value).sort(([left], [right]) =>
-      left.localeCompare(right),
+      compareUtf8(left, right),
     )) {
       if (item === undefined) throw new TypeError(`${path}.${key} must not be undefined`);
       output[key] = canonicalize(item, `${path}.${key}`);
@@ -71,13 +190,22 @@ function assertPolicy(policy: PublicProjectionPolicy): Readonly<{
 }> {
   if (policy.propertyIdField.trim().length === 0)
     throw new TypeError('propertyIdField is required');
-  const approved = [...new Set(policy.approvedFields)].sort();
+  const approved = [...new Set(policy.approvedFields)].sort(compareUtf8);
   if (approved.length === 0) throw new TypeError('At least one approved public field is required');
   if (!approved.includes(policy.propertyIdField)) {
     throw new TypeError('The property identifier must be included in the approved public fields');
   }
-  const prohibited = new Set([...ALWAYS_PROHIBITED_FIELDS, ...(policy.prohibitedFields ?? [])]);
-  const conflicting = approved.filter((field) => prohibited.has(field));
+  const prohibited = new Set(
+    [...ALWAYS_PROHIBITED_FIELDS, ...(policy.prohibitedFields ?? [])].map(normalizedFieldName),
+  );
+  const conflicting = approved.filter((field) => {
+    try {
+      assertPublicFieldName(field, `approvedFields.${field}`, prohibited);
+      return false;
+    } catch {
+      return true;
+    }
+  });
   if (conflicting.length > 0) {
     throw new TypeError(`Prohibited fields cannot be public: ${conflicting.join(', ')}`);
   }
@@ -113,8 +241,9 @@ export function buildCanonicalPropertyJson(
     seen.add(identifier);
     const value: Record<string, CanonicalJson> = {};
     for (const field of approved) {
-      if (prohibited.has(field)) throw new TypeError(`Prohibited public field: ${field}`);
+      assertPublicFieldName(field, `record.${field}`, prohibited);
       if (!(field in record)) throw new TypeError(`Approved field is missing: ${field}`);
+      assertPublicValue(record[field], `record.${field}`, prohibited);
       value[field] = canonicalize(record[field], `record.${field}`);
     }
     const bytes = canonicalJsonBytes(value);
@@ -126,6 +255,6 @@ export function buildCanonicalPropertyJson(
       sha256: sha256(bytes),
     });
   });
-  projected.sort((left, right) => left.propertyId.localeCompare(right.propertyId));
+  projected.sort((left, right) => compareUtf8(left.propertyId, right.propertyId));
   return Object.freeze(projected);
 }
