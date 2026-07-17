@@ -33,6 +33,7 @@ export type InquiryReleaseContext = Readonly<{
 }>;
 
 export type InquiryPage = Readonly<{
+  releaseId: string;
   limit?: number;
   cursor?: string | null;
 }>;
@@ -94,7 +95,7 @@ export type InquiryResponse<TValue> = Readonly<{
 
 export type RoofAgeInput = PropertyFilters &
   InquiryPage &
-  Readonly<{ minimumAgeYears?: number; includeProxy?: boolean }>;
+  Readonly<{ minimumAgeYears?: number; includeProxy?: boolean; asOf?: string }>;
 export type WaterViewInput = PropertyFilters &
   InquiryPage &
   Readonly<{ maximumDistanceMeters?: number; includeProxy?: boolean }>;
@@ -115,6 +116,7 @@ export type RankingWeight = Readonly<{
 export type CombinedRankingInput = PropertyFilters &
   InquiryPage &
   Readonly<{
+    criteria?: readonly RankingCriterion[];
     weights?: readonly RankingWeight[];
     includeProxy?: boolean;
     minimumEvidenceCoverage?: number;

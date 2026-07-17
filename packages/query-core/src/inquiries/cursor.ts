@@ -6,6 +6,7 @@ type CursorPayload = Readonly<{
   version: 1;
   inquiry: InquiryName;
   releaseId: string;
+  queryFingerprint: string;
   keys: readonly (number | string)[];
 }>;
 
@@ -18,6 +19,8 @@ function parsePayload(value: unknown): CursorPayload {
     candidate.version !== 1 ||
     typeof candidate.inquiry !== 'string' ||
     typeof candidate.releaseId !== 'string' ||
+    typeof candidate.queryFingerprint !== 'string' ||
+    !/^[a-f0-9]{64}$/u.test(candidate.queryFingerprint) ||
     !Array.isArray(candidate.keys) ||
     !candidate.keys.every(
       (key) => typeof key === 'string' || (typeof key === 'number' && Number.isFinite(key)),
@@ -49,7 +52,7 @@ export class InquiryCursorCodec {
 
   public decode(
     cursor: string,
-    expected: Readonly<{ inquiry: InquiryName; releaseId: string }>,
+    expected: Readonly<{ inquiry: InquiryName; releaseId: string; queryFingerprint: string }>,
   ): readonly (number | string)[] {
     if (Buffer.byteLength(cursor, 'utf8') > 512) throw new RangeError('Cursor exceeds 512 bytes');
     const segments = cursor.split('.');
@@ -80,6 +83,9 @@ export class InquiryCursorCodec {
     const payload = parsePayload(decoded);
     if (payload.inquiry !== expected.inquiry || payload.releaseId !== expected.releaseId) {
       throw new TypeError('Cursor is stale or belongs to another inquiry');
+    }
+    if (payload.queryFingerprint !== expected.queryFingerprint) {
+      throw new TypeError('Cursor belongs to a different normalized query');
     }
     return Object.freeze([...payload.keys]);
   }

@@ -21,4 +21,20 @@ describe('named inquiry golden inventory', () => {
       ),
     ).toBe(true);
   });
+
+  it('uses unique source-shaped synthetic cases and keeps unknown goldens empty', () => {
+    expect(new Set(NAMED_INQUIRY_GOLDENS.map(({ id }) => id)).size).toBe(
+      NAMED_INQUIRY_GOLDENS.length,
+    );
+    expect(
+      NAMED_INQUIRY_GOLDENS.flatMap(({ expectedPropertyIds }) => expectedPropertyIds).every(
+        (propertyId) => propertyId.startsWith('sc:entity:property:golden-'),
+      ),
+    ).toBe(true);
+    expect(
+      NAMED_INQUIRY_GOLDENS.filter(({ expectedSupport }) => expectedSupport === 'unknown').every(
+        ({ expectedPropertyIds }) => expectedPropertyIds.length === 0,
+      ),
+    ).toBe(true);
+  });
 });
