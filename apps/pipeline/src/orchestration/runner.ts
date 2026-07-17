@@ -1,6 +1,7 @@
 import type { CheckpointEnvelope } from '@oracle/artifacts/checkpoint-store';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
 import type { SourceId } from '@oracle/contracts/ids';
+import { snapshotIdSchema } from '@oracle/contracts/ids';
 import { sourceCheckpointSchema } from '@oracle/contracts/source';
 import type {
   AcquisitionPlan,
@@ -47,6 +48,23 @@ type SourceRuntime = Readonly<{
   mutations: readonly CanonicalMutation[];
   manifest: SourceExecutionManifest;
 }>;
+
+export const REQUIRED_COUNTY_CAPABILITIES = Object.freeze([
+  'santa_clara_parcels',
+  'san_jose_permits',
+  'palo_alto_year_built',
+  'vta_gtfs',
+  'caltrain_gtfs',
+  'osm_pedestrian_graph',
+  'noaa_shoreline',
+  'usgs_hydrography',
+  'usgs_elevation',
+  'overture_starbucks',
+  'cslb_contractors',
+  'ca_sos_businesses',
+  'ownership_transfers',
+  'santa_clara_fbn',
+] as const);
 
 function emptySource(source: SourceConfiguration): PersistedSourceState {
   return Object.freeze({
@@ -97,6 +115,13 @@ function configurationHash(configuration: PipelineConfiguration): string {
     sources: configuration.sources.map((source) => ({
       sourceId: source.adapter.describe().sourceId,
       snapshotId: source.snapshotId,
+      scope: source.scope,
+      capability: source.capability,
+      executionMode: source.executionMode,
+      supportState: source.supportState,
+      acquisitionItemCap: source.acquisitionItemCap,
+      discoveryDenominatorStrategy: source.discoveryDenominatorStrategy,
+      requiredForCountyCompletion: source.requiredForCountyCompletion,
       expectedRecords: source.expectedRecords ?? null,
       limitations: source.limitations ?? [],
       contractVersion: source.adapter.describe().contractVersion,
@@ -104,7 +129,7 @@ function configurationHash(configuration: PipelineConfiguration): string {
   });
 }
 
-function assertConfiguration(configuration: PipelineConfiguration): void {
+export function assertConfiguration(configuration: PipelineConfiguration): void {
   if (configuration.sources.length === 0) throw new TypeError('At least one source is required');
   if (
     !Number.isSafeInteger(configuration.maximumPhaseAttempts) ||
@@ -117,6 +142,35 @@ function assertConfiguration(configuration: PipelineConfiguration): void {
     throw new TypeError('Source IDs must be unique');
   if (configuration.profile.name === 'full' && configuration.profile.recordCap !== null) {
     throw new TypeError('Full runs must be uncapped');
+  }
+  if (configuration.profile.name === 'full' && configuration.sources.length < 2) {
+    throw new TypeError('A full run cannot compose fewer than two source lanes');
+  }
+  if (
+    configuration.profile.name === 'full' &&
+    new Set(configuration.sources.map(({ capability }) => capability)).size < 2
+  ) {
+    throw new TypeError('A full run cannot claim county composition from one capability');
+  }
+  if (configuration.profile.name === 'full') {
+    const configured = new Set(
+      configuration.sources
+        .filter(({ requiredForCountyCompletion }) => requiredForCountyCompletion)
+        .map(({ capability }) => capability),
+    );
+    const missing = REQUIRED_COUNTY_CAPABILITIES.filter(
+      (capability) => !configured.has(capability),
+    );
+    const unexpected = [...configured]
+      .filter(
+        (capability) => !(REQUIRED_COUNTY_CAPABILITIES as readonly string[]).includes(capability),
+      )
+      .sort();
+    if (missing.length > 0 || unexpected.length > 0) {
+      throw new TypeError(
+        `A full run requires the exact production capability inventory; missing=${missing.join(',') || 'none'}; unexpected=${unexpected.join(',') || 'none'}`,
+      );
+    }
   }
 }
 
@@ -309,14 +363,29 @@ function finalSourceCheckpoint(
   });
 }
 
+export function selectDiscoveryDenominator(
+  strategy: SourceConfiguration['discoveryDenominatorStrategy'],
+  resources: readonly Readonly<{ expectedRecords: number | null }>[],
+): number | null {
+  if (strategy === 'unavailable') return null;
+  const denominators = resources.flatMap(({ expectedRecords }) =>
+    expectedRecords === null ? [] : [expectedRecords],
+  );
+  if (denominators.length === 0) return null;
+  return strategy === 'sum_non_null'
+    ? denominators.reduce((total, value) => total + value, 0)
+    : (denominators[0] ?? null);
+}
+
 function coverage(
   source: SourceConfiguration,
   discovery: DiscoveryResult | undefined,
   state: PersistedSourceState,
 ): SourceCoverage {
-  const discovered = discovery?.resources.find(
-    ({ expectedRecords }) => expectedRecords !== null,
-  )?.expectedRecords;
+  const discovered = selectDiscoveryDenominator(
+    source.discoveryDenominatorStrategy,
+    discovery?.resources ?? [],
+  );
   const expectedRecords = source.expectedRecords ?? discovered ?? null;
   return Object.freeze({
     expectedRecords,
@@ -326,7 +395,7 @@ function coverage(
     denominatorMethod:
       source.expectedRecords !== undefined && source.expectedRecords !== null
         ? 'configured'
-        : discovered !== undefined && discovered !== null
+        : discovered !== null
           ? 'discovered'
           : 'unavailable',
     ratio:
@@ -353,12 +422,7 @@ function sourceManifest(
     source: SourceConfiguration;
     state: PersistedSourceState;
     discovery?: DiscoveryResult | undefined;
-    acquired?:
-      | readonly {
-          readonly sha256: string;
-          readonly schemaFingerprint: { readonly value: string };
-        }[]
-      | undefined;
+    acquired?: readonly AcquiredArtifact[] | undefined;
     summary?: SourceRunSummary | undefined;
     checkpointRevision: string | null;
   }>,
@@ -371,16 +435,65 @@ function sourceManifest(
     input.state.summaryArtifact,
   ].filter((artifact): artifact is PhaseArtifact => artifact !== null);
   const acquired = input.acquired ?? [];
+  const sourceCoverage = coverage(input.source, input.discovery, input.state);
+  const observedContentId =
+    acquired.length === 0
+      ? null
+      : snapshotIdSchema.parse(
+          `sc:snapshot:${input.state.sourceId.replace('sc:source:', '')}:${sha256(
+            acquired.map((artifact) => ({
+              sha256: artifact.sha256,
+              schemaFingerprint: artifact.schemaFingerprint.value,
+              sourceAsOf: artifact.sourceAsOf,
+            })),
+          )}`,
+        );
+  const sourceAsOf =
+    [
+      ...acquired.map(({ sourceAsOf: value }) => value),
+      ...(input.discovery?.resources.map(({ sourceAsOf: value }) => value) ?? []),
+    ]
+      .flatMap((value) =>
+        value.state === 'reported' || value.state === 'derived' ? [value.at] : [],
+      )
+      .sort()
+      .at(-1) ?? null;
+  const terminalState =
+    input.summary !== undefined &&
+    input.state.terminalState === 'complete' &&
+    sourceCoverage.expectedRecords !== null &&
+    sourceCoverage.observedRecords < sourceCoverage.expectedRecords
+      ? 'partial'
+      : (input.state.terminalState ?? 'failed');
   return Object.freeze({
     sourceId: input.state.sourceId,
     snapshotId: input.state.snapshotId,
-    terminalState: input.state.terminalState ?? 'failed',
-    sourceHash: sha256(acquired.map(({ sha256: hash }) => hash)),
+    snapshotIdentity: Object.freeze({
+      intentId: input.state.snapshotId,
+      observedContentId,
+      method: 'configured_intent_plus_observed_content_v1' as const,
+    }),
+    scope: input.source.scope,
+    capability: input.source.capability,
+    executionMode: input.source.executionMode,
+    supportState: input.source.supportState,
+    requiredForCountyCompletion: input.source.requiredForCountyCompletion,
+    terminalState,
+    sourceHash: sha256({
+      snapshotId: input.state.snapshotId,
+      acquiredHashes: acquired.map(({ sha256: hash }) => hash),
+    }),
+    sourceAsOf,
+    license: Object.freeze({
+      redistribution: input.source.adapter.describe().license.redistribution,
+      containsPersonalData: input.source.adapter.describe().license.containsPersonalData,
+      defaultVisibility: input.source.adapter.describe().defaultVisibility,
+    }),
     schemaHashes: Object.freeze(
       [...new Set(acquired.map(({ schemaFingerprint }) => schemaFingerprint.value))].sort(),
     ),
     checkpointRevision: input.checkpointRevision,
-    coverage: coverage(input.source, input.discovery, input.state),
+    coverage: sourceCoverage,
     timings: input.state.timings,
     artifacts: Object.freeze(artifacts),
     limitations: input.state.limitations,
@@ -440,9 +553,24 @@ async function runSource(
     if (discovery === undefined)
       throw new Error(`Discovery state unavailable for ${descriptor.sourceId}`);
 
-    if (configuration.profile.name === 'discovery') {
-      const terminalState: SourceTerminalState = discovery.complete ? 'complete' : 'partial';
-      state = Object.freeze({ ...state, terminalState, completedPhase: 'summarize' });
+    if (configuration.profile.name === 'discovery' || source.executionMode === 'discover_only') {
+      const terminalState: SourceTerminalState =
+        source.supportState === 'blocked' ? 'blocked' : discovery.complete ? 'complete' : 'partial';
+      state = Object.freeze({
+        ...state,
+        terminalState:
+          source.executionMode === 'discover_only' && configuration.profile.name !== 'discovery'
+            ? 'partial'
+            : terminalState,
+        completedPhase: 'summarize',
+        limitations:
+          source.executionMode === 'discover_only' && configuration.profile.name !== 'discovery'
+            ? Object.freeze([
+                ...state.limitations,
+                'This source was discovery-only in the bounded pilot; no records were loaded.',
+              ])
+            : state.limitations,
+      });
       await coordinator.updateSource(state);
       return Object.freeze({
         state,
@@ -472,16 +600,33 @@ async function runSource(
             signal: dependencies.signal,
           }),
       );
-      plan = phase.value;
+      const planned =
+        source.acquisitionItemCap === null || phase.value.items.length <= source.acquisitionItemCap
+          ? phase.value
+          : Object.freeze({
+              ...phase.value,
+              items: phase.value.items.slice(0, source.acquisitionItemCap),
+            });
+      plan = planned;
       state = await persistSourcePhase({
         configuration,
         dependencies,
         coordinator,
         state,
         phase: 'plan',
-        value: plan,
+        value: planned,
         timing: phase.timing,
         artifactField: 'planArtifact',
+        ...(planned.items.length < phase.value.items.length
+          ? {
+              patch: {
+                limitations: Object.freeze([
+                  ...state.limitations,
+                  `Bounded ${configuration.profile.name} acquisition executed ${planned.items.length} of ${phase.value.items.length} planned source items.`,
+                ]),
+              },
+            }
+          : {}),
       });
     }
     if (plan === undefined)
@@ -709,11 +854,74 @@ async function concurrentMap<T, U>(
 }
 
 function manifestStatus(
+  profile: PipelineConfiguration['profile'],
   sources: readonly SourceExecutionManifest[],
 ): PipelineRunManifest['status'] {
+  if (
+    profile.name === 'full' &&
+    sources.some(({ terminalState }) => terminalState !== 'complete')
+  ) {
+    return sources.every(({ terminalState }) => terminalState === 'failed') ? 'failed' : 'partial';
+  }
   if (sources.every(({ terminalState }) => terminalState === 'complete')) return 'succeeded';
   if (sources.every(({ terminalState }) => terminalState === 'failed')) return 'failed';
   return 'partial';
+}
+
+export function countyCompletion(
+  profile: PipelineConfiguration['profile'],
+  sources: readonly SourceExecutionManifest[],
+): PipelineRunManifest['countyCompletion'] {
+  const required = sources.filter(({ requiredForCountyCompletion }) => requiredForCountyCompletion);
+  const complete = required.filter(({ terminalState }) => terminalState === 'complete');
+  const blocking = required
+    .filter(({ terminalState }) => terminalState !== 'complete')
+    .map(({ sourceId }) => sourceId)
+    .sort();
+  const capabilityInventory = new Set(required.map(({ capability }) => capability));
+  const missingRequiredCapabilities = REQUIRED_COUNTY_CAPABILITIES.filter(
+    (capability) => !capabilityInventory.has(capability),
+  );
+  const unexpectedRequiredCapabilities = [...capabilityInventory]
+    .filter(
+      (capability) => !(REQUIRED_COUNTY_CAPABILITIES as readonly string[]).includes(capability),
+    )
+    .sort();
+  const inventoryComplete =
+    missingRequiredCapabilities.length === 0 && unexpectedRequiredCapabilities.length === 0;
+  if (profile.name !== 'full') {
+    return Object.freeze({
+      state: 'not_applicable' as const,
+      requiredSourceCount: required.length,
+      completeRequiredSourceCount: complete.length,
+      blockingSourceIds: Object.freeze(blocking),
+      missingRequiredCapabilities: Object.freeze(missingRequiredCapabilities),
+      unexpectedRequiredCapabilities: Object.freeze(unexpectedRequiredCapabilities),
+      claim: `${profile.name} is not a county-completion profile.`,
+    });
+  }
+  if (blocking.length === 0 && inventoryComplete) {
+    return Object.freeze({
+      state: 'complete' as const,
+      requiredSourceCount: required.length,
+      completeRequiredSourceCount: complete.length,
+      blockingSourceIds: Object.freeze([]),
+      missingRequiredCapabilities: Object.freeze([]),
+      unexpectedRequiredCapabilities: Object.freeze([]),
+      claim: 'Every required configured source lane reached complete in an uncapped full run.',
+    });
+  }
+  const blocked = required.some(({ terminalState }) => terminalState === 'blocked');
+  return Object.freeze({
+    state: blocked ? ('blocked' as const) : ('partial' as const),
+    requiredSourceCount: required.length,
+    completeRequiredSourceCount: complete.length,
+    blockingSourceIds: Object.freeze(blocking),
+    missingRequiredCapabilities: Object.freeze(missingRequiredCapabilities),
+    unexpectedRequiredCapabilities: Object.freeze(unexpectedRequiredCapabilities),
+    claim:
+      'County completion is not claimed because one or more required source lanes are incomplete or blocked.',
+  });
 }
 
 export async function runPipeline(
@@ -768,6 +976,7 @@ export async function runPipeline(
   let featureArtifact = run.state.featureArtifact;
   let martArtifact = run.state.martArtifact;
   const allMutations = Object.freeze(sourceResults.flatMap(({ mutations }) => mutations));
+  const processorSourceManifests = Object.freeze(sourceResults.map(({ manifest }) => manifest));
   if (
     configuration.profile.name !== 'discovery' &&
     sourceResults.some(({ state }) => state.terminalState !== 'failed')
@@ -818,7 +1027,22 @@ export async function runPipeline(
         null,
         dependencies,
         configuration.maximumPhaseAttempts,
-        () => dependencies.processors.buildMarts({ reconciled, features }, dependencies.signal),
+        () =>
+          dependencies.processors.buildMarts(
+            {
+              reconciled,
+              features,
+              run: Object.freeze({
+                runId: configuration.runId,
+                pipelineVersion: configuration.pipelineVersion,
+                profile: configuration.profile.name,
+                requestedAt: configuration.requestedAt,
+                completedAt: dependencies.clock.now(),
+              }),
+              sources: processorSourceManifests,
+            },
+            dependencies.signal,
+          ),
       );
       martArtifact = await writeJsonArtifact({
         store: dependencies.artifactStore,
@@ -858,12 +1082,13 @@ export async function runPipeline(
   const globalArtifacts = [reconcileArtifact, featureArtifact, martArtifact].filter(
     (artifact): artifact is PhaseArtifact => artifact !== null,
   );
+  const completion = countyCompletion(configuration.profile, sourceManifests);
   const manifest: PipelineRunManifest = Object.freeze({
-    schemaVersion: '1.0.0',
+    schemaVersion: '2.0.0',
     runId: configuration.runId,
     pipelineVersion: configuration.pipelineVersion,
     profile: configuration.profile.name,
-    status: manifestStatus(sourceManifests),
+    status: manifestStatus(configuration.profile, sourceManifests),
     requestedAt: configuration.requestedAt,
     completedAt,
     configurationHash: hash,
@@ -874,6 +1099,7 @@ export async function runPipeline(
     }),
     sources: Object.freeze(sourceManifests),
     artifacts: Object.freeze(globalArtifacts),
+    countyCompletion: completion,
     limitations: Object.freeze(sourceManifests.flatMap(({ limitations }) => limitations)),
   });
   const manifestPhase = await writeJsonArtifact({

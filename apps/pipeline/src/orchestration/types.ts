@@ -29,6 +29,9 @@ export const ORCHESTRATION_PHASES = Object.freeze([
 export type OrchestrationPhase = (typeof ORCHESTRATION_PHASES)[number];
 export type RunProfileName = 'discovery' | 'pilot' | 'full' | 'incremental';
 export type SourceTerminalState = 'complete' | 'partial' | 'blocked' | 'failed';
+export type SourceExecutionMode = 'execute' | 'discover_only';
+export type SourceSupportState = 'available' | 'blocked';
+export type DiscoveryDenominatorStrategy = 'first_non_null' | 'sum_non_null' | 'unavailable';
 
 export type RunProfile = Readonly<{
   name: RunProfileName;
@@ -40,6 +43,13 @@ export type RunProfile = Readonly<{
 export type SourceConfiguration = Readonly<{
   adapter: SourceAdapter;
   snapshotId: SnapshotId;
+  scope: string;
+  capability: string;
+  executionMode: SourceExecutionMode;
+  supportState: SourceSupportState;
+  acquisitionItemCap: number | null;
+  discoveryDenominatorStrategy: DiscoveryDenominatorStrategy;
+  requiredForCountyCompletion: boolean;
   expectedRecords?: number | null;
   limitations?: readonly string[];
 }>;
@@ -82,8 +92,24 @@ export type PhaseArtifact = Readonly<{
 export type SourceExecutionManifest = Readonly<{
   sourceId: SourceId;
   snapshotId: SnapshotId;
+  snapshotIdentity: Readonly<{
+    intentId: SnapshotId;
+    observedContentId: SnapshotId | null;
+    method: 'configured_intent_plus_observed_content_v1';
+  }>;
+  scope: string;
+  capability: string;
+  executionMode: SourceExecutionMode;
+  supportState: SourceSupportState;
+  requiredForCountyCompletion: boolean;
   terminalState: SourceTerminalState;
   sourceHash: string;
+  sourceAsOf: string | null;
+  license: Readonly<{
+    redistribution: 'approved' | 'restricted' | 'prohibited' | 'unknown';
+    containsPersonalData: boolean;
+    defaultVisibility: 'public' | 'restricted' | 'prohibited_public' | 'authenticated';
+  }>;
   schemaHashes: readonly string[];
   checkpointRevision: string | null;
   coverage: SourceCoverage;
@@ -95,7 +121,7 @@ export type SourceExecutionManifest = Readonly<{
 }>;
 
 export type PipelineRunManifest = Readonly<{
-  schemaVersion: '1.0.0';
+  schemaVersion: '2.0.0';
   runId: RunId;
   pipelineVersion: string;
   profile: RunProfileName;
@@ -115,6 +141,15 @@ export type PipelineRunManifest = Readonly<{
   }>;
   sources: readonly SourceExecutionManifest[];
   artifacts: readonly PhaseArtifact[];
+  countyCompletion: Readonly<{
+    state: 'not_applicable' | 'complete' | 'partial' | 'blocked';
+    requiredSourceCount: number;
+    completeRequiredSourceCount: number;
+    blockingSourceIds: readonly SourceId[];
+    missingRequiredCapabilities: readonly string[];
+    unexpectedRequiredCapabilities: readonly string[];
+    claim: string;
+  }>;
   limitations: readonly string[];
 }>;
 
@@ -135,7 +170,18 @@ export interface PipelineProcessors {
   ): Promise<ReconciliationOutput>;
   deriveFeatures(reconciled: ReconciliationOutput, signal: AbortSignal): Promise<unknown>;
   buildMarts(
-    input: Readonly<{ reconciled: ReconciliationOutput; features: unknown }>,
+    input: Readonly<{
+      reconciled: ReconciliationOutput;
+      features: unknown;
+      run: Readonly<{
+        runId: RunId;
+        pipelineVersion: string;
+        profile: RunProfileName;
+        requestedAt: string;
+        completedAt: string;
+      }>;
+      sources: readonly SourceExecutionManifest[];
+    }>,
     signal: AbortSignal,
   ): Promise<unknown>;
 }

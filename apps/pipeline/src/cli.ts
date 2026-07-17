@@ -10,7 +10,7 @@ function option(arguments_: readonly string[], name: string): string | undefined
 
 function usage(): void {
   process.stderr.write(
-    'Usage: oracle-pipeline --check | <discovery|pilot|full|incremental> [--fixture] [--workspace <repo>] --output <directory>\n',
+    'Usage: oracle-pipeline --check | <discovery|pilot|full|incremental> [--fixture] [--source-config <json>] [--requested-at <iso>] [--workspace <repo>] --output <directory>\n',
   );
 }
 
@@ -32,11 +32,15 @@ export async function main(arguments_: readonly string[]): Promise<number> {
       usage();
       return 2;
     }
+    const sourceConfigPath = option(arguments_, '--source-config');
+    const requestedAt = option(arguments_, '--requested-at');
     const result = await runCommand({
       profile,
       workspaceDirectory: option(arguments_, '--workspace') ?? process.cwd(),
       outputDirectory: output,
       fixture: arguments_.includes('--fixture'),
+      ...(sourceConfigPath === undefined ? {} : { sourceConfigPath }),
+      ...(requestedAt === undefined ? {} : { requestedAt }),
     });
     process.stdout.write(`${JSON.stringify(result.manifest)}\n`);
     return result.manifest.status === 'failed' ? 1 : 0;

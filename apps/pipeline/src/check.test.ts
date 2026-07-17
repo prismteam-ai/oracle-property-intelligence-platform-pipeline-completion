@@ -9,7 +9,8 @@ describe('pipeline foundation check', () => {
       command: 'pipeline.check',
       networkAccess: false,
       status: 'ok',
-      pipelineState: 'not_implemented',
+      pipelineState: 'production_composition_available',
+      publicationEffects: false,
     });
   });
 

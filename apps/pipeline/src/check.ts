@@ -1,10 +1,9 @@
-import { FOUNDATION_STATUS } from '@oracle/contracts';
-
 export type PipelineCheck = Readonly<{
   command: 'pipeline.check';
   networkAccess: false;
   status: 'ok';
-  pipelineState: 'not_implemented';
+  pipelineState: 'production_composition_available';
+  publicationEffects: false;
 }>;
 
 export function runCheck(): PipelineCheck {
@@ -12,6 +11,7 @@ export function runCheck(): PipelineCheck {
     command: 'pipeline.check',
     networkAccess: false,
     status: 'ok',
-    pipelineState: FOUNDATION_STATUS.capabilities.propertyPipeline,
+    pipelineState: 'production_composition_available',
+    publicationEffects: false,
   });
 }

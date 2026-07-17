@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { runCommand } from './run.js';
+import { collectResponseHeaders, isWithinAuthorizationScope, runCommand } from './run.js';
 
 const temporaryDirectories: string[] = [];
 const WORKSPACE_DIRECTORY = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -23,6 +23,40 @@ afterEach(() => {
 });
 
 describe('executable pipeline commands', () => {
+  it('rejects a requested instant later than the runtime clock', async () => {
+    await expect(
+      runCommand({
+        profile: 'pilot',
+        fixture: true,
+        requestedAt: '2026-07-17T13:00:00.001Z',
+        workspaceDirectory: WORKSPACE_DIRECTORY,
+        outputDirectory: await temporaryDirectory('future-request'),
+      }),
+    ).rejects.toThrow('requestedAt cannot be later than the current runtime clock');
+  });
+
+  it('preserves duplicate response cookies for stateful portal adapters', () => {
+    const headers = new Headers({ 'x-source': 'test' });
+    headers.append('set-cookie', 'session=one; Path=/');
+    headers.append('set-cookie', 'route=two; Path=/');
+    expect(collectResponseHeaders(headers)).toEqual({
+      'set-cookie': 'session=one; Path=/,route=two; Path=/',
+      'x-source': 'test',
+    });
+  });
+
+  it('matches authorization only within the configured feed origin and path boundary', () => {
+    const scope = 'https://api.511.org/transit/datafeeds';
+    expect(isWithinAuthorizationScope(scope, scope)).toBe(true);
+    expect(isWithinAuthorizationScope(`${scope}/vta`, scope)).toBe(true);
+    expect(isWithinAuthorizationScope('https://api.511.org/transit/datafeeds-evil', scope)).toBe(
+      false,
+    );
+    expect(
+      isWithinAuthorizationScope('https://unrelated.example.test/transit/datafeeds', scope),
+    ).toBe(false);
+  });
+
   it('runs every real parcel-adapter phase and the real reducer, reconciliation, feature, and mart processors', async () => {
     const result = await runCommand({
       profile: 'pilot',
@@ -59,6 +93,13 @@ describe('executable pipeline commands', () => {
     expect(source?.summary?.normalizedMutations).toBeGreaterThan(0);
     expect(source?.sourceHash).toMatch(/^[a-f0-9]{64}$/u);
     expect(source?.schemaHashes).toHaveLength(1);
+    expect(source?.snapshotIdentity.observedContentId).toMatch(
+      /^sc:snapshot:santa-clara-socrata-parcels:[a-f0-9]{64}$/u,
+    );
+    expect(result.manifest.countyCompletion).toMatchObject({
+      state: 'not_applicable',
+      claim: 'pilot is not a county-completion profile.',
+    });
   });
 
   it('runs discovery without acquiring or claiming loaded records', async () => {
@@ -72,6 +113,7 @@ describe('executable pipeline commands', () => {
     expect(result.manifest.sources[0]?.coverage.observedRecords).toBe(0);
     expect(result.manifest.sources[0]?.artifacts.map(({ phase }) => phase)).toEqual(['discover']);
     expect(result.manifest.artifacts).toEqual([]);
+    expect(result.manifest.countyCompletion.state).toBe('not_applicable');
   });
 
   it('checkpoints an interruption and resumes without replaying durable phases', async () => {
