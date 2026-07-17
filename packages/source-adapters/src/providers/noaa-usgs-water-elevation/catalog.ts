@@ -118,6 +118,7 @@ const USGS_3DEP_SERVICE =
 const NOAA_LIMITATIONS = Object.freeze([
   'Shoreline is a surveyed or interpreted land-water interface, not a parcel or legal boundary.',
   'The CUSP archive incorporates NOAA and non-NOAA sources; downstream redistribution must retain record-level source credit and rights review.',
+  'The West archive is EPSG:4269 NAD83; coordinates are normalized to EPSG:4326 with the EPSG:1188 null transformation and its stated 4 m accuracy.',
   'Shoreline proximity alone does not establish visibility from a property.',
 ]);
 
@@ -156,7 +157,7 @@ export const NOAA_CUSP_SHORELINE: WaterElevationProduct = Object.freeze({
   catalogUrl: NOAA_CATALOG_URL,
   serviceAsOf: '2026-03-24T17:25:55.000Z',
   encoding: 'zip',
-  horizontalCrs: 'EPSG:4326 (WGS 84 archive .prj)',
+  horizontalCrs: 'Source EPSG:4269 (NAD83); normalized to EPSG:4326 with EPSG:1188 (4 m accuracy)',
   horizontalUnits: 'decimal_degrees',
   verticalCrs: null,
   verticalUnits: null,

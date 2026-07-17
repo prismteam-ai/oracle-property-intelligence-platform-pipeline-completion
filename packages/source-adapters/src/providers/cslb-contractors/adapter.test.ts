@@ -379,6 +379,28 @@ describe('CSLB contractor adapter', () => {
     );
   });
 
+  it('forwards every comma-folded anonymous response cookie to the WebForms POST', async () => {
+    const adapter = createCslbContractorAdapter({
+      runId: RUN_ID,
+      normalizationTimestamp: NOW,
+    });
+    const http = new ScriptedHttp([
+      {
+        status: 200,
+        text: INITIAL_HTML,
+        headers: {
+          'set-cookie': 'anon=one; Path=/; Secure, affinity=two; Path=/; HttpOnly',
+        },
+      },
+      { status: 200, text: SELECTED_HTML },
+    ]);
+
+    await adapter.discover(discoveryContext(http));
+
+    expect(http.requests).toHaveLength(2);
+    expect(http.requests[1]?.headers.cookie).toBe('anon=one; affinity=two');
+  });
+
   it('retries a transient portal response, verifies immutable bytes, checkpoints, and resumes without duplication', async () => {
     const fixture = await safeFixture();
     const csv = csvFromRecords(fixture.records);

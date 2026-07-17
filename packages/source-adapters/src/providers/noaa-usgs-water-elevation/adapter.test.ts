@@ -180,6 +180,52 @@ describe('NOAA/USGS water and elevation adapter lifecycle', () => {
     expect(classifyHttpStatus(404)).toMatchObject({ code: 'RECORD_QUALITY', retryable: false });
   });
 
+  it('terminates a NOAA acquisition on HTTP 403 without retrying or persisting state', async () => {
+    immediateDelay.waits.length = 0;
+    const adapter = createNoaaCuspShorelineAdapter();
+    const signal = new AbortController().signal;
+    const identityHeaders = {
+      etag: '"28897d9-64dc8719a4ec0"',
+      'last-modified': 'Tue, 24 Mar 2026 17:25:55 GMT',
+      'content-length': '42506201',
+      'content-type': 'application/zip',
+    };
+    const discovery = await adapter.discover({
+      clock,
+      signal,
+      http: new QueueTransport([{ status: 200, headers: identityHeaders }]),
+      ratePolicy: adapter.describe().ratePolicy,
+      delay: immediateDelay,
+    });
+    const plan = await adapter.plan(requestFor(adapter.describe().sourceId), discovery, {
+      clock,
+      signal,
+    });
+    const transport = new QueueTransport([{ status: 403 }]);
+    const artifacts = new MemoryArtifactStore();
+    const checkpoints = new MemoryCheckpointStore();
+
+    await expect(
+      (async () => {
+        for await (const artifact of adapter.acquire(plan, undefined, {
+          clock,
+          signal,
+          http: transport,
+          artifactStore: artifacts,
+          checkpointStore: checkpoints,
+          ratePolicy: adapter.describe().ratePolicy,
+          delay: immediateDelay,
+        })) {
+          void artifact;
+        }
+      })(),
+    ).rejects.toMatchObject({ code: 'TERMS_ACCESS', retryable: false, phase: 'acquire' });
+    expect(transport.requests).toHaveLength(1);
+    expect(immediateDelay.waits).toEqual([]);
+    expect(artifacts.writes).toEqual([]);
+    expect(checkpoints.value).toBeUndefined();
+  });
+
   it('discovers both current 3DHP layers, retries 429, checkpoints, and resumes deterministically', async () => {
     immediateDelay.waits.length = 0;
     const adapter = createUsgs3dhpHydrographyAdapter({

@@ -30,7 +30,7 @@ Every accepted record carries these limitations, its authority and product versi
 - Observed ETag: `"28897d9-64dc8719a4ec0"`
 - Observed byte length: `42,506,201`
 - Observed SHA-256: `d07277208ab4399b2e62ed6e86d86bbb5cbc7d92cc0bfa499cf156712693b1d6`
-- Archive CRS: WGS 84 / decimal degrees, verified from `West.prj`
+- Archive CRS: EPSG:4269 NAD83 / decimal degrees, verified from `West.prj`; normalized to EPSG:4326 using EPSG:1188 with its stated 4 m accuracy
 - Accuracy and vintage: per-record `HOR_ACC`, `SRC_DATE`, source, creator, and region fields; no archive-wide accuracy claim
 
 The catalog-resolved archive is used instead of the retired/legacy shoreline landing page. The archive is mutable, so a production run must preserve the response bytes, SHA-256, ETag, Last-Modified value, retrieval time, and record-level survey/source metadata. The archive incorporates NOAA and non-NOAA records. Its descriptor therefore uses redistribution `unknown`; downstream publication must retain record-level source credit and complete any required rights review.

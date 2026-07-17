@@ -106,7 +106,12 @@ function createDbf(properties: Readonly<Record<string, string>>): Buffer {
   return dbf;
 }
 
-async function noaaExcerptArchive(): Promise<Uint8Array> {
+const WGS84_ESRI_WKT =
+  'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["Degree",0.0174532925199433]]';
+const NAD83_ESRI_WKT =
+  'GEOGCS["GCS_North_American_1983",DATUM["D_North_American_1983",SPHEROID["GRS_1980",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["Degree",0.0174532925199433]]';
+
+async function noaaExcerptArchive(projection = WGS84_ESRI_WKT): Promise<Uint8Array> {
   const collection = JSON.parse(
     (await fixture('noaa-cusp-west-record-8.geojson')).toString('utf8'),
   );
@@ -115,9 +120,7 @@ async function noaaExcerptArchive(): Promise<Uint8Array> {
     {
       'West.shp': createShapefile(feature),
       'West.dbf': createDbf(feature.properties),
-      'West.prj': new TextEncoder().encode(
-        'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137,298.257223563]]]',
-      ),
+      'West.prj': new TextEncoder().encode(projection),
     },
     { level: 9 },
   );
@@ -141,6 +144,20 @@ describe('NOAA/USGS water and elevation formats', () => {
         NOAA_Regio: 'West',
       },
     });
+  });
+
+  it('normalizes the frozen archive NAD83 CRS through the EPSG:1188 null operation', async () => {
+    const wgs84 = decodeNoaaShorelineArchive(
+      await noaaExcerptArchive(WGS84_ESRI_WKT),
+      SANTA_CLARA_WATER_TERRAIN_BOUNDS,
+    );
+    const nad83 = decodeNoaaShorelineArchive(
+      await noaaExcerptArchive(NAD83_ESRI_WKT),
+      SANTA_CLARA_WATER_TERRAIN_BOUNDS,
+    );
+
+    expect(nad83).toEqual(wgs84);
+    expect(nad83).toHaveLength(1);
   });
 
   it('rejects malformed ZIP bytes, missing members, and NOAA schema drift', async () => {
@@ -167,6 +184,16 @@ describe('NOAA/USGS water and elevation formats', () => {
     expect(() => decodeNoaaShorelineArchive(mismatched, SANTA_CLARA_WATER_TERRAIN_BOUNDS)).toThrow(
       /SHP\/DBF record count mismatch/u,
     );
+
+    const unsupportedProjection = zipSync({
+      ...mismatchedEntries,
+      'West.prj': new TextEncoder().encode(
+        'GEOGCS["GCS_North_American_1927",DATUM["D_North_American_1927",SPHEROID["Clarke_1866",6378206.4,294.9786982]],PRIMEM["Greenwich",0],UNIT["Degree",0.0174532925199433]]',
+      ),
+    });
+    expect(() =>
+      decodeNoaaShorelineArchive(unsupportedProjection, SANTA_CLARA_WATER_TERRAIN_BOUNDS),
+    ).toThrow(expect.objectContaining({ code: 'SCHEMA_DRIFT', retryable: false, phase: 'decode' }));
   });
 
   it('decodes the pinned current 3DHP GeoJSON and rejects duplicate IDs/schema drift', async () => {

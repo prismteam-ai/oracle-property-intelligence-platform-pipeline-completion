@@ -1,6 +1,7 @@
 import { unzipSync } from 'fflate';
 import { fromArrayBuffer } from 'geotiff';
 
+import { oracleErrorSchema, type OracleError } from '@oracle/contracts/errors';
 import type { JsonValue } from '../../spi/decode.js';
 import {
   geometryIntersectsBounds,
@@ -41,8 +42,14 @@ const REQUIRED_NOAA_FIELDS = Object.freeze([
   'NOAA_Regio',
 ]);
 
-function schemaError(message: string): Error {
-  return new Error(`SCHEMA_DRIFT: ${message}`);
+function schemaError(message: string): Error & OracleError {
+  const parsed = oracleErrorSchema.parse({
+    code: 'SCHEMA_DRIFT',
+    retryable: false,
+    message: `SCHEMA_DRIFT: ${message}`,
+    phase: 'decode',
+  });
+  return Object.assign(new Error(parsed.message), parsed);
 }
 
 function entry(entries: Readonly<Record<string, Uint8Array>>, suffix: string): Uint8Array {
@@ -116,11 +123,94 @@ function readDbfProperties(
   return Object.freeze(properties);
 }
 
-function assertNoaaProjection(prj: Uint8Array): void {
-  const projection = Buffer.from(prj).toString('utf8');
-  if (!/WGS[_ ]1984|WGS[_ ]84/iu.test(projection)) {
-    throw schemaError('NOAA archive projection is not recognized as WGS 84');
+type NoaaSourceEpsg = 4269 | 4326;
+
+function projectionNumber(projection: string, pattern: RegExp, component: string): number {
+  const value = pattern.exec(projection)?.[1];
+  if (value === undefined) {
+    throw schemaError(`NOAA archive projection is missing ${component}`);
   }
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw schemaError(`NOAA archive projection has invalid ${component}`);
+  }
+  return parsed;
+}
+
+function projectionName(projection: string, pattern: RegExp, component: string): string {
+  const value = pattern.exec(projection)?.[1];
+  if (value === undefined) {
+    throw schemaError(`NOAA archive projection is missing ${component}`);
+  }
+  return value.replaceAll(' ', '_').toUpperCase();
+}
+
+function closeTo(actual: number, expected: number, tolerance: number): boolean {
+  return Math.abs(actual - expected) <= tolerance;
+}
+
+function noaaSourceEpsg(prj: Uint8Array): NoaaSourceEpsg {
+  const projection = Buffer.from(prj).toString('utf8');
+  if (!/^\s*GEOGCS\s*\[/iu.test(projection) || /PROJCS\s*\[/iu.test(projection)) {
+    throw schemaError('NOAA archive projection must be a geographic CRS');
+  }
+  const datum = projectionName(projection, /DATUM\s*\[\s*"([^"]+)"/iu, 'datum');
+  const spheroid = projectionName(projection, /SPHEROID\s*\[\s*"([^"]+)"/iu, 'spheroid');
+  const semiMajor = projectionNumber(
+    projection,
+    /SPHEROID\s*\[\s*"[^"]+"\s*,\s*([-+\d.e]+)/iu,
+    'spheroid semi-major axis',
+  );
+  const inverseFlattening = projectionNumber(
+    projection,
+    /SPHEROID\s*\[\s*"[^"]+"\s*,\s*[-+\d.e]+\s*,\s*([-+\d.e]+)/iu,
+    'spheroid inverse flattening',
+  );
+  const primeMeridian = projectionNumber(
+    projection,
+    /PRIMEM\s*\[\s*"GREENWICH"\s*,\s*([-+\d.e]+)/iu,
+    'Greenwich prime meridian',
+  );
+  const angularUnit = projectionNumber(
+    projection,
+    /UNIT\s*\[\s*"DEGREE"\s*,\s*([-+\d.e]+)/iu,
+    'degree angular unit',
+  );
+  if (
+    !closeTo(semiMajor, 6_378_137, 1e-6) ||
+    !closeTo(primeMeridian, 0, 1e-12) ||
+    !closeTo(angularUnit, Math.PI / 180, 1e-15)
+  ) {
+    throw schemaError('NOAA archive projection parameters are not recognized');
+  }
+  if (
+    datum === 'D_WGS_1984' &&
+    spheroid === 'WGS_1984' &&
+    closeTo(inverseFlattening, 298.257223563, 1e-9)
+  ) {
+    return 4326;
+  }
+  if (
+    datum === 'D_NORTH_AMERICAN_1983' &&
+    spheroid === 'GRS_1980' &&
+    closeTo(inverseFlattening, 298.257222101, 1e-9)
+  ) {
+    return 4269;
+  }
+  throw schemaError('NOAA archive projection is not recognized as WGS 84 or NAD83');
+}
+
+function noaaCoordinateToWgs84(
+  longitude: number,
+  latitude: number,
+  sourceEpsg: NoaaSourceEpsg,
+): readonly [number, number] {
+  if (sourceEpsg === 4269) {
+    // EPSG:1188 is the applicable NAD83-to-WGS84 null geocentric translation for
+    // North America. Its stated 4 m accuracy is preserved in the source catalog.
+    return Object.freeze([longitude, latitude]);
+  }
+  return Object.freeze([longitude, latitude]);
 }
 
 export function decodeNoaaShorelineArchive(
@@ -135,7 +225,7 @@ export function decodeNoaaShorelineArchive(
   }
   const shp = Buffer.from(entry(entries, '.shp'));
   const dbf = Buffer.from(entry(entries, '.dbf'));
-  assertNoaaProjection(entry(entries, '.prj'));
+  const sourceEpsg = noaaSourceEpsg(entry(entries, '.prj'));
 
   if (shp.byteLength < 100 || shp.readInt32BE(0) !== 9994) {
     throw schemaError('NOAA shapefile header is malformed');
@@ -196,10 +286,11 @@ export function decodeNoaaShorelineArchive(
           const coordinates: JsonValue[] = [];
           for (let pointIndex = partStart; pointIndex < partEnd; pointIndex += 1) {
             coordinates.push(
-              Object.freeze([
+              noaaCoordinateToWgs84(
                 shp.readDoubleLE(pointsOffset + pointIndex * 16),
                 shp.readDoubleLE(pointsOffset + pointIndex * 16 + 8),
-              ]),
+                sourceEpsg,
+              ),
             );
           }
           const geometry = parseSupportedGeometry(

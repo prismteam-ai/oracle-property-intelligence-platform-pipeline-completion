@@ -21,12 +21,24 @@ function normalizeEntryPath(path: string): string {
 
 export function parseGtfsCsv(bytes: Uint8Array, memberName: string): readonly GtfsRow[] {
   const text = decoder.decode(bytes).replace(/^\uFEFF/u, '');
-  const records: Record<string, unknown>[] = parse(text, {
+  const records = parse<
+    Record<string, unknown>,
+    Readonly<{ raw: string; record: Record<string, unknown> }>
+  >(text, {
     bom: true,
     columns: true,
-    relax_column_count: false,
+    raw: true,
+    relax_column_count: true,
     skip_empty_lines: true,
     trim: false,
+    on_record(parsed, context) {
+      const parseError = context.error as Error | undefined;
+      if (parseError === undefined) return parsed.record;
+      if (/^\s*$/u.test(parsed.raw)) {
+        return null;
+      }
+      throw parseError;
+    },
   });
 
   return Object.freeze(

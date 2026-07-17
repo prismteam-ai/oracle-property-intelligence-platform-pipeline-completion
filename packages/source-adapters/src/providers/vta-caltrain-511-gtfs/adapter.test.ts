@@ -424,6 +424,42 @@ describe('VTA/Caltrain direct GTFS adapter', () => {
     ).toThrow();
   });
 
+  it('ignores whitespace-only physical GTFS rows but rejects nonblank column drift', () => {
+    const { config } = fixture('caltrain');
+    const base = officialExcerpts.caltrain.members;
+    const baseTrips = base['trips.txt'];
+    if (baseTrips === undefined) throw new Error('Expected trips.txt in Caltrain fixture');
+
+    const whitespaceMembers = {
+      ...base,
+      'trips.txt': `${baseTrips.trimEnd()}\n   \t\n`,
+    };
+    const whitespaceBytes = frozenZip(whitespaceMembers);
+    const decoded = decodeGtfsZip(
+      artifactFor(whitespaceBytes, {
+        ...config,
+        expectedZipSha256: sha256Hex(whitespaceBytes),
+        expectedZipBytes: whitespaceBytes.byteLength,
+      }),
+    );
+    expect(decoded.members['trips.txt']).toHaveLength(baseTrips.trimEnd().split('\n').length - 1);
+
+    const driftMembers = {
+      ...base,
+      'trips.txt': `${baseTrips.trimEnd()}\nnonblank-column-drift\n`,
+    };
+    const driftBytes = frozenZip(driftMembers);
+    expect(() =>
+      decodeGtfsZip(
+        artifactFor(driftBytes, {
+          ...config,
+          expectedZipSha256: sha256Hex(driftBytes),
+          expectedZipBytes: driftBytes.byteLength,
+        }),
+      ),
+    ).toThrow(/Invalid Record Length|column/u);
+  });
+
   it('emits strict canonical mutations with lineage and source visibility', async () => {
     const { config, artifact, record } = await validatedFixture('vta');
     const adapter = createStaticGtfsAdapter(config);
