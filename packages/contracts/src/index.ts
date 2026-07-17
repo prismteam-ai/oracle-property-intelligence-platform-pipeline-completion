@@ -1,60 +1,242 @@
-import { z } from 'zod';
+export {
+  FOUNDATION_STATUS,
+  apiErrorSchema,
+  foundationCapabilitiesSchema,
+  foundationStatusSchema,
+  healthResponseSchema,
+  isoDateTimeSchema,
+  jsonValueSchema,
+  mcpFoundationErrorSchema,
+  nonEmptyStringSchema,
+  operationRequestSchema,
+  semverSchema,
+  sha256Schema,
+} from './foundation.js';
+export type {
+  ApiError,
+  FoundationStatus,
+  HealthResponse,
+  JsonValue,
+  McpFoundationError,
+  OperationRequest,
+} from './foundation.js';
 
-export const foundationCapabilitiesSchema = z.object({
-  propertyPipeline: z.literal('not_implemented'),
-  queryExperience: z.literal('not_implemented'),
-  mcpProtocol: z.literal('not_implemented'),
-});
+export {
+  artifactIdSchema,
+  canonicalEntityKindSchema,
+  conflictIdSchema,
+  entityIdSchema,
+  entityIdSchemaFor,
+  evidenceIdSchema,
+  licenseSnapshotIdSchema,
+  linkIdSchema,
+  manifestIdSchema,
+  mutationIdSchema,
+  observationIdSchema,
+  runIdSchema,
+  schemaFingerprintValueSchema,
+  snapshotBelongsToSource,
+  snapshotIdSchema,
+  sourceIdSchema,
+} from './ids.js';
+export type {
+  ArtifactId,
+  CanonicalEntityKind,
+  ConflictId,
+  EntityId,
+  EvidenceId,
+  LicenseSnapshotId,
+  LinkId,
+  ManifestId,
+  MutationId,
+  ObservationId,
+  RunId,
+  SchemaFingerprintValue,
+  SnapshotId,
+  SourceId,
+} from './ids.js';
 
-export const foundationStatusSchema = z.object({
-  operation: z.literal('foundation.status'),
-  service: z.literal('oracle-property-intelligence-platform'),
-  state: z.literal('foundation_only'),
-  capabilities: foundationCapabilitiesSchema,
-});
+export { publicVisibilitySchema, visibilityCountsSchema, visibilitySchema } from './visibility.js';
+export type { PublicVisibility, Visibility, VisibilityCounts } from './visibility.js';
 
-export type FoundationStatus = z.infer<typeof foundationStatusSchema>;
+export { isRetryableOracleError, oracleErrorCodeSchema, oracleErrorSchema } from './errors.js';
+export type { OracleError, OracleErrorCode } from './errors.js';
 
-export const FOUNDATION_STATUS: FoundationStatus = Object.freeze({
-  operation: 'foundation.status',
-  service: 'oracle-property-intelligence-platform',
-  state: 'foundation_only',
-  capabilities: Object.freeze({
-    propertyPipeline: 'not_implemented',
-    queryExperience: 'not_implemented',
-    mcpProtocol: 'not_implemented',
-  }),
-});
+export {
+  acquiredArtifactSchema,
+  acquisitionPlanItemSchema,
+  acquisitionPlanSchema,
+  acquisitionRequestSchema,
+  artifactRequestHeaderSchema,
+  artifactRequestMetadataSchema,
+  artifactResponseMetadataSchema,
+  licenseSnapshotSchema,
+  ratePolicySchema,
+  rawArtifactUriSchema,
+  schemaFingerprintSchema,
+  sourceAsOfSchema,
+  sourceAuthoritySchema,
+  sourceCheckpointSchema,
+  sourceDescriptorSchema,
+  sourceEncodingSchema,
+  sourceRunSummarySchema,
+  validationIssueSchema,
+  validationReportSchema,
+} from './source.js';
+export type {
+  AcquiredArtifact,
+  AcquisitionPlan,
+  AcquisitionPlanItem,
+  AcquisitionRequest,
+  ArtifactRequestHeader,
+  ArtifactRequestMetadata,
+  ArtifactResponseMetadata,
+  LicenseSnapshot,
+  RatePolicy,
+  SchemaFingerprint,
+  SourceAsOf,
+  SourceAuthority,
+  SourceCheckpoint,
+  SourceDescriptor,
+  SourceEncoding,
+  SourceRunSummary,
+  ValidationIssue,
+  ValidationReport,
+} from './source.js';
 
-export const healthResponseSchema = z.object({
-  service: z.enum(['api', 'mcp']),
-  status: z.literal('ok'),
-  foundationOnly: z.literal(true),
-});
+export {
+  coverageMetricSchema,
+  datasetCoverageSchema,
+  pipelineRunSchema,
+  pipelineStageRunSchema,
+  pipelineStageSchema,
+  supportStateSchema,
+} from './pipeline.js';
+export type {
+  CoverageMetric,
+  DatasetCoverage,
+  PipelineRun,
+  PipelineStage,
+  PipelineStageRun,
+  SupportState,
+} from './pipeline.js';
 
-export type HealthResponse = z.infer<typeof healthResponseSchema>;
+export {
+  algorithmReferenceSchema,
+  evidenceSourceReferenceSchema,
+  featureEvidenceSchema,
+  featureKindSchema,
+} from './evidence.js';
+export type {
+  AlgorithmReference,
+  EvidenceSourceReference,
+  FeatureEvidence,
+  FeatureKind,
+} from './evidence.js';
 
-export const apiErrorSchema = z.object({
-  error: z.object({
-    code: z.enum(['UNKNOWN_OPERATION', 'INVALID_REQUEST']),
-    message: z.string(),
-    operation: z.string().optional(),
-  }),
-});
+export {
+  deterministicSortSchema,
+  namedQueryDefinitionSchema,
+  namedQueryNameSchema,
+  namedQueryPageSchema,
+  namedQueryRequestSchema,
+  namedQueryResultSchema,
+} from './query.js';
+export type {
+  DeterministicSort,
+  NamedQueryDefinition,
+  NamedQueryName,
+  NamedQueryPage,
+  NamedQueryRequest,
+  NamedQueryResult,
+} from './query.js';
 
-export type ApiError = z.infer<typeof apiErrorSchema>;
+export {
+  artifactManifestEntrySchema,
+  artifactManifestSchema,
+  publicationEligibilitySchema,
+} from './manifest.js';
+export type {
+  ArtifactManifest,
+  ArtifactManifestEntry,
+  PublicationEligibility,
+} from './manifest.js';
 
-export const operationRequestSchema = z.object({
-  operation: z.string().min(1),
-});
-
-export type OperationRequest = z.infer<typeof operationRequestSchema>;
-
-export const mcpFoundationErrorSchema = z.object({
-  error: z.object({
-    code: z.literal('MCP_FOUNDATION_ONLY'),
-    message: z.string(),
-  }),
-});
-
-export type McpFoundationError = z.infer<typeof mcpFoundationErrorSchema>;
+export {
+  addressSchema,
+  businessSchema,
+  canonicalArtifactReferenceSchema,
+  canonicalEntityMetadataSchema,
+  canonicalEntitySchema,
+  canonicalMutationSchema,
+  conflictResolutionSchema,
+  contractorSchema,
+  coordinateSchema,
+  elevationRasterRefSchema,
+  entityLinkCandidateSchema,
+  fieldConflictSchema,
+  fieldLineageSchema,
+  fieldObservationSchema,
+  geoBoundingBoxSchema,
+  geoGeometrySchema,
+  geoLineStringSchema,
+  geoMultiPolygonSchema,
+  geoPointSchema,
+  geoPolygonSchema,
+  hydroFeatureSchema,
+  latitudeSchema,
+  linearRingSchema,
+  longitudeSchema,
+  ownershipEventSchema,
+  ownershipInterestSchema,
+  partyIdentifierSchema,
+  partySchema,
+  pedestrianGraphRefSchema,
+  permitPropertyLinkSchema,
+  permitSchema,
+  placeSchema,
+  propertySchema,
+  propertyUnitSchema,
+  sourceRecordReferenceSchema,
+  transformationStepSchema,
+  transitServiceSchema,
+  transitStopSchema,
+} from './canonical/index.js';
+export type {
+  Address,
+  Business,
+  CanonicalArtifactReference,
+  CanonicalEntity,
+  CanonicalEntityMetadata,
+  CanonicalMutation,
+  ConflictResolution,
+  Coordinate,
+  Contractor,
+  ElevationRasterRef,
+  EntityLinkCandidate,
+  FieldConflict,
+  FieldLineage,
+  FieldObservation,
+  GeoBoundingBox,
+  GeoGeometry,
+  GeoLineString,
+  GeoMultiPolygon,
+  GeoPoint,
+  GeoPolygon,
+  HydroFeature,
+  LinearRing,
+  OwnershipEvent,
+  OwnershipInterest,
+  Party,
+  PartyIdentifier,
+  PedestrianGraphRef,
+  Permit,
+  PermitPropertyLink,
+  Place,
+  Property,
+  PropertyUnit,
+  SourceRecordReference,
+  TransformationStep,
+  TransitService,
+  TransitStop,
+} from './canonical/index.js';

@@ -71,7 +71,7 @@ cdk.out/
 .serverless/
 
 # Generated pipeline and portable-data artifacts
-artifacts/
+/artifacts/
 generated/
 output/
 tmp/

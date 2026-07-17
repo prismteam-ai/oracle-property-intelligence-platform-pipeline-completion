@@ -1,13 +1,9 @@
 {
-  "name": "@oracle/contracts",
+  "name": "@oracle/artifacts",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    },
     "./*": {
       "types": "./dist/*.d.ts",
       "default": "./dist/*.js"
@@ -20,7 +16,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "zod": "4.4.3"
+    "@aws-sdk/client-s3": "3.1089.0",
+    "@aws-sdk/lib-storage": "3.1089.0",
+    "@oracle/contracts": "workspace:*"
   },
   "devDependencies": {
     "@oracle/tsconfig": "workspace:*",

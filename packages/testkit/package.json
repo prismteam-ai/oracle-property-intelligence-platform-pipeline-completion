@@ -1,16 +1,16 @@
 {
-  "name": "@oracle/contracts",
+  "name": "@oracle/testkit",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
+    "./shared/*": {
+      "types": "./dist/shared/*.d.ts",
+      "default": "./dist/shared/*.js"
     },
-    "./*": {
-      "types": "./dist/*.d.ts",
-      "default": "./dist/*.js"
+    "./sources/*": {
+      "types": "./dist/sources/*.d.ts",
+      "default": "./dist/sources/*.js"
     }
   },
   "scripts": {
@@ -20,7 +20,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "zod": "4.4.3"
+    "@oracle/contracts": "workspace:*",
+    "fast-check": "4.9.0"
   },
   "devDependencies": {
     "@oracle/tsconfig": "workspace:*",

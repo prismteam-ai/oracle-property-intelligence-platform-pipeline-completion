@@ -1,13 +1,9 @@
 {
-  "name": "@oracle/contracts",
+  "name": "@oracle/data-runtime",
   "version": "0.0.0",
   "private": true,
   "type": "module",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    },
     "./*": {
       "types": "./dist/*.d.ts",
       "default": "./dist/*.js"
@@ -20,7 +16,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "zod": "4.4.3"
+    "@duckdb/node-api": "1.4.5-r.1",
+    "@oracle/contracts": "workspace:*"
   },
   "devDependencies": {
     "@oracle/tsconfig": "workspace:*",

@@ -14,7 +14,15 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@oracle/contracts": "workspace:*"
+    "@oracle/artifacts": "workspace:*",
+    "@oracle/canonical-model": "workspace:*",
+    "@oracle/contracts": "workspace:*",
+    "@oracle/data-runtime": "workspace:*",
+    "@oracle/features": "workspace:*",
+    "@oracle/query-core": "workspace:*",
+    "@oracle/reconciliation": "workspace:*",
+    "@oracle/source-adapters": "workspace:*",
+    "@oracle/testkit": "workspace:*"
   },
   "devDependencies": {
     "@oracle/tsconfig": "workspace:*",
