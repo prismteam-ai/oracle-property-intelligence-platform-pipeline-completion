@@ -1,0 +1,53 @@
+{
+  "id": 0,
+  "name": "Assessor's Parcel",
+  "type": "Feature Layer",
+  "displayField": "OBJECTID",
+  "objectIdField": "OBJECTID",
+  "geometryType": "esriGeometryPolygon",
+  "extent": {
+    "xmin": 6066811.730318725,
+    "ymin": 1931968.662792924,
+    "xmax": 6106104.076622115,
+    "ymax": 2000585.7288684745,
+    "spatialReference": { "wkid": 102643, "latestWkid": 2227 }
+  },
+  "spatialReference": { "wkid": 102643, "latestWkid": 2227 },
+  "fields": [
+    { "name": "OBJECTID", "type": "esriFieldTypeOID", "alias": "OBJECTID", "nullable": false },
+    {
+      "name": "GID",
+      "type": "esriFieldTypeInteger",
+      "alias": "Identifier System",
+      "nullable": false
+    },
+    { "name": "APN", "type": "esriFieldTypeString", "alias": "APN", "nullable": true },
+    {
+      "name": "ZONEGIS",
+      "type": "esriFieldTypeString",
+      "alias": "Zoning District",
+      "nullable": true
+    },
+    { "name": "FLOODZONE", "type": "esriFieldTypeString", "alias": "Flood Zone", "nullable": true },
+    {
+      "name": "YEARBUILT",
+      "type": "esriFieldTypeSmallInteger",
+      "alias": "Year Built SCCA",
+      "nullable": true
+    },
+    {
+      "name": "EFFECTIVEYEARBUILT",
+      "type": "esriFieldTypeSmallInteger",
+      "alias": "Effective Year Built SCCA",
+      "nullable": true
+    },
+    {
+      "name": "NEARCREEKFEATURE",
+      "type": "esriFieldTypeString",
+      "alias": "Near Creek Feature",
+      "nullable": true
+    },
+    { "name": "X", "type": "esriFieldTypeDouble", "alias": "Label X", "nullable": true },
+    { "name": "Y", "type": "esriFieldTypeDouble", "alias": "Label Y", "nullable": true }
+  ]
+}
