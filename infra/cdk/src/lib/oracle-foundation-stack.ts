@@ -53,8 +53,10 @@ export class OracleFoundationStack extends cdk.Stack {
     cdk.Tags.of(this).add('repository', REPOSITORY);
 
     this.validateBedrockPromotion(props.bedrockPromotion);
+    const hasReleaseSelection =
+      props.publicReleaseDirectory !== undefined || props.servingConfigRelativePath !== undefined;
     const verifiedRelease =
-      props.testOnlyFunctionCodeOverride === undefined
+      props.testOnlyFunctionCodeOverride === undefined || hasReleaseSelection
         ? validatePublicReleaseBundle({
             repositoryRoot: REPOSITORY_ROOT,
             releaseDirectory: props.publicReleaseDirectory,
@@ -158,6 +160,18 @@ export class OracleFoundationStack extends cdk.Stack {
       prune: false,
       retainOnDelete: true,
     });
+
+    if (verifiedRelease !== undefined) {
+      new s3deploy.BucketDeployment(this, 'PublicReleaseDeployment', {
+        sources: [s3deploy.Source.asset(verifiedRelease.directory)],
+        destinationBucket: releaseBucket,
+        distribution: artifactDistribution,
+        distributionPaths: ['/*'],
+        waitForDistributionInvalidation: true,
+        prune: false,
+        retainOnDelete: true,
+      });
+    }
 
     const cursorSecret = new secretsmanager.Secret(this, 'CursorSecret', {
       description: 'Stable HMAC secret for release- and operation-bound Oracle cursors.',

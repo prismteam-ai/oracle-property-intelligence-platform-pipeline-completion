@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { runInNewContext } from 'node:vm';
@@ -7,6 +7,7 @@ import { runInNewContext } from 'node:vm';
 import * as cdk from 'aws-cdk-lib';
 import { Match, Template } from 'aws-cdk-lib/assertions';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
+import type * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import { describe, expect, it } from 'vitest';
 
 import { OracleFoundationStack, type BedrockPromotion } from './oracle-foundation-stack.js';
@@ -123,6 +124,17 @@ const testReleaseGenerator = resolve(
   repositoryRoot,
   'infra/cdk/test-fixtures/create-public-release.mts',
 );
+const expectedPublicReleaseFiles = [
+  'public/data-dictionary.parquet',
+  'public/field-coverage.parquet',
+  'public/pipeline-runs.parquet',
+  'public/property-evidence.parquet',
+  'public/property-query.parquet',
+  'public/relation-coverage.parquet',
+  'public/source-coverage.parquet',
+  'release-manifest.json',
+  'serving-config.json',
+] as const;
 
 describe('Oracle product infrastructure', () => {
   it('uses three private, encrypted, versioned, object-locked buckets', () => {
@@ -198,6 +210,67 @@ describe('Oracle product infrastructure', () => {
     const deployments = foundationTemplate.findResources('Custom::CDKBucketDeployment');
     expect(JSON.stringify(deployments)).toContain('Prune');
     expect(JSON.stringify(deployments)).toContain('false');
+  });
+
+  it('promotes only the validator-returned nine-file release root with retained explicit invalidation', async () => {
+    const outputDirectory = await mkdtemp(join(tmpdir(), 'oracle-release-assets-'));
+
+    try {
+      execFileSync(process.execPath, [
+        '--experimental-strip-types',
+        testReleaseGenerator,
+        'create',
+      ]);
+      const releaseApp = new cdk.App({ outdir: outputDirectory });
+      const releaseStack = new OracleFoundationStack(releaseApp, 'ReleasePromotionStack', {
+        env: { account: '417242953053', region: 'us-east-2' },
+        publicReleaseDirectory: testReleaseDirectory,
+        servingConfigRelativePath: 'serving-config.json',
+        testOnlyAllowFixtureRelease: true,
+        testOnlyFunctionCodeOverride: templateTestCode,
+      });
+      const releaseTemplate = Template.fromStack(releaseStack);
+      const releaseDeployment = releaseStack.node.findChild('PublicReleaseDeployment');
+      const releaseAsset = releaseDeployment.node.findChild('Asset1') as s3assets.Asset;
+      const releaseAssetStage = releaseAsset.node.findChild('Stage') as cdk.AssetStaging;
+
+      expect(await realpath(releaseAssetStage.sourcePath)).toBe(
+        await realpath(testReleaseDirectory),
+      );
+      expect([...(await recursiveFiles(releaseAssetStage.sourcePath))].sort()).toEqual(
+        expectedPublicReleaseFiles,
+      );
+
+      const deployments = releaseTemplate.findResources('Custom::CDKBucketDeployment');
+      expect(Object.keys(deployments)).toHaveLength(2);
+      const releaseDeploymentEntry = Object.entries(deployments).find(([logicalId]) =>
+        logicalId.startsWith('PublicReleaseDeployment'),
+      );
+      expect(releaseDeploymentEntry).toBeDefined();
+      const releaseDeploymentProperties = releaseDeploymentEntry?.[1].Properties as
+        Record<string, unknown> | undefined;
+      expect(releaseDeploymentProperties).toMatchObject({
+        DestinationBucketName: { Ref: expect.stringContaining('PublicReleaseBucket') },
+        DistributionId: { Ref: expect.stringContaining('ArtifactDistribution') },
+        DistributionPaths: ['/*'],
+        Prune: false,
+        RetainOnDelete: true,
+        WaitForDistributionInvalidation: true,
+      });
+      expect(releaseDeploymentProperties).not.toHaveProperty('DestinationBucketKeyPrefix');
+      expect(JSON.stringify(releaseDeploymentProperties)).not.toContain('WebBucket');
+      expect(JSON.stringify(releaseDeploymentProperties)).not.toContain('RestrictedArtifactBucket');
+      expect(JSON.stringify(releaseTemplate.findResources('AWS::IAM::Policy'))).not.toContain(
+        's3:PutObjectAcl',
+      );
+    } finally {
+      await rm(outputDirectory, { recursive: true, force: true });
+      execFileSync(process.execPath, [
+        '--experimental-strip-types',
+        testReleaseGenerator,
+        'remove',
+      ]);
+    }
   });
 
   it('exposes only the committed API and MCP routes with allowlisted CORS and throttling', () => {
@@ -420,6 +493,29 @@ describe('Oracle product infrastructure', () => {
           env: { account: '417242953053', region: 'us-east-2' },
         }),
     ).toThrow('caller-selected Oracle public release directory is required');
+  });
+
+  it('rejects an invalid selected release before creating any asset', async () => {
+    const outputDirectory = await mkdtemp(join(tmpdir(), 'oracle-invalid-release-'));
+    const invalidApp = new cdk.App({ outdir: outputDirectory });
+
+    try {
+      expect(
+        () =>
+          new OracleFoundationStack(invalidApp, 'InvalidReleaseStack', {
+            env: { account: '417242953053', region: 'us-east-2' },
+            publicReleaseDirectory: 'infra/cdk/test-fixtures/does-not-exist',
+            servingConfigRelativePath: 'serving-config.json',
+            testOnlyFunctionCodeOverride: templateTestCode,
+          }),
+      ).toThrow('public release directory does not exist');
+      expect(
+        invalidApp.node.findAll().filter((construct) => construct instanceof cdk.AssetStaging),
+      ).toEqual([]);
+      expect(await readdir(outputDirectory)).toEqual([]);
+    } finally {
+      await rm(outputDirectory, { recursive: true, force: true });
+    }
   });
 
   const bundleImportTest = process.env.ORACLE_RUN_LAMBDA_BUNDLE_IMPORT === '1' ? it : it.skip;
