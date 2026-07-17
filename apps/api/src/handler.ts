@@ -1,5 +1,3 @@
-import { randomBytes } from 'node:crypto';
-
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2, Context } from 'aws-lambda';
 
 import { createObservability } from '@oracle/observability';
@@ -12,6 +10,12 @@ import {
   type ApplicationOperation,
 } from './contract.js';
 import { ApiFailure, publicMessage, statusFor } from './errors.js';
+import {
+  loadProductionRuntimeServices,
+  productionConfigurationState,
+  unconfiguredProductionServices,
+  type ProductionCompositionDependencies,
+} from './production.js';
 import { executeOperation } from './router.js';
 import type { ApiErrorCode, ApiErrorEnvelope, RuntimeServices } from './runtime.js';
 
@@ -152,24 +156,33 @@ export function createApiHandler(services: RuntimeServices) {
   };
 }
 
-const unavailableServices: RuntimeServices = {
-  deployment: 'production',
-  readiness: 'unconfigured',
-  allowedOrigins: Object.freeze(
-    (process.env.ORACLE_ALLOWED_ORIGINS ?? '')
-      .split(',')
-      .map((value) => value.trim())
-      .filter((value) => value.length > 0),
-  ),
-  cursorSecret: randomBytes(32),
-  agent: null,
-  query: {
-    kind: 'verified-immutable-release',
-    execute: async () => await Promise.reject(new ApiFailure('SERVICE_UNAVAILABLE')),
-  },
-};
+export function createProductionApiHandler(
+  environment: Readonly<Record<string, string | undefined>>,
+  dependencies: ProductionCompositionDependencies = {},
+) {
+  let servicesPromise: Promise<RuntimeServices> | undefined;
+  const services = async (): Promise<RuntimeServices> => {
+    const configurationState = productionConfigurationState(environment);
+    servicesPromise ??=
+      configurationState === 'absent'
+        ? Promise.resolve(unconfiguredProductionServices(environment))
+        : configurationState === 'partial'
+          ? Promise.resolve(unconfiguredProductionServices(environment, 'configuration_error'))
+          : loadProductionRuntimeServices(environment, dependencies).catch(() =>
+              unconfiguredProductionServices(environment, 'configuration_error'),
+            );
+    return await servicesPromise;
+  };
+  return async (
+    event: APIGatewayProxyEventV2,
+    context: Context,
+  ): Promise<APIGatewayProxyResultV2> => {
+    const configured = await services();
+    return await createApiHandler(configured)(event, context);
+  };
+}
 
-// The default Lambda remains fail-closed until the recovered query executor is
-// composed by infrastructure. Tests and local demos must call createApiHandler
-// with a visibly labelled test-only fixture instead of mutating this export.
-export const handler = createApiHandler(unavailableServices);
+// Production composition is attempted once per warm Lambda. Missing or invalid
+// server-owned release configuration remains query-free and fails closed; no
+// environment switch can select a fixture or deterministic test service.
+export const handler = createProductionApiHandler(process.env);

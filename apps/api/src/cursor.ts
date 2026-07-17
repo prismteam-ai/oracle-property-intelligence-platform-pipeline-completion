@@ -1,11 +1,11 @@
 import { createHmac, timingSafeEqual } from 'node:crypto';
 
-import { API_LIMITS, type ApplicationOperation } from './contract.js';
+import { API_LIMITS } from './contract.js';
 import { ApiFailure } from './errors.js';
 
 type CursorPayload = Readonly<{
   version: 1;
-  operation: ApplicationOperation;
+  operation: string;
   releaseId: string;
   continuation: readonly (number | string)[];
 }>;
@@ -32,7 +32,7 @@ export class ApiCursorCodec {
 
   public decode(
     cursor: string,
-    operation: ApplicationOperation,
+    operation: string,
     releaseId: string,
   ): readonly (number | string)[] {
     if (Buffer.byteLength(cursor, 'utf8') > API_LIMITS.cursorBytes)

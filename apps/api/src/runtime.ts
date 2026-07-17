@@ -22,7 +22,7 @@ export type QueryRequest = Readonly<{
   operation: NamedQueryName;
   releaseId: string | null;
   parameters: Readonly<Record<string, unknown>>;
-  continuation: readonly (number | string)[] | null;
+  cursor: string | null;
   budget: QueryBudget;
   signal: AbortSignal;
 }>;
@@ -37,7 +37,7 @@ export type QueryResult = Readonly<{
   coverage: unknown;
   limitations: readonly string[];
   data: unknown;
-  nextContinuation: readonly (number | string)[] | null;
+  nextCursor: string | null;
   truncated: boolean;
   timing: RuntimeTiming;
 }>;
@@ -85,7 +85,7 @@ export type RuntimeServices = Readonly<{
   cursorSecret: Uint8Array;
   allowedOrigins: readonly string[];
   deployment: 'production' | 'test';
-  readiness: 'ready' | 'unconfigured' | 'test_fixture';
+  readiness: 'ready' | 'unconfigured' | 'configuration_error' | 'test_fixture';
   fixtureLabel?: 'TEST_ONLY_DETERMINISTIC_FIXTURE';
 }>;
 

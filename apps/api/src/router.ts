@@ -6,7 +6,6 @@ import {
   type ParsedRequest,
   type QueryApplicationOperation,
 } from './contract.js';
-import { ApiCursorCodec } from './cursor.js';
 import { ApiFailure } from './errors.js';
 import type { ApiSuccessEnvelope, RuntimeServices } from './runtime.js';
 
@@ -47,19 +46,13 @@ export async function executeOperation(
   operation: ApplicationOperation,
   request: ParsedRequest,
 ): Promise<ApiSuccessEnvelope> {
-  const codec = new ApiCursorCodec(services.cursorSecret);
-  const continuation =
-    request.cursor === null
-      ? null
-      : codec.decode(request.cursor, operation, request.releaseId ?? 'discovery');
-
   if (isQueryOperation(operation)) {
     const result = await bounded(API_LIMITS.queryTimeoutMs, (signal) =>
       services.query.execute({
         operation: queryOperationByApplicationOperation[operation],
         releaseId: request.releaseId,
         parameters: request.parameters,
-        continuation,
+        cursor: request.cursor,
         budget: {
           timeoutMs: API_LIMITS.queryTimeoutMs,
           maximumScanBytes: API_LIMITS.maximumScanBytes,
@@ -76,14 +69,11 @@ export async function executeOperation(
           result.timing.bytesScanned > API_LIMITS.maximumScanBytes))
     )
       throw new ApiFailure('QUERY_BUDGET_EXCEEDED');
-    const nextCursor =
-      result.nextContinuation === null
-        ? null
-        : codec.encode({
-            operation,
-            releaseId: result.release.releaseId,
-            continuation: result.nextContinuation,
-          });
+    if (
+      result.nextCursor !== null &&
+      Buffer.byteLength(result.nextCursor, 'utf8') > API_LIMITS.cursorBytes
+    )
+      throw new ApiFailure('DATA_CORRUPTION');
     return Object.freeze({
       schemaVersion: API_SCHEMA_VERSION,
       releaseId: result.release.releaseId,
@@ -93,7 +83,7 @@ export async function executeOperation(
       coverage: result.coverage,
       limitations: Object.freeze([...result.limitations]),
       data: result.data,
-      nextCursor,
+      nextCursor: result.nextCursor,
       truncated: result.truncated,
       timing: result.timing,
     });

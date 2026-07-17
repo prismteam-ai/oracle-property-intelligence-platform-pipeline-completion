@@ -7,6 +7,7 @@ import {
   queryOperationByApplicationOperation,
   type ApplicationOperation,
 } from './contract.js';
+import { ApiCursorCodec } from './cursor.js';
 import { createApiHandler, handler as productionHandler } from './handler.js';
 import type {
   AgentResult,
@@ -36,16 +37,22 @@ type FixtureOptions = Readonly<{
 
 function fixtureServices(options: FixtureOptions = {}): RuntimeServices {
   const fixtureRelease = options.release ?? release;
+  const cursorSecret = new Uint8Array(32).fill(7);
+  const cursor = new ApiCursorCodec(cursorSecret);
   return {
     deployment: 'test',
     readiness: 'test_fixture',
     fixtureLabel: 'TEST_ONLY_DETERMINISTIC_FIXTURE',
     allowedOrigins: ['https://oracle.test'],
-    cursorSecret: new Uint8Array(32).fill(7),
+    cursorSecret,
     query: {
       kind: 'verified-immutable-release',
-      execute: async (request: QueryRequest): Promise<QueryResult> =>
-        await Promise.resolve({
+      execute: async (request: QueryRequest): Promise<QueryResult> => {
+        const continuation =
+          request.cursor === null
+            ? null
+            : cursor.decode(request.cursor, request.operation, request.releaseId ?? 'discovery');
+        return await Promise.resolve({
           release: fixtureRelease,
           coverage: { county: 'Santa Clara', fixture: true },
           limitations: ['TEST ONLY — deterministic fixture; never production county evidence.'],
@@ -53,17 +60,20 @@ function fixtureServices(options: FixtureOptions = {}): RuntimeServices {
             operation: request.operation,
             parameters: request.parameters,
             rows:
-              request.continuation === null
-                ? [{ propertyId: 'sc:test:1' }]
-                : [{ propertyId: 'sc:test:2' }],
+              continuation === null ? [{ propertyId: 'sc:test:1' }] : [{ propertyId: 'sc:test:2' }],
           },
-          nextContinuation:
-            request.continuation === null && request.operation === 'search_properties'
-              ? ['sc:test:1']
+          nextCursor:
+            continuation === null && request.operation === 'search_properties'
+              ? cursor.encode({
+                  operation: request.operation,
+                  releaseId: fixtureRelease.releaseId,
+                  continuation: ['sc:test:1'],
+                })
               : null,
-          truncated: request.operation === 'search_properties' && request.continuation === null,
+          truncated: request.operation === 'search_properties' && continuation === null,
           timing: { elapsedMs: 2, bytesScanned: options.bytesScanned ?? 256 },
-        }),
+        });
+      },
     },
     agent:
       options.agent === 'unavailable'

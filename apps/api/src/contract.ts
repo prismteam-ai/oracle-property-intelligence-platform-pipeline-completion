@@ -250,9 +250,11 @@ export function parseApplicationRequest(
       exact(value, []);
       return parsed(value, {}, false);
     case 'dataset.getCoverage':
-    case 'artifacts.getDataDictionary':
     case 'agent.status':
       exact(value, releaseKeys);
+      return parsed(value, {});
+    case 'artifacts.getDataDictionary':
+      exact(value, [...releaseKeys, ...pageKeys]);
       return parsed(value, {});
     case 'pipeline.listRuns':
     case 'artifacts.list': {
@@ -295,7 +297,7 @@ export function parseApplicationRequest(
       exact(value, [...releaseKeys, 'propertyId']);
       return parsed(value, { propertyId: requiredString(value, 'propertyId', 256) });
     case 'property.getEvidence':
-      exact(value, [...releaseKeys, 'propertyId', 'feature']);
+      exact(value, [...releaseKeys, ...pageKeys, 'propertyId', 'feature']);
       return parsed(value, {
         propertyId: requiredString(value, 'propertyId', 256),
         ...(optionalEnum(value, 'feature', [
@@ -329,7 +331,7 @@ export function parseApplicationRequest(
       ]);
       return parsed(value, {
         ...filters(value),
-        minimumAgeYears: optionalInteger(value, 'minimumAgeYears', 1, 100) ?? 15,
+        minimumAgeYears: optionalInteger(value, 'minimumAgeYears', 1, 200) ?? 15,
         includeProxy: optionalBoolean(value, 'includeProxy') ?? false,
         ...(optionalIsoDate(value, 'asOf') === undefined
           ? {}
@@ -347,14 +349,14 @@ export function parseApplicationRequest(
       ]);
       return parsed(value, {
         ...filters(value),
-        maximumDistanceMeters: optionalInteger(value, 'maximumDistanceMeters', 1, 20_000) ?? 5_000,
+        maximumDistanceMeters: optionalInteger(value, 'maximumDistanceMeters', 1, 50_000) ?? 5_000,
         minimumTerrainConfidence: optionalNumber(value, 'minimumTerrainConfidence', 0, 1) ?? 0.5,
         waterFeatureTypes: optionalStringArray(
           value,
           'waterFeatureTypes',
-          ['ocean', 'bay', 'lake', 'reservoir', 'river', 'stream', 'creek'] as const,
+          ['ocean', 'bay', 'reservoir', 'lake', 'river', 'stream', 'canal'] as const,
           7,
-        ) ?? ['ocean', 'bay', 'lake', 'reservoir', 'river', 'stream', 'creek'],
+        ) ?? ['ocean', 'bay', 'reservoir', 'lake', 'river', 'stream', 'canal'],
         includeProxy: optionalBoolean(value, 'includeProxy') ?? false,
       });
     case 'inquiry.ownershipAge':
@@ -367,7 +369,7 @@ export function parseApplicationRequest(
       ]);
       return parsed(value, {
         ...filters(value),
-        minimumTenureYears: optionalInteger(value, 'minimumTenureYears', 1, 100) ?? 10,
+        minimumTenureYears: optionalInteger(value, 'minimumTenureYears', 1, 200) ?? 10,
         requireCompleteCoverage: optionalBoolean(value, 'requireCompleteCoverage') ?? true,
       });
     case 'inquiry.regionalOwner':
@@ -394,9 +396,9 @@ export function parseApplicationRequest(
       return parsed(value, {
         ...filters(value),
         maximumNetworkDistanceMeters:
-          optionalInteger(value, 'maximumNetworkDistanceMeters', 1, 5_000) ?? 800,
+          optionalInteger(value, 'maximumNetworkDistanceMeters', 1, 10_000) ?? 800,
         maximumSnapDistanceMeters:
-          optionalInteger(value, 'maximumSnapDistanceMeters', 1, 1_000) ?? 150,
+          optionalInteger(value, 'maximumSnapDistanceMeters', 1, 2_000) ?? 200,
         ...(optionalIsoDate(value, 'serviceDate') === undefined
           ? {}
           : { serviceDate: optionalIsoDate(value, 'serviceDate') }),
@@ -432,11 +434,11 @@ export function parseApplicationRequest(
       return parsed(value, {
         ...filters(value),
         maximumNetworkDistanceMeters:
-          optionalInteger(value, 'maximumNetworkDistanceMeters', 1, 5_000) ?? 800,
+          optionalInteger(value, 'maximumNetworkDistanceMeters', 1, 10_000) ?? 800,
         maximumSnapDistanceMeters:
-          optionalInteger(value, 'maximumSnapDistanceMeters', 1, 1_000) ?? 150,
+          optionalInteger(value, 'maximumSnapDistanceMeters', 1, 2_000) ?? 200,
         minimumValidationConfidence:
-          optionalNumber(value, 'minimumValidationConfidence', 0, 1) ?? 0.8,
+          optionalNumber(value, 'minimumValidationConfidence', 0, 1) ?? 0.7,
         includeProxy: optionalBoolean(value, 'includeProxy') ?? false,
       });
     case 'inquiry.rankCandidates': {
