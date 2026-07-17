@@ -333,6 +333,9 @@ function validateSemanticRow(
     );
   }
   for (const [name, value] of Object.entries(row)) {
+    if (visibility === 'public' && name.endsWith('_json') && typeof value === 'string') {
+      assertPublicJsonValue(JSON.parse(value) as unknown, `${relation}[${rowIndex}].${name}`);
+    }
     if (name.endsWith('_support_class') || name === 'support_class') {
       if (typeof value !== 'string' || !SUPPORT_CLASSES.has(value)) {
         throw new ServingSchemaError(`${relation}[${rowIndex}].${name} has invalid support class`);
@@ -370,6 +373,30 @@ function validateSemanticRow(
         `source_coverage[${rowIndex}] observed_count exceeds expected_count`,
       );
     }
+  }
+}
+
+function assertPublicJsonValue(value: unknown, path: string): void {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertPublicJsonValue(item, `${path}[${index}]`));
+    return;
+  }
+  if (value === null || typeof value !== 'object') return;
+  for (const [key, item] of Object.entries(value)) {
+    const normalized = key.toLowerCase().replaceAll(/[^a-z0-9]/gu, '');
+    if (
+      normalized === 'ownername' ||
+      normalized === 'ownerstext' ||
+      normalized === 'mailingaddress' ||
+      normalized.includes('grantor') ||
+      normalized.includes('grantee') ||
+      normalized.includes('email') ||
+      normalized.includes('phone') ||
+      normalized.includes('contact')
+    ) {
+      throw new PublicArtifactPolicyError(`${path} contains prohibited public field ${key}`);
+    }
+    assertPublicJsonValue(item, `${path}.${key}`);
   }
 }
 

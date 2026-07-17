@@ -22,6 +22,18 @@ export type ReleaseArtifactInput = Readonly<{
   schemaSha256: string;
   columns: readonly ReleaseColumn[];
   nonNullCounts: Readonly<Record<string, number>>;
+  grain: string;
+  sourceLineage: readonly ReleaseArtifactSource[];
+  limitations: readonly string[];
+}>;
+
+export type ReleaseArtifactSource = Readonly<{
+  sourceId: string;
+  snapshotId: string;
+  sourceSha256: string;
+  schemaSha256: string;
+  asOf: string | null;
+  role: 'direct' | 'derived';
 }>;
 
 export type PortableReleaseManifestPayload = Readonly<{
@@ -64,6 +76,16 @@ export function createPortableReleaseManifest(
             ...artifact,
             columns: Object.freeze(artifact.columns.map((column) => Object.freeze({ ...column }))),
             nonNullCounts: Object.freeze(sortRecord(artifact.nonNullCounts)),
+            sourceLineage: Object.freeze(
+              artifact.sourceLineage
+                .map((source) => Object.freeze({ ...source }))
+                .sort(
+                  (left, right) =>
+                    left.sourceId.localeCompare(right.sourceId) ||
+                    left.snapshotId.localeCompare(right.snapshotId),
+                ),
+            ),
+            limitations: Object.freeze([...new Set(artifact.limitations)].sort()),
           }),
         )
         .sort(
@@ -97,6 +119,33 @@ export async function readPortableReleaseManifest(path: string): Promise<Portabl
   return value;
 }
 
+export async function verifyPortableReleaseFiles(
+  releaseRoot: string,
+  manifest: PortableReleaseManifest,
+): Promise<readonly Readonly<{ relativePath: string; byteSize: number; sha256: string }>[]> {
+  verifyPortableReleaseManifest(manifest);
+  const verified = [];
+  for (const artifact of manifest.artifacts) {
+    const path = resolveInside(releaseRoot, artifact.relativePath);
+    const bytes = await readFile(path);
+    if (bytes.byteLength !== artifact.byteSize) {
+      throw new ReleaseArtifactIntegrityError(`${artifact.relativePath} byte-size mismatch`);
+    }
+    const actualSha256 = sha256(bytes);
+    if (actualSha256 !== artifact.sha256) {
+      throw new ReleaseArtifactIntegrityError(`${artifact.relativePath} SHA-256 mismatch`);
+    }
+    verified.push(
+      Object.freeze({
+        relativePath: artifact.relativePath,
+        byteSize: artifact.byteSize,
+        sha256: actualSha256,
+      }),
+    );
+  }
+  return Object.freeze(verified);
+}
+
 export function verifyPortableReleaseManifest(manifest: PortableReleaseManifest): void {
   const { manifestSha256, ...payload } = manifest;
   assertSha256(manifestSha256, 'manifestSha256');
@@ -123,6 +172,7 @@ function validateManifestInput(
   if (input.sourceIds.length === 0) throw new TypeError('sourceIds cannot be empty');
   if (input.artifacts.length === 0) throw new TypeError('artifacts cannot be empty');
   const identities = new Set<string>();
+  const lineageSourceIds = new Set<string>();
   for (const artifact of input.artifacts) {
     const identity = `${artifact.visibility}/${artifact.relation}`;
     if (identities.has(identity)) throw new TypeError(`Duplicate release artifact: ${identity}`);
@@ -143,6 +193,7 @@ function validateManifestInput(
     if (!Number.isSafeInteger(artifact.rowCount) || artifact.rowCount < 0) {
       throw new TypeError(`${identity} rowCount must be non-negative`);
     }
+    if (artifact.grain.trim().length === 0) throw new TypeError(`${identity} grain is required`);
     assertSha256(artifact.sha256, `${identity} sha256`);
     assertSha256(artifact.schemaSha256, `${identity} schemaSha256`);
     const columnNames = artifact.columns.map(({ name }) => name);
@@ -160,7 +211,55 @@ function validateManifestInput(
         throw new TypeError(`${identity}.${name} has an invalid non-null count`);
       }
     }
+    if (artifact.sourceLineage.length === 0) {
+      throw new TypeError(`${identity} sourceLineage cannot be empty`);
+    }
+    const sourceIdentities = new Set<string>();
+    for (const source of artifact.sourceLineage) {
+      if (source.sourceId.trim().length === 0 || source.snapshotId.trim().length === 0) {
+        throw new TypeError(`${identity} source lineage identifiers are required`);
+      }
+      const sourceIdentity = `${source.sourceId}/${source.snapshotId}`;
+      if (sourceIdentities.has(sourceIdentity)) {
+        throw new TypeError(`${identity} has duplicate source lineage ${sourceIdentity}`);
+      }
+      sourceIdentities.add(sourceIdentity);
+      lineageSourceIds.add(source.sourceId);
+      assertSha256(source.sourceSha256, `${identity}.${sourceIdentity}.sourceSha256`);
+      assertSha256(source.schemaSha256, `${identity}.${sourceIdentity}.schemaSha256`);
+      if (source.asOf !== null) assertInstant(source.asOf, `${identity}.${sourceIdentity}.asOf`);
+      assertLineageRole(source.role, `${identity}.${sourceIdentity}.role`);
+    }
+    if (
+      artifact.limitations.some((limitation) => limitation.trim().length === 0) ||
+      new Set(artifact.limitations).size !== artifact.limitations.length
+    ) {
+      throw new TypeError(`${identity} limitations must be unique non-empty strings`);
+    }
   }
+  const declaredSourceIds = [...new Set(input.sourceIds)].sort();
+  if (JSON.stringify([...lineageSourceIds].sort()) !== JSON.stringify(declaredSourceIds)) {
+    throw new TypeError('sourceIds must exactly match artifact source lineage');
+  }
+}
+
+function assertLineageRole(value: unknown, label: string): asserts value is 'direct' | 'derived' {
+  if (value !== 'direct' && value !== 'derived') {
+    throw new TypeError(`${label} is invalid`);
+  }
+}
+
+function resolveInside(root: string, relativePath: string): string {
+  const resolvedRoot = resolve(root);
+  const resolvedPath = resolve(resolvedRoot, relativePath);
+  if (
+    resolvedPath !== resolvedRoot &&
+    !resolvedPath.startsWith(`${resolvedRoot}\\`) &&
+    !resolvedPath.startsWith(`${resolvedRoot}/`)
+  ) {
+    throw new ReleaseArtifactIntegrityError('Artifact path escapes release root');
+  }
+  return resolvedPath;
 }
 
 function assertInstant(value: string, label: string): void {
@@ -203,5 +302,12 @@ export class ReleaseManifestIntegrityError extends Error {
   public constructor(message: string) {
     super(message);
     this.name = 'ReleaseManifestIntegrityError';
+  }
+}
+
+export class ReleaseArtifactIntegrityError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'ReleaseArtifactIntegrityError';
   }
 }

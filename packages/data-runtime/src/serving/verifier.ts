@@ -50,8 +50,13 @@ export async function verifyServingArtifacts(
           `${artifact.relativePath} does not have Parquet boundaries`,
         );
       }
+      assertArtifactContract(artifact);
       await assertDuckDbSchema(connection, path, artifact);
       await assertDuckDbGrain(connection, path, artifact);
+      await assertDuckDbNonNullCounts(connection, path, artifact);
+      if (artifact.visibility === 'public') {
+        await assertNoRestrictedJsonFields(connection, path, artifact);
+      }
       results.push(
         Object.freeze({
           relation: artifact.relation,
@@ -119,6 +124,79 @@ async function assertDuckDbSchema(
   }
 }
 
+function assertArtifactContract(artifact: BuiltServingArtifact): void {
+  const definition = SERVING_RELATIONS[artifact.relation];
+  const expectedPath = `${artifact.visibility}/${definition.fileName}`;
+  if (artifact.relativePath !== expectedPath) {
+    throw new ArtifactVisibilityError(
+      `${artifact.relativePath} does not match its ${artifact.visibility} release class`,
+    );
+  }
+  if (!definition.allowedVisibilities.includes(artifact.visibility)) {
+    throw new ArtifactVisibilityError(
+      `${artifact.relation} is not allowed in the ${artifact.visibility} release class`,
+    );
+  }
+  if (stableJson(artifact.columns) !== stableJson(definition.columns)) {
+    throw new ArtifactSchemaDriftError(
+      `${artifact.relativePath} metadata drifted from the serving contract`,
+    );
+  }
+  const schemaSha256 = createHash('sha256').update(stableJson(definition.columns)).digest('hex');
+  if (artifact.schemaSha256 !== schemaSha256) {
+    throw new ArtifactSchemaDriftError(`${artifact.relativePath} schema hash mismatch`);
+  }
+  const expectedColumns = definition.columns.map(({ name }) => name).sort();
+  if (
+    JSON.stringify(Object.keys(artifact.nonNullCounts).sort()) !== JSON.stringify(expectedColumns)
+  ) {
+    throw new ArtifactSchemaDriftError(
+      `${artifact.relativePath} non-null counts do not cover the exact schema`,
+    );
+  }
+}
+
+async function assertDuckDbNonNullCounts(
+  connection: DuckDBConnection,
+  path: string,
+  artifact: BuiltServingArtifact,
+): Promise<void> {
+  const projections = artifact.columns
+    .map(({ name }) => `count(${quoteIdentifier(name)})::BIGINT AS ${quoteIdentifier(name)}`)
+    .join(', ');
+  const result = await connection.runAndReadAll(
+    `SELECT ${projections} FROM read_parquet('${sqlPath(path)}')`,
+  );
+  const row = result.getRowObjects()[0];
+  for (const { name } of artifact.columns) {
+    if (Number(row?.[name]) !== artifact.nonNullCounts[name]) {
+      throw new ArtifactCountDriftError(
+        `${artifact.relativePath}.${name} non-null count differs from manifest`,
+      );
+    }
+  }
+}
+
+async function assertNoRestrictedJsonFields(
+  connection: DuckDBConnection,
+  path: string,
+  artifact: BuiltServingArtifact,
+): Promise<void> {
+  const jsonColumns = artifact.columns.filter(({ name }) => name.endsWith('_json'));
+  if (jsonColumns.length === 0) return;
+  const keyPattern =
+    '(?i)"[^"]*(owner[_ -]?name|owners[_ -]?text|mailing[_ -]?address|grantor|grantee|email|phone|contact)[^"]*"\\s*:';
+  const predicate = jsonColumns
+    .map(({ name }) => `regexp_matches(${quoteIdentifier(name)}, '${keyPattern}')`)
+    .join(' OR ');
+  const result = await connection.runAndReadAll(
+    `SELECT count(*)::BIGINT AS leaks FROM read_parquet('${sqlPath(path)}') WHERE ${predicate}`,
+  );
+  if (Number(result.getRowObjects()[0]?.leaks) !== 0) {
+    throw new ArtifactVisibilityError(`${artifact.relativePath} contains restricted JSON fields`);
+  }
+}
+
 async function assertDuckDbGrain(
   connection: DuckDBConnection,
   path: string,
@@ -172,6 +250,22 @@ function quoteIdentifier(value: string): string {
 
 function sqlPath(value: string): string {
   return resolve(value).replaceAll('\\', '/').replaceAll("'", "''");
+}
+
+function stableJson(value: unknown): string {
+  return JSON.stringify(sortJson(value));
+}
+
+function sortJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortJson);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, item]) => [key, sortJson(item)]),
+    );
+  }
+  return value;
 }
 
 export class ArtifactCorruptionError extends Error {
