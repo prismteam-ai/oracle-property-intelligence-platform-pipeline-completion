@@ -1,0 +1,33 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": "record-8-part-0",
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [-122.09014860827165, 37.44526826371947],
+          [-122.09019028375457, 37.44525764722272]
+        ]
+      },
+      "properties": {
+        "SOURCE_ID": "",
+        "SRC_DATE": "20130423",
+        "HOR_ACC": "2.9",
+        "INFORM": "Sluice gate",
+        "ATTRIBUTE": "Man-made.Bulkhead Or Sea Wall",
+        "VER_DATE": "",
+        "SRC_RESOLU": "0.00000e+00",
+        "DATA_SOURC": "Aerial Photography",
+        "EXT_METH": "Stereo",
+        "DAT_SET_CR": "NOAA",
+        "SRC_CITA": "",
+        "FIPS_ALPHA": "CA",
+        "NOAA_Regio": "West",
+        "GISDATE": "20121230",
+        "Shape_Leng": "4.30064632329e-05"
+      }
+    }
+  ]
+}
