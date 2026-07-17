@@ -1,0 +1,10 @@
+{
+  "authority": "County of Santa Clara, Office of the Clerk-Recorder",
+  "asOf": "2026-07-17T00:00:00.000Z",
+  "sourceUrl": "https://clerkrecorder.santaclaracounty.gov/official-records/subscribe-data-sales-reports/additional-information-related-data-sales",
+  "capability": "Fictitious Business Names",
+  "delivery": "monthly subscription only",
+  "fieldsStatedByPublisher": ["business name", "owner names", "business address"],
+  "coverageLimitation": "Not all new businesses are required to file an FBN Statement.",
+  "releaseDecision": "blocked"
+}
