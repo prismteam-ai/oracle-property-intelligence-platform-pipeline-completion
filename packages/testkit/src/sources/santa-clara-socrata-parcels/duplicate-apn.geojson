@@ -1,0 +1,107 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "MultiPolygon",
+        "coordinates": [
+          [
+            [
+              [-122.102411516073, 37.422736121951],
+              [-122.102408557023, 37.422605650485],
+              [-122.102533274625, 37.422603280505],
+              [-122.102534024718, 37.422634364186],
+              [-122.102621999429, 37.42263265412],
+              [-122.102658275197, 37.422631950689],
+              [-122.102669714344, 37.423078924332],
+              [-122.102544831451, 37.423082084047],
+              [-122.102419435621, 37.42308525803],
+              [-122.102413331568, 37.422816066841],
+              [-122.102411516073, 37.422736121951]
+            ]
+          ]
+        ]
+      },
+      "properties": {
+        "situs_street_type": "RD",
+        "jurisdiction": "PALO ALTO",
+        "reserved2": null,
+        "situs_state_code": "CA",
+        "shape_area": "1805.5702283133601",
+        "objectid": "10649",
+        "number_of_situs_address": "1",
+        "situs_street_direction": null,
+        "situs_city_name": "PALO ALTO",
+        "shape_area_stateplane": "12234.83022731613",
+        "shape_length": "189.85909777118843",
+        "ap_lp": "AP",
+        "situs_house_number": "899",
+        "tax_rate_area": "6012",
+        "reserved1": null,
+        "apn": "12769001",
+        "situs_house_number_suffix": null,
+        "reserved3": null,
+        "situs_street_name": "CHARLESTON",
+        "situs_unit_number": null,
+        "situs_zip_code": "94303",
+        "shape_length_stateplane": "493.79033859027226"
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "MultiPolygon",
+        "coordinates": [
+          [
+            [
+              [-122.103088767644, 37.422620048715],
+              [-122.103066798445, 37.422618264453],
+              [-122.103040719454, 37.422616148451],
+              [-122.102948823597, 37.422608687511],
+              [-122.102978189524, 37.422365022985],
+              [-122.102763746394, 37.422346981973],
+              [-122.102769959143, 37.422296453134],
+              [-122.102788632423, 37.422298035505],
+              [-122.10279640824, 37.422235246459],
+              [-122.102947618058, 37.422248175823],
+              [-122.102952159042, 37.422210694003],
+              [-122.102998038699, 37.42221463852],
+              [-122.102989231615, 37.422287714422],
+              [-122.103104925641, 37.422297555371],
+              [-122.103112425675, 37.422234467401],
+              [-122.10324000531, 37.42224541559],
+              [-122.103195115597, 37.422628681802],
+              [-122.103088767644, 37.422620048715]
+            ]
+          ]
+        ]
+      },
+      "properties": {
+        "situs_street_type": "RD",
+        "jurisdiction": "PALO ALTO",
+        "reserved2": null,
+        "situs_state_code": "CA",
+        "shape_area": "1760.4009839724713",
+        "objectid": "10650",
+        "number_of_situs_address": "1",
+        "situs_street_direction": null,
+        "situs_city_name": "PALO ALTO",
+        "shape_area_stateplane": "11928.892593963837",
+        "shape_length": "231.63493110969375",
+        "ap_lp": "AP",
+        "situs_house_number": "899",
+        "tax_rate_area": "6012",
+        "reserved1": null,
+        "apn": "12769001",
+        "situs_house_number_suffix": null,
+        "reserved3": null,
+        "situs_street_name": "CHARLESTON",
+        "situs_unit_number": null,
+        "situs_zip_code": "94303",
+        "shape_length_stateplane": "602.83312132851893"
+      }
+    }
+  ],
+  "crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } }
+}
