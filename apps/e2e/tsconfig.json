@@ -1,0 +1,9 @@
+{
+  "extends": "@oracle/tsconfig/node.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "noEmit": true,
+    "types": ["node", "@playwright/test"]
+  },
+  "include": ["playwright.config.ts", "support/**/*.ts", "tests/**/*.ts"]
+}
