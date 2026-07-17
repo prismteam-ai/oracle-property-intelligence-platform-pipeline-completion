@@ -1,36 +1,11 @@
-import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
+import { UnavailableNamedEvidenceService } from './service.js';
+import { createLambdaMcpHandler } from './transport.js';
 
-import type { HealthResponse, McpFoundationError } from '@oracle/contracts';
-import { createObservability } from '@oracle/observability';
+/**
+ * Production intentionally fails tool execution closed until composition injects the
+ * verified immutable-release query service. Protocol discovery remains available.
+ */
+export const handler = createLambdaMcpHandler(new UnavailableNamedEvidenceService());
 
-const observability = createObservability('oracle-foundation-mcp');
-
-function json(
-  statusCode: number,
-  body: HealthResponse | McpFoundationError,
-): APIGatewayProxyResultV2 {
-  return {
-    statusCode,
-    headers: { 'content-type': 'application/json; charset=utf-8' },
-    body: JSON.stringify(body),
-  };
-}
-
-export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> {
-  if (event.rawPath === '/mcp/health' || event.rawPath === '/health') {
-    observability.logger.info('Foundation MCP health check');
-    return await Promise.resolve(json(200, { service: 'mcp', status: 'ok', foundationOnly: true }));
-  }
-
-  observability.logger.warn('MCP request rejected because only the foundation exists', {
-    method: event.requestContext.http.method,
-  });
-  return await Promise.resolve(
-    json(501, {
-      error: {
-        code: 'MCP_FOUNDATION_ONLY',
-        message: 'The MCP protocol and property tools are not implemented in ORA-010.',
-      },
-    }),
-  );
-}
+export { createLambdaMcpHandler } from './transport.js';
+export type { NamedEvidenceRequest, NamedEvidenceService } from './service.js';
