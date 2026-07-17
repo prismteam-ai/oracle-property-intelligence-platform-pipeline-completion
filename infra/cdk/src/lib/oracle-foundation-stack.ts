@@ -129,13 +129,11 @@ export class OracleFoundationStack extends cdk.Stack {
         POWERTOOLS_SERVICE_NAME: serviceName,
       },
       bundling: {
-        format: nodejs.OutputFormat.ESM,
+        format: nodejs.OutputFormat.CJS,
         mainFields: ['module', 'main'],
         minify: true,
         sourceMap: true,
         target: 'node22',
-        banner:
-          'import { createRequire } from "module";const require=createRequire(import.meta.url);',
       },
     });
   }

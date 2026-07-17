@@ -43,22 +43,30 @@ function event(rawPath: string): APIGatewayProxyEventV2 {
 }
 
 describe('foundation-only MCP surface', () => {
-  it('returns typed health', () => {
-    const response = handler(event('/mcp/health'));
+  it('immediately returns a promise that resolves to typed health', async () => {
+    const responsePromise = handler(event('/mcp/health'));
+
+    expect(responsePromise).toBeInstanceOf(Promise);
+
+    const response = await responsePromise;
     expect(response).toMatchObject({ statusCode: 200 });
-    expect(healthResponseSchema.parse(parseJson(responseBody(response)))).toMatchObject({
+    expect(healthResponseSchema.parse(parseJson(responseBody(response)))).toEqual({
       service: 'mcp',
+      status: 'ok',
       foundationOnly: true,
     });
   });
 
-  it('truthfully rejects every non-health request', () => {
+  it('truthfully rejects every non-health request', async () => {
     for (const path of ['/mcp', '/mcp/tools/list', '/anything']) {
-      const response = handler(event(path));
+      const response = await handler(event(path));
       expect(response).toMatchObject({ statusCode: 501 });
-      expect(mcpFoundationErrorSchema.parse(parseJson(responseBody(response))).error.code).toBe(
-        'MCP_FOUNDATION_ONLY',
-      );
+      expect(mcpFoundationErrorSchema.parse(parseJson(responseBody(response)))).toEqual({
+        error: {
+          code: 'MCP_FOUNDATION_ONLY',
+          message: 'The MCP protocol and property tools are not implemented in ORA-010.',
+        },
+      });
     }
   });
 });

@@ -16,19 +16,21 @@ function json(
   };
 }
 
-export function handler(event: APIGatewayProxyEventV2): APIGatewayProxyResultV2 {
+export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> {
   if (event.rawPath === '/mcp/health' || event.rawPath === '/health') {
     observability.logger.info('Foundation MCP health check');
-    return json(200, { service: 'mcp', status: 'ok', foundationOnly: true });
+    return await Promise.resolve(json(200, { service: 'mcp', status: 'ok', foundationOnly: true }));
   }
 
   observability.logger.warn('MCP request rejected because only the foundation exists', {
     method: event.requestContext.http.method,
   });
-  return json(501, {
-    error: {
-      code: 'MCP_FOUNDATION_ONLY',
-      message: 'The MCP protocol and property tools are not implemented in ORA-010.',
-    },
-  });
+  return await Promise.resolve(
+    json(501, {
+      error: {
+        code: 'MCP_FOUNDATION_ONLY',
+        message: 'The MCP protocol and property tools are not implemented in ORA-010.',
+      },
+    }),
+  );
 }
