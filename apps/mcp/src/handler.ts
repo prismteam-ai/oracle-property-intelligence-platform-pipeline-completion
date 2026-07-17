@@ -1,11 +1,18 @@
-import { UnavailableNamedEvidenceService } from './service.js';
-import { createLambdaMcpHandler } from './transport.js';
+import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2 } from 'aws-lambda';
 
-/**
- * Production intentionally fails tool execution closed until composition injects the
- * verified immutable-release query service. Protocol discovery remains available.
- */
-export const handler = createLambdaMcpHandler(new UnavailableNamedEvidenceService());
+import { createProductionMcpHandler } from './composition.js';
+
+let defaultHandler: Promise<
+  (event: APIGatewayProxyEventV2) => Promise<APIGatewayProxyResultV2>
+> | null = null;
+
+export async function handler(event: APIGatewayProxyEventV2): Promise<APIGatewayProxyResultV2> {
+  defaultHandler ??= createProductionMcpHandler(process.env);
+  return await (
+    await defaultHandler
+  )(event);
+}
 
 export { createLambdaMcpHandler } from './transport.js';
+export { createProductionMcpHandler } from './composition.js';
 export type { NamedEvidenceRequest, NamedEvidenceService } from './service.js';

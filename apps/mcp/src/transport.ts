@@ -7,6 +7,10 @@ import type { NamedEvidenceService } from './service.js';
 
 type LambdaHandler = (event: APIGatewayProxyEventV2) => Promise<APIGatewayProxyResultV2>;
 
+export type McpHandlerOptions = Readonly<{
+  deployment: 'production' | 'test';
+}>;
+
 type JsonRpcErrorCode = -32_000 | -32_600 | -32_700;
 
 function jsonRpcError(
@@ -26,7 +30,26 @@ function jsonRpcError(
   };
 }
 
-function health(): APIGatewayProxyResultV2 {
+function runtimeState(service: NamedEvidenceService): Readonly<{
+  status: 'ready' | 'degraded';
+  readiness: 'ready' | 'unconfigured' | 'test_fixture';
+  fixture: string | null;
+}> {
+  if (service.kind === 'verified-immutable-release') {
+    return { status: 'ready', readiness: 'ready', fixture: null };
+  }
+  if (service.kind === 'unavailable') {
+    return { status: 'degraded', readiness: 'unconfigured', fixture: null };
+  }
+  return {
+    status: 'degraded',
+    readiness: 'test_fixture',
+    fixture: 'TEST_ONLY_DETERMINISTIC_FIXTURE',
+  };
+}
+
+function health(service: NamedEvidenceService): APIGatewayProxyResultV2 {
+  const state = runtimeState(service);
   return {
     statusCode: 200,
     headers: {
@@ -35,7 +58,7 @@ function health(): APIGatewayProxyResultV2 {
     },
     body: JSON.stringify({
       service: 'oracle-named-evidence-mcp',
-      status: 'ok',
+      ...state,
       dataQueriesExecuted: 0,
       transport: 'streamable-http',
       releaseBinding: 'immutable',
@@ -92,13 +115,23 @@ async function toLambdaResponse(response: Response): Promise<APIGatewayProxyResu
   };
 }
 
-export function createLambdaMcpHandler(service: NamedEvidenceService): LambdaHandler {
+export function createLambdaMcpHandler(
+  service: NamedEvidenceService,
+  options: McpHandlerOptions = { deployment: 'test' },
+): LambdaHandler {
+  if (
+    options.deployment === 'production' &&
+    service.kind !== 'verified-immutable-release' &&
+    service.kind !== 'unavailable'
+  ) {
+    throw new TypeError('Test fixture services cannot be composed in production.');
+  }
   return async (event) => {
     if (event.rawPath === '/health' || event.rawPath === '/mcp/health') {
       if (requestMethod(event) !== 'GET') {
         return jsonRpcError(405, -32_000, 'Method not allowed.', { allow: 'GET' });
       }
-      return health();
+      return health(service);
     }
     if (event.rawPath !== '/mcp') {
       return jsonRpcError(404, -32_000, 'MCP endpoint not found.');
@@ -117,13 +150,21 @@ export function createLambdaMcpHandler(service: NamedEvidenceService): LambdaHan
 
     const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
     const server = createNamedEvidenceMcpServer(service);
-    await server.connect(transport);
+    let connected = false;
     try {
+      await server.connect(transport);
+      connected = true;
       return await toLambdaResponse(await transport.handleRequest(createRequest(event, body)));
     } catch {
       return jsonRpcError(400, -32_700, 'The MCP request could not be processed.');
     } finally {
-      await server.close();
+      if (connected) {
+        try {
+          await server.close();
+        } catch {
+          // The response is already bounded and redacted; teardown details are never returned.
+        }
+      }
     }
   };
 }

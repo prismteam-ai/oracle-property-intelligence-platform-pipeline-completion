@@ -7,7 +7,7 @@
     ".": "./dist/handler.js"
   },
   "scripts": {
-    "build": "esbuild src/handler.ts --bundle --format=esm --platform=node --target=node22 --sourcemap --banner:js=\"import { createRequire } from 'node:module';const require=createRequire(import.meta.url);\" --outfile=dist/handler.js && node --input-type=module -e \"await import('./dist/handler.js')\"",
+    "build": "esbuild src/handler.ts --bundle --format=esm --platform=node --target=node22 --sourcemap --external:@oracle/query-core/* --banner:js=\"import { createRequire } from 'node:module';const require=createRequire(import.meta.url);\" --outfile=dist/handler.js && node --input-type=module -e \"await import('./dist/handler.js')\"",
     "lint": "eslint src",
     "test": "vitest run src",
     "typecheck": "tsc -p tsconfig.json --noEmit"

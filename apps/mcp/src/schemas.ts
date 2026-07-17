@@ -4,7 +4,7 @@ export const MAX_REQUEST_BYTES = 16 * 1024;
 export const MAX_CURSOR_BYTES = 512;
 export const MAX_RESPONSE_BYTES = 1024 * 1024;
 export const MAX_TOOL_PAYLOAD_BYTES = 900 * 1024;
-export const DEFAULT_PAGE_SIZE = 50;
+export const DEFAULT_PAGE_SIZE = 25;
 export const MAX_PAGE_SIZE = 100;
 
 const authorityIdSchema = z

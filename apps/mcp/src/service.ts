@@ -16,6 +16,7 @@ export type NamedEvidenceRequest = Readonly<{
 }>;
 
 export interface NamedEvidenceService {
+  readonly kind?: 'verified-immutable-release' | 'unavailable' | 'test-fixture';
   execute(request: NamedEvidenceRequest): Promise<unknown>;
   validateCursor?(
     request: Readonly<{
@@ -39,6 +40,8 @@ export class NamedEvidenceServiceError extends Error {
 }
 
 export class UnavailableNamedEvidenceService implements NamedEvidenceService {
+  public readonly kind = 'unavailable' as const;
+
   public execute(request: NamedEvidenceRequest): Promise<never> {
     const releaseId =
       typeof request.input.releaseId === 'string' ? request.input.releaseId : undefined;

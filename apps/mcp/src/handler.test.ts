@@ -150,7 +150,9 @@ describe('Streamable HTTP lifecycle and Lambda integration', () => {
     expect(response).toMatchObject({ statusCode: 200 });
     expect(body(response)).toEqual({
       service: 'oracle-named-evidence-mcp',
-      status: 'ok',
+      status: 'degraded',
+      readiness: 'test_fixture',
+      fixture: 'TEST_ONLY_DETERMINISTIC_FIXTURE',
       dataQueriesExecuted: 0,
       transport: 'streamable-http',
       releaseBinding: 'immutable',
@@ -263,6 +265,22 @@ describe('Streamable HTTP lifecycle and Lambda integration', () => {
       },
     });
   });
+
+  it('reports the unconfigured default production export as degraded', async () => {
+    const response = await handler(event('/mcp/health', { method: 'GET' }));
+    expect(body(response)).toMatchObject({
+      status: 'degraded',
+      readiness: 'unconfigured',
+      fixture: null,
+      dataQueriesExecuted: 0,
+    });
+  });
+
+  it('prevents an injected fixture service from entering production composition', () => {
+    expect(() =>
+      createLambdaMcpHandler(new FixtureService(), { deployment: 'production' }),
+    ).toThrow(/Test fixture/u);
+  });
 });
 
 describe('named evidence tool boundary', () => {
@@ -301,7 +319,7 @@ describe('named evidence tool boundary', () => {
     );
     const tools = (body(response) as { result: { tools: unknown[] } }).result.tools;
     const digest = createHash('sha256').update(stableJson(tools)).digest('hex');
-    expect(digest).toBe('3b42e564ed04557824afd7ae6721f738ef2e00c7473ad544bcf015d5aadc9ac2');
+    expect(digest).toBe('0922e80263cf6855f1a1bc8450b536c0c538e17adf6a549c46a857ecfcf964e5');
   });
 
   it('rejects additional properties for every frozen operation before execution', async () => {
