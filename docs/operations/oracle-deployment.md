@@ -9,7 +9,7 @@ of validation or review.
 
 | Surface | Product resource | Idle behavior |
 |---|---|---|
-| Evaluator web | private, versioned, object-locked S3 origin behind CloudFront OAC | storage and requests only |
+| Evaluator web | CloudFront with private, versioned, object-locked S3+OAC as the default origin and explicit same-origin HTTP API behaviors | storage and requests only |
 | Public release artifacts | separate private, versioned, object-locked S3 origin behind its own CloudFront distribution | storage and requests only |
 | Restricted artifacts | isolated private, versioned, object-locked S3 bucket | storage only; no API, MCP, or CloudFront grant |
 | Application API | Node.js 22 x86_64 Lambda behind explicit HTTP API routes | scales to zero |
@@ -153,18 +153,48 @@ POST /mcp
 GET  /mcp/health
 ```
 
-There is no `ANY` route. Browser CORS allows only the exact CloudFront web
-origin, `GET`/`POST`/preflight, and the committed bounded headers. CORS is not
-authorization; the absence of a restricted route is the data boundary.
+There is no `ANY` or HTTP API `OPTIONS` route. The application handler continues
+to own CORS on direct API responses and allows only the exact CloudFront web
+origin and the committed bounded headers. Same-origin browser preflight instead
+terminates in a viewer-request CloudFront Function on only the explicit API
+behaviors. It requires `Origin` to equal `https://<viewer Host>`, requires the
+requested method to be `POST`, accepts only `authorization`, `content-type`, and
+`x-request-id`, and returns `204` with no body plus the bounded CORS and security
+headers. Invalid preflight returns a no-body `403` without CORS authority. This
+keeps preflight away from Lambda, leaves direct API/MCP application outputs
+unchanged, and avoids an API/distribution CloudFormation dependency cycle. CORS
+is not authorization; the absence of a restricted route is the data boundary.
+
+`WebUrl` is the browser's stable same-origin contract. Its default cache
+behavior remains the private evaluator S3 origin through OAC and accepts only
+`GET`/`HEAD`/`OPTIONS`. Separate exact behaviors route `health`, `mcp`,
+`mcp/health`, `trpc/*`, and every operation in the committed application
+contract (`dataset.getInfo` through `agent.status`) to the HTTP API origin.
+Those behaviors redirect to HTTPS, use CloudFront's disabled-cache policy,
+disable compression, apply the security-headers policy, and use the managed
+API Gateway origin-request policy that forwards every viewer header except
+`Host`, plus all query strings and cookies. CloudFront forwards request paths
+and bodies independently of that policy. API Gateway remains the method and
+route authority even though CloudFront's only method set that admits `POST`
+also admits methods that no API route implements.
+
+The operator method contract in this section is authoritative for deployed
+routing. At `WebUrl`, `GET /mcp` is the evaluator SPA page and `POST /mcp` is the
+Streamable HTTP protocol endpoint; at direct `ApiUrl`, only `POST /mcp` exists.
+Do not smoke, document, or automate `GET /mcp` as a protocol request.
 
 The web CloudFront Function rewrites only extensionless SPA deep links to
 `/index.html`. Requests at or below `/api`, `/mcp`, `/assets`, `/trpc`, or
 `/health`; top-level operation paths beginning `dataset.`, `pipeline.`,
 `property.`, `inquiry.`, `artifacts.`, or `agent.`; and any file-like path
 containing an extension remain origin requests and can return a real miss. UI
-routes such as plural `/inquiries/*` remain valid SPA deep links. There is no
-distribution-wide 403/404-to-HTML custom error response, so unknown API, MCP,
-and asset paths cannot become HTML `200` responses.
+routes such as plural `/inquiries/*` remain valid SPA deep links. The exact
+`/mcp` path is both a React evaluator route and the Streamable HTTP endpoint:
+the viewer-request function returns the built SPA entry document only for
+`GET /mcp`, while `POST /mcp` passes unchanged to the HTTP API behavior. Direct
+HTTP API/MCP endpoints are untouched. There is no distribution-wide
+403/404-to-HTML custom error response and no broad extension/file-miss API
+proxy, so unknown API, MCP, and asset paths cannot become HTML `200` responses.
 
 The artifact distribution allows browser `GET`/`HEAD`/`OPTIONS` and bounded
 range headers only from the web origin. Both distributions redirect to HTTPS
@@ -229,7 +259,10 @@ release is a successful fail-closed check, not a deployable template.
 
 Assertions cover release rejection and closure validation, separate immutable
 buckets, restricted-data isolation, SPA rewrite boundaries, HTTPS/security
-headers, exact routes/CORS/throttling, x86_64 Node 22 function configuration,
+headers, both exact read-only application/browser operation inventories,
+API-origin selection, disabled API caching, complete request forwarding, the
+edge-generated no-body preflight and method-aware `/mcp` boundary, exact
+routes/CORS/throttling, x86_64 Node 22 function configuration,
 absence of reserved concurrency, all required runtime variables and the shared
 secret dynamic reference, absence of obsolete S3/prefix/secret-ARN variables,
 absence of product S3/Secrets Manager grants, exact validator-returned public
@@ -251,9 +284,10 @@ Deployment is a separate authorized action. After all gates pass:
    restricted bytes;
 4. deploy without printing context containing credentials and record the seven
    stable outputs;
-5. externally smoke `WebUrl`, `/health`, `/mcp/health`, one real named API query,
-   one MCP tool, a SPA deep-link refresh, API/MCP/assets misses, and public
-   artifact byte/hash/range behavior;
+5. externally smoke `WebUrl`; same-origin `POST /dataset.getInfo`; `/health`;
+   `/mcp/health`; one real named API query; one MCP tool through same-origin
+   `POST /mcp`; a `GET /mcp` SPA refresh; another SPA deep-link refresh;
+   API/MCP/assets misses; and public artifact byte/hash/range behavior;
 6. confirm the release ID, manifest hash, capabilities, and cursor continuity;
    and
 7. retain the prior release directory, deployed asset, and web object versions

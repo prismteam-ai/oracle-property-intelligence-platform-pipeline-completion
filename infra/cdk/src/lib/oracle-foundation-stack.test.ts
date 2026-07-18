@@ -10,7 +10,11 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import type * as s3assets from 'aws-cdk-lib/aws-s3-assets';
 import { describe, expect, it } from 'vitest';
 
-import { OracleFoundationStack, type BedrockPromotion } from './oracle-foundation-stack.js';
+import {
+  OracleFoundationStack,
+  SAME_ORIGIN_APPLICATION_OPERATIONS,
+  type BedrockPromotion,
+} from './oracle-foundation-stack.js';
 
 const app = new cdk.App();
 const templateTestCode = lambda.Code.fromInline(
@@ -35,6 +39,13 @@ interface SynthesizedResource {
 
 interface SynthesizedTemplate {
   Resources: Record<string, SynthesizedResource>;
+}
+
+interface CloudFrontDistributionConfig {
+  CacheBehaviors?: Record<string, unknown>[];
+  DefaultCacheBehavior?: Record<string, unknown>;
+  DefaultRootObject?: string;
+  Origins?: Record<string, unknown>[];
 }
 
 interface GatewayEvent {
@@ -167,13 +178,28 @@ describe('Oracle product infrastructure', () => {
     expect(JSON.stringify(distributions)).not.toContain('CustomErrorResponses');
     expect(JSON.stringify(distributions)).toContain('FunctionAssociations');
     const functions = foundationTemplate.findResources('AWS::CloudFront::Function');
-    expect(Object.values(functions)).toHaveLength(1);
-    const functionCode = (Object.values(functions)[0]?.Properties as { FunctionCode?: unknown })
-      .FunctionCode;
+    expect(Object.values(functions)).toHaveLength(2);
+    const functionCode = (
+      Object.values(functions).find((resource) =>
+        JSON.stringify(resource.Properties).includes('Rewrite only extensionless evaluator'),
+      )?.Properties as { FunctionCode?: unknown } | undefined
+    )?.FunctionCode;
+    const apiEdgeCode = (
+      Object.values(functions).find((resource) =>
+        JSON.stringify(resource.Properties).includes('Resolve same-origin preflight'),
+      )?.Properties as { FunctionCode?: unknown } | undefined
+    )?.FunctionCode;
     expect(typeof functionCode).toBe('string');
+    expect(typeof apiEdgeCode).toBe('string');
+    for (const code of [functionCode, apiEdgeCode]) {
+      expect(Buffer.byteLength(String(code), 'utf8')).toBeLessThanOrEqual(10 * 1024);
+    }
     const rewrite = (uri: string): string => {
-      const context: { event: { request: { uri: string } }; result?: { uri: string } } = {
-        event: { request: { uri } },
+      const context: {
+        event: { request: { method: string; uri: string } };
+        result?: { uri?: string };
+      } = {
+        event: { request: { method: 'GET', uri } },
       };
       runInNewContext(`${String(functionCode)}\nresult = handler(event);`, context);
       return context.result?.uri ?? '';
@@ -197,6 +223,105 @@ describe('Oracle product infrastructure', () => {
     ]) {
       expect(rewrite(uri)).toBe(uri);
     }
+
+    const mcpContext: {
+      event: { request: { method: string; uri: string } };
+      result?: {
+        body?: string;
+        headers?: Record<string, { value?: string }>;
+        statusCode?: number;
+        uri?: string;
+      };
+    } = { event: { request: { method: 'GET', uri: '/mcp' } } };
+    runInNewContext(`${String(apiEdgeCode)}\nresult = handler(event);`, mcpContext);
+    expect(mcpContext.result).toMatchObject({
+      statusCode: 200,
+      headers: {
+        'cache-control': { value: 'no-store' },
+        'content-type': { value: 'text/html; charset=utf-8' },
+        'strict-transport-security': { value: 'max-age=31536000' },
+      },
+    });
+    expect(mcpContext.result?.body).toContain('<div id="root"></div>');
+    expect(mcpContext.result?.body).toMatch(/src="\/assets\/index-[^"]+\.js"/u);
+
+    const mcpPostContext: {
+      event: { request: { method: string; uri: string } };
+      result?: { method?: string; uri?: string };
+    } = { event: { request: { method: 'POST', uri: '/mcp' } } };
+    runInNewContext(`${String(apiEdgeCode)}\nresult = handler(event);`, mcpPostContext);
+    expect(mcpPostContext.result).toEqual({ method: 'POST', uri: '/mcp' });
+
+    const preflight = (headers: Record<string, { value: string }>) => {
+      const context: {
+        event: {
+          request: {
+            headers: Record<string, { value: string }>;
+            method: string;
+            uri: string;
+          };
+        };
+        result?: {
+          body?: string;
+          headers?: Record<string, { value?: string }>;
+          statusCode?: number;
+        };
+      } = {
+        event: { request: { headers, method: 'OPTIONS', uri: '/dataset.getInfo' } },
+      };
+      runInNewContext(`${String(apiEdgeCode)}\nresult = handler(event);`, context);
+      return context.result;
+    };
+    const sameOriginPreflight = preflight({
+      'access-control-request-headers': { value: 'Content-Type, X-Request-ID' },
+      'access-control-request-method': { value: 'POST' },
+      host: { value: 'd111111abcdef8.cloudfront.net' },
+      origin: { value: 'https://d111111abcdef8.cloudfront.net' },
+    });
+    expect(sameOriginPreflight).toMatchObject({
+      statusCode: 204,
+      headers: {
+        'access-control-allow-headers': {
+          value: 'authorization,content-type,x-request-id',
+        },
+        'access-control-allow-methods': { value: 'GET,POST,OPTIONS' },
+        'access-control-allow-origin': {
+          value: 'https://d111111abcdef8.cloudfront.net',
+        },
+        'access-control-max-age': { value: '600' },
+        'strict-transport-security': { value: 'max-age=31536000' },
+        'x-content-type-options': { value: 'nosniff' },
+      },
+    });
+    expect(sameOriginPreflight).not.toHaveProperty('body');
+    for (const rejected of [
+      preflight({
+        'access-control-request-method': { value: 'POST' },
+        host: { value: 'd111111abcdef8.cloudfront.net' },
+        origin: { value: 'https://attacker.test' },
+      }),
+      preflight({
+        'access-control-request-method': { value: 'DELETE' },
+        host: { value: 'd111111abcdef8.cloudfront.net' },
+        origin: { value: 'https://d111111abcdef8.cloudfront.net' },
+      }),
+      preflight({
+        'access-control-request-headers': { value: 'x-unbounded-header' },
+        'access-control-request-method': { value: 'POST' },
+        host: { value: 'd111111abcdef8.cloudfront.net' },
+        origin: { value: 'https://d111111abcdef8.cloudfront.net' },
+      }),
+    ]) {
+      expect(rejected).toMatchObject({
+        statusCode: 403,
+        headers: {
+          'strict-transport-security': { value: 'max-age=31536000' },
+          'x-content-type-options': { value: 'nosniff' },
+        },
+      });
+      expect(rejected).not.toHaveProperty('body');
+      expect(rejected?.headers).not.toHaveProperty('access-control-allow-origin');
+    }
     foundationTemplate.hasResourceProperties('AWS::CloudFront::ResponseHeadersPolicy', {
       ResponseHeadersPolicyConfig: {
         CorsConfig: Match.objectLike({
@@ -210,6 +335,110 @@ describe('Oracle product infrastructure', () => {
     const deployments = foundationTemplate.findResources('Custom::CDKBucketDeployment');
     expect(JSON.stringify(deployments)).toContain('Prune');
     expect(JSON.stringify(deployments)).toContain('false');
+  });
+
+  it('routes only the current same-origin API contract to the uncached HTTP API origin', async () => {
+    const contractSource = await readFile(
+      resolve(repositoryRoot, 'apps/api/src/contract.ts'),
+      'utf8',
+    );
+    const operationBlock = /export const applicationOperations = \[([\s\S]*?)\] as const;/u.exec(
+      contractSource,
+    )?.[1];
+    if (operationBlock === undefined) {
+      throw new Error('The application operation inventory could not be read from its contract.');
+    }
+    const applicationOperations = [...operationBlock.matchAll(/'([^']+)'/gu)].map(
+      (match) => match[1],
+    );
+    expect(
+      operationBlock
+        .replace(/'[^']+'/gu, '')
+        .replaceAll(',', '')
+        .trim(),
+    ).toBe('');
+    expect(new Set(applicationOperations).size).toBe(applicationOperations.length);
+
+    const webTypesSource = await readFile(resolve(repositoryRoot, 'apps/web/src/types.ts'), 'utf8');
+    const webOperationBlock = /export type ApplicationOperation =([\s\S]*?);/u.exec(
+      webTypesSource,
+    )?.[1];
+    if (webOperationBlock === undefined) {
+      throw new Error('The browser operation inventory could not be read from its type contract.');
+    }
+    const browserOperations = [...webOperationBlock.matchAll(/\|\s*'([^']+)'/gu)].map(
+      (match) => match[1],
+    );
+    expect(webOperationBlock.replace(/\|\s*'[^']+'/gu, '').trim()).toBe('');
+    expect(new Set(browserOperations).size).toBe(browserOperations.length);
+    expect(browserOperations).toEqual(applicationOperations);
+    expect(SAME_ORIGIN_APPLICATION_OPERATIONS).toEqual(applicationOperations);
+    expect(SAME_ORIGIN_APPLICATION_OPERATIONS).toEqual(browserOperations);
+
+    const distributions = Object.values(
+      foundationTemplate.findResources('AWS::CloudFront::Distribution'),
+    );
+    const webDistribution = distributions.find((resource) => {
+      const config = (resource.Properties as { DistributionConfig?: CloudFrontDistributionConfig })
+        .DistributionConfig;
+      return config?.DefaultRootObject === 'index.html';
+    });
+    expect(webDistribution).toBeDefined();
+    const config = (
+      webDistribution?.Properties as { DistributionConfig?: CloudFrontDistributionConfig }
+    ).DistributionConfig;
+    if (config === undefined) throw new Error('Web distribution config was not synthesized.');
+
+    const behaviors = config.CacheBehaviors ?? [];
+    const expectedPatterns = [
+      'health',
+      'mcp',
+      'mcp/health',
+      'trpc/*',
+      ...applicationOperations,
+    ].sort();
+    expect(behaviors.map((behavior) => String(behavior.PathPattern)).sort()).toEqual(
+      expectedPatterns,
+    );
+    expect(expectedPatterns).not.toContain('*.*');
+    expect(expectedPatterns).not.toContain('*');
+
+    const apiOriginId = behaviors[0]?.TargetOriginId;
+    expect(typeof apiOriginId).toBe('string');
+    for (const behavior of behaviors) {
+      expect(behavior).toMatchObject({
+        AllowedMethods: ['GET', 'HEAD', 'OPTIONS', 'PUT', 'PATCH', 'POST', 'DELETE'],
+        CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad',
+        Compress: false,
+        OriginRequestPolicyId: 'b689b0a8-53d0-40ab-baf2-68738e2966ac',
+        ResponseHeadersPolicyId: '67f7725c-6f97-4210-82d7-5512b31e9d03',
+        TargetOriginId: apiOriginId,
+        ViewerProtocolPolicy: 'redirect-to-https',
+      });
+    }
+
+    expect(config.DefaultCacheBehavior).toMatchObject({
+      AllowedMethods: ['GET', 'HEAD', 'OPTIONS'],
+      CachePolicyId: '658327ea-f89d-4fab-a63d-7e88639e58f6',
+      Compress: true,
+      ViewerProtocolPolicy: 'redirect-to-https',
+    });
+    expect(config.DefaultCacheBehavior?.TargetOriginId).not.toBe(apiOriginId);
+    expect(config.Origins).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ Id: config.DefaultCacheBehavior?.TargetOriginId }),
+        expect.objectContaining({
+          CustomOriginConfig: expect.objectContaining({ OriginProtocolPolicy: 'https-only' }),
+          Id: apiOriginId,
+        }),
+      ]),
+    );
+    expect(JSON.stringify(config.Origins)).toContain('HttpApi');
+    expect(JSON.stringify(config.DefaultCacheBehavior)).toContain('SpaRewrite');
+    for (const behavior of behaviors) {
+      expect(JSON.stringify(behavior)).toContain('ApiEdgeRequest');
+      expect(JSON.stringify(behavior)).not.toContain('SpaRewrite');
+    }
   });
 
   it('promotes only the validator-returned nine-file release root with retained explicit invalidation', async () => {
@@ -273,17 +502,13 @@ describe('Oracle product infrastructure', () => {
     }
   });
 
-  it('exposes only the committed API and MCP routes with allowlisted CORS and throttling', () => {
+  it('exposes only committed API and MCP routes while preflight terminates at CloudFront', () => {
     foundationTemplate.resourceCountIs('AWS::ApiGatewayV2::Api', 1);
     foundationTemplate.hasResourceProperties('AWS::ApiGatewayV2::Api', {
-      CorsConfiguration: {
-        AllowCredentials: false,
-        AllowHeaders: ['authorization', 'content-type', 'x-request-id'],
-        AllowMethods: ['GET', 'POST', 'OPTIONS'],
-        MaxAge: 600,
-      },
       ProtocolType: 'HTTP',
     });
+    const apis = foundationTemplate.findResources('AWS::ApiGatewayV2::Api');
+    expect(Object.values(apis)[0]?.Properties).not.toHaveProperty('CorsConfiguration');
 
     const routes = Object.values(foundationTemplate.findResources('AWS::ApiGatewayV2::Route'));
     expect(routes).toHaveLength(5);
@@ -305,6 +530,7 @@ describe('Oracle product infrastructure', () => {
           (route.Properties as { AuthorizationType?: string }).AuthorizationType === 'NONE',
       ),
     ).toBe(true);
+    expect(JSON.stringify(routes)).not.toContain('OPTIONS');
 
     foundationTemplate.hasResourceProperties('AWS::ApiGatewayV2::Stage', {
       AccessLogSettings: Match.objectLike({ DestinationArn: Match.anyValue() }),
@@ -316,6 +542,18 @@ describe('Oracle product infrastructure', () => {
 
     const encoded = JSON.stringify(foundationTemplate.toJSON());
     expect(encoded).not.toContain('"AllowOrigins":["*"]');
+    expect(encoded).not.toContain('CorsConfiguration');
+    const apiFunction = Object.values(
+      foundationTemplate.findResources('AWS::Lambda::Function'),
+    ).find((resource) => {
+      const variables = (resource.Properties as SynthesizedResource['Properties'])?.Environment
+        ?.Variables;
+      return variables?.POWERTOOLS_SERVICE_NAME === 'oracle-application-api';
+    });
+    const allowedOrigins = (apiFunction?.Properties as SynthesizedResource['Properties'])
+      ?.Environment?.Variables?.ORACLE_ALLOWED_ORIGINS;
+    expect(JSON.stringify(allowedOrigins)).toContain('WebDistribution');
+    expect(JSON.stringify(allowedOrigins)).not.toContain('*');
   });
 
   it('builds bounded observable Node 22 x86_64 Lambdas without reserved concurrency', () => {

@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import * as cdk from 'aws-cdk-lib';
@@ -25,6 +26,36 @@ const PROJECT = 'oracle-property-intelligence-platform';
 const REPOSITORY = 'oracle-property-intelligence-platform-pipeline-completion';
 const REPOSITORY_ROOT = resolve(import.meta.dirname, '../../../../');
 const CURSOR_SECRET_JSON_KEY = 'cursorHmacSecretBase64';
+const WEB_INDEX_PATH = resolve(REPOSITORY_ROOT, 'apps/web/dist/index.html');
+
+export const SAME_ORIGIN_APPLICATION_OPERATIONS = [
+  'dataset.getInfo',
+  'dataset.getCoverage',
+  'pipeline.listRuns',
+  'pipeline.getRun',
+  'property.search',
+  'property.get',
+  'property.getEvidence',
+  'inquiry.roofAge',
+  'inquiry.waterCandidates',
+  'inquiry.ownershipAge',
+  'inquiry.regionalOwner',
+  'inquiry.transitWalkability',
+  'inquiry.starbucksWalkability',
+  'inquiry.rankCandidates',
+  'artifacts.list',
+  'artifacts.getDataDictionary',
+  'agent.ask',
+  'agent.status',
+] as const;
+
+const SAME_ORIGIN_API_PATH_PATTERNS = [
+  'health',
+  'mcp',
+  'mcp/health',
+  'trpc/*',
+  ...SAME_ORIGIN_APPLICATION_OPERATIONS,
+] as const;
 
 export type BedrockPromotion = Readonly<{
   inferenceProfileArn: string;
@@ -72,6 +103,91 @@ export class OracleFoundationStack extends cdk.Stack {
       cdk.Duration.days(30),
     );
 
+    // Keep the API resource independent of the distribution. API integrations
+    // are attached after the distribution so the Lambda can receive the exact
+    // generated web origin without creating a CloudFormation API <->
+    // distribution dependency cycle. Browser preflight terminates at the edge.
+    const httpApi = new apigwv2.HttpApi(this, 'HttpApi', {
+      apiName: `${PROJECT}-api`,
+    });
+    const apiOrigin = new origins.HttpOrigin(
+      cdk.Fn.select(2, cdk.Fn.split('/', httpApi.apiEndpoint)),
+      { protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY },
+    );
+
+    const webIndexDocument = readFileSync(WEB_INDEX_PATH, 'utf8');
+    if (Buffer.byteLength(webIndexDocument, 'utf8') > 8 * 1024) {
+      throw new Error('The evaluator index exceeds the bounded CloudFront Function response.');
+    }
+
+    const apiEdgeRequest = new cloudfront.Function(this, 'ApiEdgeRequest', {
+      code: cloudfront.FunctionCode.fromInline(`function handler(event) {
+  var request = event.request;
+  if (request.method === 'OPTIONS') {
+    var headers = request.headers;
+    var host = headers.host && headers.host.value;
+    var origin = headers.origin && headers.origin.value;
+    var requestedMethod =
+      headers['access-control-request-method'] &&
+      headers['access-control-request-method'].value;
+    var requestedHeaders =
+      headers['access-control-request-headers'] &&
+      headers['access-control-request-headers'].value;
+    var allowedHeaders = ['authorization', 'content-type', 'x-request-id'];
+    var requested = requestedHeaders ? requestedHeaders.toLowerCase().split(',') : [];
+    var headersAllowed = true;
+    for (var h = 0; h < requested.length; h += 1) {
+      if (allowedHeaders.indexOf(requested[h].trim()) === -1) headersAllowed = false;
+    }
+    var securityHeaders = {
+      'referrer-policy': { value: 'strict-origin-when-cross-origin' },
+      'strict-transport-security': { value: 'max-age=31536000' },
+      'x-content-type-options': { value: 'nosniff' },
+      'x-frame-options': { value: 'SAMEORIGIN' },
+      'x-xss-protection': { value: '1; mode=block' }
+    };
+    if (!host || origin !== 'https://' + host || requestedMethod !== 'POST' || !headersAllowed) {
+      return {
+        statusCode: 403,
+        statusDescription: 'Forbidden',
+        headers: securityHeaders
+      };
+    }
+    securityHeaders['access-control-allow-origin'] = { value: origin };
+    securityHeaders['access-control-allow-methods'] = { value: 'GET,POST,OPTIONS' };
+    securityHeaders['access-control-allow-headers'] = {
+      value: 'authorization,content-type,x-request-id'
+    };
+    securityHeaders['access-control-max-age'] = { value: '600' };
+    securityHeaders.vary = { value: 'origin' };
+    return {
+      statusCode: 204,
+      statusDescription: 'No Content',
+      headers: securityHeaders
+    };
+  }
+  if (request.uri === '/mcp' && request.method === 'GET') {
+    return {
+      statusCode: 200,
+      statusDescription: 'OK',
+      headers: {
+        'cache-control': { value: 'no-store' },
+        'content-type': { value: 'text/html; charset=utf-8' },
+        'referrer-policy': { value: 'strict-origin-when-cross-origin' },
+        'strict-transport-security': { value: 'max-age=31536000' },
+        'x-content-type-options': { value: 'nosniff' },
+        'x-frame-options': { value: 'SAMEORIGIN' },
+        'x-xss-protection': { value: '1; mode=block' }
+      },
+      body: ${JSON.stringify(webIndexDocument)}
+    };
+  }
+  return request;
+}`),
+      comment: 'Resolve same-origin preflight and the GET /mcp route collision at the edge.',
+      runtime: cloudfront.FunctionRuntime.JS_2_0,
+    });
+
     const spaRewrite = new cloudfront.Function(this, 'SpaRewrite', {
       code: cloudfront.FunctionCode.fromInline(`function handler(event) {
   var request = event.request;
@@ -98,10 +214,25 @@ export class OracleFoundationStack extends cdk.Stack {
   request.uri = '/index.html';
   return request;
 }`),
-      comment: 'Rewrite only extensionless SPA deep links; preserve API, MCP, and asset misses.',
+      comment: 'Rewrite only extensionless evaluator SPA deep links.',
       runtime: cloudfront.FunctionRuntime.JS_2_0,
     });
+    const apiBehavior = this.apiCloudFrontBehavior(apiOrigin);
     const distribution = new cloudfront.Distribution(this, 'WebDistribution', {
+      additionalBehaviors: Object.fromEntries(
+        SAME_ORIGIN_API_PATH_PATTERNS.map((pathPattern) => [
+          pathPattern,
+          {
+            ...apiBehavior,
+            functionAssociations: [
+              {
+                eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+                function: apiEdgeRequest,
+              },
+            ],
+          },
+        ]),
+      ),
       defaultBehavior: this.cloudFrontBehavior(
         origins.S3BucketOrigin.withOriginAccessControl(webBucket),
         cloudfront.ResponseHeadersPolicy.SECURITY_HEADERS,
@@ -225,22 +356,6 @@ export class OracleFoundationStack extends cdk.Stack {
 
     this.grantBedrockInvoke(apiFunction, props.bedrockPromotion);
 
-    const httpApi = new apigwv2.HttpApi(this, 'HttpApi', {
-      apiName: `${PROJECT}-api`,
-      corsPreflight: {
-        allowCredentials: false,
-        allowHeaders: ['authorization', 'content-type', 'x-request-id'],
-        allowMethods: [
-          apigwv2.CorsHttpMethod.GET,
-          apigwv2.CorsHttpMethod.POST,
-          apigwv2.CorsHttpMethod.OPTIONS,
-        ],
-        allowOrigins: [webOrigin],
-        exposeHeaders: ['content-type', 'x-request-id'],
-        maxAge: cdk.Duration.minutes(10),
-      },
-    });
-
     const apiIntegration = new integrations.HttpLambdaIntegration('ApiIntegration', apiFunction);
     const mcpIntegration = new integrations.HttpLambdaIntegration('McpIntegration', mcpFunction);
 
@@ -335,6 +450,18 @@ export class OracleFoundationStack extends cdk.Stack {
       cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
       responseHeadersPolicy,
       functionAssociations,
+    };
+  }
+
+  private apiCloudFrontBehavior(origin: cloudfront.IOrigin): cloudfront.BehaviorOptions {
+    return {
+      origin,
+      viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+      compress: false,
+      allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+      cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+      originRequestPolicy: cloudfront.OriginRequestPolicy.ALL_VIEWER_EXCEPT_HOST_HEADER,
+      responseHeadersPolicy: cloudfront.ResponseHeadersPolicy.SECURITY_HEADERS,
     };
   }
 
