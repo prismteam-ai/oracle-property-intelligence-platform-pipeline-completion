@@ -222,12 +222,11 @@ function canonicalInput(
       input = defined({ releaseId, runId: parameters.runId });
       break;
     case 'search_properties': {
-      const sort = parameters.sort;
-      if (sort !== undefined && sort !== 'property_id') throw new ApiFailure('INVALID_REQUEST');
       input = defined({
         releaseId,
         ...filters(),
-        parcelIdentifier: parameters.query,
+        query: parameters.query,
+        sort: parameters.sort,
       });
       break;
     }

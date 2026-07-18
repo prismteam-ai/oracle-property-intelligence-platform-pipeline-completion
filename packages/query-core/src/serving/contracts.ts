@@ -100,13 +100,35 @@ export interface ProductionServingService {
 const release = ['releaseId'] as const;
 const page = ['limit', 'cursor'] as const;
 const filters = ['city', 'postalCode', 'propertyId'] as const;
+const propertySearchSharedFields = [...release, ...filters, 'parcelIdentifier', ...page] as const;
+
+export const PROPERTY_SEARCH_SORTS = Object.freeze([
+  'property_id',
+  'address',
+  'parcel_identifier',
+] as const);
+export type PropertySearchSort = (typeof PROPERTY_SEARCH_SORTS)[number];
+
+export const REGIONAL_OWNER_POLICY_ID = 'bay-area-nine-counties-v1';
+
+/**
+ * API/query-core opt-in fields layered over the stable shared/MCP property-search contract.
+ * Transports must select this list explicitly rather than widening the shared operation map.
+ */
+export const PROPERTY_SEARCH_EXTENDED_INPUT_FIELDS = Object.freeze([
+  ...propertySearchSharedFields,
+  'query',
+  'sort',
+] as const);
+export type PropertySearchExtendedInputField =
+  (typeof PROPERTY_SEARCH_EXTENDED_INPUT_FIELDS)[number];
 
 export const PRODUCTION_SERVING_INPUT_FIELDS = Object.freeze({
   get_dataset_info: Object.freeze([]),
   get_dataset_coverage: Object.freeze([...release]),
   list_pipeline_runs: Object.freeze([...release, ...page]),
   get_pipeline_run: Object.freeze([...release, 'runId']),
-  search_properties: Object.freeze([...release, ...filters, 'parcelIdentifier', ...page]),
+  search_properties: Object.freeze([...propertySearchSharedFields]),
   get_property: Object.freeze([...release, 'propertyId']),
   get_property_evidence: Object.freeze([...release, 'propertyId', 'feature', ...page]),
   find_roof_age_candidates: Object.freeze([

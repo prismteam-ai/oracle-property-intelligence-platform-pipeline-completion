@@ -24,6 +24,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import type { InquiryReleaseContext } from '../inquiries/contracts.js';
 import {
+  PROPERTY_SEARCH_EXTENDED_INPUT_FIELDS,
   PRODUCTION_SERVING_INPUT_FIELDS,
   ProductionServingError,
   type ProductionServingConfig,
@@ -37,6 +38,9 @@ const RUN_ID = 'run-production-v1';
 const SOURCE_ID = 'source-santa-clara';
 const PROPERTY_A = 'sc:property:a';
 const PROPERTY_B = 'sc:property:b';
+const PROPERTY_C = 'sc:property:c';
+const PROPERTY_D = 'sc:property:d';
+const PROPERTY_E = 'sc:property:e';
 const CURSOR_SECRET = new Uint8Array(32).fill(7);
 const roots: string[] = [];
 
@@ -50,6 +54,20 @@ describe('production serving composition', () => {
     const inputs = minimumInputs();
     const operations = namedQueryNameSchema.options;
     expect(Object.keys(PRODUCTION_SERVING_INPUT_FIELDS).sort()).toEqual([...operations].sort());
+    expect(PRODUCTION_SERVING_INPUT_FIELDS.search_properties).toEqual([
+      'releaseId',
+      'city',
+      'postalCode',
+      'propertyId',
+      'parcelIdentifier',
+      'limit',
+      'cursor',
+    ]);
+    expect(PROPERTY_SEARCH_EXTENDED_INPUT_FIELDS).toEqual([
+      ...PRODUCTION_SERVING_INPUT_FIELDS.search_properties,
+      'query',
+      'sort',
+    ]);
     const results = await Promise.all(
       operations.map((operation) => service.execute({ operation, input: inputs[operation] })),
     );
@@ -61,7 +79,7 @@ describe('production serving composition', () => {
       results.every(({ limitations }) => limitations.includes('Public fixture release.')),
     ).toBe(true);
     const info = results[operations.indexOf('get_dataset_info')];
-    expect(info?.data).toMatchObject({ propertyCount: 2, sourceCount: 1, artifactCount: 7 });
+    expect(info?.data).toMatchObject({ propertyCount: 5, sourceCount: 1, artifactCount: 7 });
     const property = results[operations.indexOf('get_property')];
     expect(property?.data).toMatchObject({ property: { property_id: PROPERTY_A } });
     const artifacts = results[operations.indexOf('list_artifacts')];
@@ -121,7 +139,7 @@ describe('production serving composition', () => {
       service.validateCursor({
         operation: 'search_properties',
         releaseId: RELEASE_ID,
-        cursor: `${cursor.slice(0, -1)}x`,
+        cursor: tamperCursor(cursor),
       }),
     ).toThrow(ProductionServingError);
     expect(() =>
@@ -131,6 +149,154 @@ describe('production serving composition', () => {
         cursor: 'a'.repeat(513),
       }),
     ).toThrow(ProductionServingError);
+  }, 15_000);
+
+  it('searches exact property/APN and contained address evidence with fixed deterministic sort plans', async () => {
+    const { service } = await fixture();
+
+    await expect(
+      service.execute({
+        operation: 'search_properties',
+        input: { releaseId: RELEASE_ID, query: 'hAmIlToN' },
+      }),
+    ).resolves.toMatchObject({
+      data: {
+        properties: [
+          { property_id: PROPERTY_A },
+          { property_id: PROPERTY_B },
+          { property_id: PROPERTY_D },
+        ],
+      },
+    });
+    await expect(
+      service.execute({
+        operation: 'search_properties',
+        input: { releaseId: RELEASE_ID, query: PROPERTY_E },
+      }),
+    ).resolves.toMatchObject({ data: { properties: [{ property_id: PROPERTY_E }] } });
+    await expect(
+      service.execute({
+        operation: 'search_properties',
+        input: { releaseId: RELEASE_ID, query: '002' },
+      }),
+    ).resolves.toMatchObject({
+      data: { properties: [{ property_id: PROPERTY_B }, { property_id: PROPERTY_D }] },
+    });
+    await expect(
+      service.execute({
+        operation: 'search_properties',
+        input: { releaseId: RELEASE_ID, parcelIdentifier: '002' },
+      }),
+    ).resolves.toMatchObject({
+      data: { properties: [{ property_id: PROPERTY_B }, { property_id: PROPERTY_D }] },
+    });
+
+    await expect(searchAll(service, 'property_id')).resolves.toEqual([
+      PROPERTY_A,
+      PROPERTY_B,
+      PROPERTY_C,
+      PROPERTY_D,
+      PROPERTY_E,
+    ]);
+    await expect(searchAll(service, 'address')).resolves.toEqual([
+      PROPERTY_C,
+      PROPERTY_A,
+      PROPERTY_B,
+      PROPERTY_D,
+      PROPERTY_E,
+    ]);
+    await expect(searchAll(service, 'parcel_identifier')).resolves.toEqual([
+      PROPERTY_C,
+      PROPERTY_A,
+      PROPERTY_B,
+      PROPERTY_D,
+      PROPERTY_E,
+    ]);
+  }, 15_000);
+
+  it('binds search cursors to query, sort, filters, limit, release, and the selected keyset', async () => {
+    const { service } = await fixture();
+    const first = await service.execute({
+      operation: 'search_properties',
+      input: {
+        releaseId: RELEASE_ID,
+        query: 'Hamilton',
+        city: 'Palo Alto',
+        sort: 'address',
+        limit: 1,
+      },
+    });
+    expect(first.nextCursor).not.toBeNull();
+    if (first.nextCursor === null) throw new Error('Expected search cursor.');
+    const cursor = first.nextCursor;
+    const rebound = [
+      { query: 'Hamilton', city: 'Palo Alto', sort: 'parcel_identifier', limit: 1 },
+      { query: 'University', city: 'Palo Alto', sort: 'address', limit: 1 },
+      { query: 'Hamilton', city: 'San Jose', sort: 'address', limit: 1 },
+      { query: 'Hamilton', city: 'Palo Alto', sort: 'address', limit: 2 },
+    ] as const;
+    for (const changed of rebound) {
+      await expect(
+        service.execute({
+          operation: 'search_properties',
+          input: { releaseId: RELEASE_ID, ...changed, cursor },
+        }),
+      ).rejects.toMatchObject({ code: 'STALE_OR_TAMPERED_CURSOR' });
+    }
+    await expect(
+      service.execute({
+        operation: 'search_properties',
+        input: { releaseId: 'another-release', ...rebound[0], cursor },
+      }),
+    ).rejects.toMatchObject({ code: 'RELEASE_MISMATCH' });
+  }, 15_000);
+
+  it('treats injection and wildcard syntax literally and enforces normalized UTF-8 query bounds', async () => {
+    const { service } = await fixture();
+    for (const query of ["%_' OR 1=1 --", '%%%']) {
+      await expect(
+        service.execute({
+          operation: 'search_properties',
+          input: { releaseId: RELEASE_ID, query },
+        }),
+      ).resolves.toMatchObject({ data: { properties: [] } });
+    }
+    for (const query of ['ab', 'a'.repeat(201), 'é'.repeat(101), 'Hamilton\nAve']) {
+      await expect(
+        service.execute({
+          operation: 'search_properties',
+          input: { releaseId: RELEASE_ID, query },
+        }),
+      ).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
+    }
+  });
+
+  it('keeps global publication policy and regional-owner inquiry policy independent', async () => {
+    const { service } = await fixture();
+    const result = await service.execute({
+      operation: 'find_regional_owner_properties',
+      input: {
+        releaseId: RELEASE_ID,
+        propertyId: PROPERTY_A,
+        regionPolicyId: 'bay-area-nine-counties-v1',
+      },
+    });
+    expect(result.data).toMatchObject({
+      query: {
+        policyVersion: 'owner-free-public-serving@1.0.0',
+        parameters: { regionPolicyId: 'bay-area-nine-counties-v1' },
+      },
+      results: [{ propertyId: PROPERTY_A }],
+    });
+    await expect(
+      service.execute({
+        operation: 'find_regional_owner_properties',
+        input: {
+          releaseId: RELEASE_ID,
+          regionPolicyId: 'owner-free-public-serving@1.0.0',
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'RELEASE_MISMATCH' });
   }, 15_000);
 
   it('serves a public-only package without requiring restricted release bytes', async () => {
@@ -244,7 +410,7 @@ async function fixture(): Promise<
       manifestCid: 'bafy-production-manifest',
       asOf: INSTANT,
       schemaVersion: '1.0.0',
-      policyVersion: 'bay-area-nine-counties-v1',
+      policyVersion: 'owner-free-public-serving@1.0.0',
     },
     cursorSecret: CURSOR_SECRET,
     rankingWeights: rankingWeights(),
@@ -265,14 +431,32 @@ function buildInput(outputDirectory: string): PortableServingBuildInput {
       {
         visibility: 'public',
         relations: {
-          property_query: [property(PROPERTY_B, false), property(PROPERTY_A, true)],
+          property_query: [
+            property(PROPERTY_E, false, {
+              parcelIdentifier: '100',
+              addressStreet: '99 University Ave',
+            }),
+            property(PROPERTY_B, false, {
+              parcelIdentifier: '002',
+              addressStreet: '10 Hamilton Ave',
+            }),
+            property(PROPERTY_C, false, { parcelIdentifier: '000', addressStreet: null }),
+            property(PROPERTY_A, true, {
+              parcelIdentifier: '001',
+              addressStreet: '10 Hamilton Ave',
+            }),
+            property(PROPERTY_D, false, {
+              parcelIdentifier: '002',
+              addressStreet: '20 Hamilton Avenue',
+            }),
+          ],
           property_evidence: evidenceRows(),
           source_coverage: [
             relationRow('source_coverage', {
               source_id: SOURCE_ID,
               scope: 'county',
-              expected_count: 2,
-              observed_count: 2,
+              expected_count: 5,
+              observed_count: 5,
               quarantine_count: 0,
               limitations_json: '["Coverage fixture only."]',
             }),
@@ -281,8 +465,8 @@ function buildInput(outputDirectory: string): PortableServingBuildInput {
             relationRow('field_coverage', {
               relation_name: 'property_query',
               field_name: 'property_id',
-              numerator: 2,
-              denominator: 2,
+              numerator: 5,
+              denominator: 5,
               ratio: 1,
               source_ids_json: `["${SOURCE_ID}"]`,
               limitations_json: '[]',
@@ -316,11 +500,21 @@ function buildInput(outputDirectory: string): PortableServingBuildInput {
   };
 }
 
-function property(propertyId: string, supported: boolean): ServingRow {
+function property(
+  propertyId: string,
+  supported: boolean,
+  search: Readonly<{ parcelIdentifier?: string | null; addressStreet?: string | null }> = {},
+): ServingRow {
   return relationRow('property_query', {
     property_id: propertyId,
-    parcel_identifier: supported ? '001' : '002',
-    address_street: supported ? '1 University Ave' : '2 University Ave',
+    parcel_identifier:
+      search.parcelIdentifier === undefined ? (supported ? '001' : '002') : search.parcelIdentifier,
+    address_street:
+      search.addressStreet === undefined
+        ? supported
+          ? '1 University Ave'
+          : '2 University Ave'
+        : search.addressStreet,
     address_city: 'Palo Alto',
     address_zip: '94301',
     roof_support_class: supported ? 'supported' : 'unknown',
@@ -471,7 +665,7 @@ function capabilities(): InquiryReleaseContext['capabilities'] {
     state: 'supported',
     supportClasses: ['supported', 'proxy', 'unknown', 'unsupported'],
     numerator: 1,
-    denominator: 2,
+    denominator: 5,
     limitations: ['Public fixture release.'],
   } as const;
   return {
@@ -507,6 +701,36 @@ function minimumInputs(): Readonly<Record<NamedQueryName, Readonly<Record<string
     list_artifacts: { releaseId: RELEASE_ID },
     get_data_dictionary: { releaseId: RELEASE_ID },
   };
+}
+
+async function searchAll(
+  service: ProductionServingService,
+  sort: 'property_id' | 'address' | 'parcel_identifier',
+): Promise<readonly string[]> {
+  const propertyIds: string[] = [];
+  let cursor: string | null = null;
+  do {
+    const response = await service.execute({
+      operation: 'search_properties',
+      input: {
+        releaseId: RELEASE_ID,
+        sort,
+        limit: 2,
+        ...(cursor === null ? {} : { cursor }),
+      },
+    });
+    const data = response.data as Readonly<{
+      properties: readonly Readonly<{ property_id: string }>[];
+    }>;
+    propertyIds.push(...data.properties.map(({ property_id }) => property_id));
+    cursor = response.nextCursor;
+  } while (cursor !== null);
+  return Object.freeze(propertyIds);
+}
+
+function tamperCursor(cursor: string): string {
+  const index = Math.floor(cursor.length / 2);
+  return `${cursor.slice(0, index)}${cursor[index] === 'a' ? 'b' : 'a'}${cursor.slice(index + 1)}`;
 }
 
 function stableJson(value: unknown): string {

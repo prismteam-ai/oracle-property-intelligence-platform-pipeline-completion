@@ -134,7 +134,7 @@ const inquiries = [
         key: 'maximumSnapDistanceMeters',
         label: 'Maximum snap distance (m)',
         type: 'number',
-        value: '150',
+        value: '200',
       },
       { key: 'includeProxy', label: 'Include straight-line proxies', type: 'checkbox' },
     ],
@@ -158,7 +158,7 @@ const inquiries = [
         key: 'minimumValidationConfidence',
         label: 'Minimum place confidence',
         type: 'number',
-        value: '0.8',
+        value: '0.7',
         step: '0.1',
       },
       { key: 'includeProxy', label: 'Include straight-line proxies', type: 'checkbox' },
@@ -1012,9 +1012,9 @@ export function DictionaryPage() {
                     caption="Release-bound data dictionary"
                     rows={rowsFromData(data.data)}
                     columns={[
-                      { label: 'Entity', keys: ['entity', 'table'] },
-                      { label: 'Field', keys: ['field', 'name'] },
-                      { label: 'Type', keys: ['type', 'dataType'] },
+                      { label: 'Entity', keys: ['relation_name', 'entity', 'table'] },
+                      { label: 'Field', keys: ['column_name', 'field', 'name'] },
+                      { label: 'Type', keys: ['duckdb_type', 'type', 'dataType'] },
                       { label: 'Definition', keys: ['description', 'definition'] },
                       { label: 'Publication', keys: ['publicationClass', 'visibility'] },
                     ]}

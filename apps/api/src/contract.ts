@@ -108,6 +108,28 @@ function requiredString(
   return candidate;
 }
 
+function optionalSearchQuery(value: Readonly<Record<string, unknown>>): string | undefined {
+  const candidate = value.query;
+  if (candidate === undefined) return undefined;
+  if (typeof candidate !== 'string') {
+    throw new InputContractError('query must be a string containing 3 to 200 UTF-8 bytes.');
+  }
+  const normalized = candidate.trim();
+  const bytes = Buffer.byteLength(normalized, 'utf8');
+  if (bytes < 3 || bytes > 200 || containsControlCharacter(normalized)) {
+    throw new InputContractError('query must be a string containing 3 to 200 UTF-8 bytes.');
+  }
+  return normalized;
+}
+
+function containsControlCharacter(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code <= 31 || (code >= 127 && code <= 159)) return true;
+  }
+  return false;
+}
+
 function optionalBoolean(
   value: Readonly<Record<string, unknown>>,
   key: string,
@@ -281,7 +303,7 @@ export function parseApplicationRequest(
       return parsed(value, { runId: requiredString(value, 'runId', 256) });
     case 'property.search': {
       exact(value, [...releaseKeys, ...pageKeys, ...filterKeys, 'query', 'sort']);
-      const query = optionalString(value, 'query', 200);
+      const query = optionalSearchQuery(value);
       const sort = optionalEnum(value, 'sort', [
         'property_id',
         'address',

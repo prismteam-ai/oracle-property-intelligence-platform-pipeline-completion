@@ -19,7 +19,11 @@ import type {
 } from '../inquiries/contracts.js';
 import { NamedInquiryExecutor } from '../inquiries/executor.js';
 import {
+  PROPERTY_SEARCH_EXTENDED_INPUT_FIELDS,
+  PROPERTY_SEARCH_SORTS,
+  REGIONAL_OWNER_POLICY_ID,
   ProductionServingError,
+  type PropertySearchSort,
   type ProductionServingConfig,
   type ProductionServingEnvelope,
   type ProductionServingRelease,
@@ -27,7 +31,7 @@ import {
   type ProductionServingService,
 } from './contracts.js';
 import { ProductionCursorCodec } from './cursor.js';
-import { fixedGeneralQuery, SERVING_PAGE_SIZE_MAXIMUM } from './plans.js';
+import { fixedGeneralQuery, SERVING_PAGE_SIZE_MAXIMUM, type GeneralPlanName } from './plans.js';
 import { loadProductionRelease, type LoadedProductionRelease } from './release.js';
 
 const RESPONSE_BYTES_MAXIMUM = 1024 * 1024;
@@ -41,6 +45,11 @@ const featureNames = Object.freeze([
   'starbucks_walkability',
   'combined_review_score',
 ] as const);
+const propertySearchPlanBySort = Object.freeze({
+  property_id: 'search_properties_by_property_id',
+  address: 'search_properties_by_address',
+  parcel_identifier: 'search_properties_by_parcel_identifier',
+} as const satisfies Readonly<Record<PropertySearchSort, GeneralPlanName>>);
 
 export async function createProductionServingService(
   config: ProductionServingConfig,
@@ -340,24 +349,19 @@ class VerifiedProductionServingService implements ProductionServingService {
     session: AnalyticalSession,
     signal?: AbortSignal,
   ): Promise<ProductionServingEnvelope> {
-    exactKeys(input, [
-      'releaseId',
-      'city',
-      'postalCode',
-      'propertyId',
-      'parcelIdentifier',
-      'limit',
-      'cursor',
-    ]);
+    exactKeys(input, PROPERTY_SEARCH_EXTENDED_INPUT_FIELDS);
     const page = pageInput(input);
     const normalized = {
       city: optionalText(input.city, 'city', 100),
       postalCode: optionalText(input.postalCode, 'postalCode', 20),
       propertyId: optionalText(input.propertyId, 'propertyId', 256),
       parcelIdentifier: optionalText(input.parcelIdentifier, 'parcelIdentifier', 64),
+      query: optionalSearchQuery(input.query),
+      sort: optionalEnum(input.sort, 'sort', PROPERTY_SEARCH_SORTS) ?? 'property_id',
       limit: page.limit,
     };
     const fingerprint = this.#cursor.fingerprint(normalized);
+    let afterSortValue: string | null = null;
     let afterPropertyId: string | null = null;
     if (page.cursor !== null) {
       const keys = this.#cursor.decode(page.cursor, {
@@ -365,24 +369,46 @@ class VerifiedProductionServingService implements ProductionServingService {
         releaseId: this.release.releaseId,
         queryFingerprint: fingerprint,
       });
-      if (keys.length !== 1 || typeof keys[0] !== 'string') {
+      const validPropertyIdCursor =
+        normalized.sort === 'property_id' && keys.length === 1 && typeof keys[0] === 'string';
+      const validCompositeCursor =
+        normalized.sort !== 'property_id' &&
+        keys.length === 2 &&
+        typeof keys[0] === 'string' &&
+        typeof keys[1] === 'string';
+      if (!validPropertyIdCursor && !validCompositeCursor) {
         throw new ProductionServingError('STALE_OR_TAMPERED_CURSOR', 'Invalid property cursor.');
       }
-      [afterPropertyId] = keys;
+      if (normalized.sort === 'property_id') {
+        afterPropertyId = keys[0] as string;
+      } else {
+        afterSortValue = keys[0] as string;
+        afterPropertyId = keys[1] as string;
+      }
     }
+    const commonParameters = [
+      normalized.city,
+      normalized.city,
+      normalized.postalCode,
+      normalized.postalCode,
+      normalized.propertyId,
+      normalized.propertyId,
+      normalized.parcelIdentifier,
+      normalized.parcelIdentifier,
+      normalized.query,
+      normalized.query,
+      normalized.query,
+      normalized.query,
+    ] as const;
+    const keysetParameters =
+      normalized.sort === 'property_id'
+        ? [afterPropertyId, afterPropertyId]
+        : [afterSortValue, afterSortValue, afterSortValue, afterPropertyId];
     const result = await session.execute(
       withSignal(
-        fixedGeneralQuery('search_properties', [
-          normalized.city,
-          normalized.city,
-          normalized.postalCode,
-          normalized.postalCode,
-          normalized.propertyId,
-          normalized.propertyId,
-          normalized.parcelIdentifier,
-          normalized.parcelIdentifier,
-          afterPropertyId,
-          afterPropertyId,
+        fixedGeneralQuery(propertySearchPlanBySort[normalized.sort], [
+          ...commonParameters,
+          ...keysetParameters,
           page.limit + 1,
         ]),
         signal,
@@ -401,7 +427,18 @@ class VerifiedProductionServingService implements ProductionServingService {
               operation: 'search_properties',
               releaseId: this.release.releaseId,
               queryFingerprint: fingerprint,
-              keys: [requiredText(last.property_id, 'property_id')],
+              keys:
+                normalized.sort === 'property_id'
+                  ? [requiredText(last.property_id, 'property_id')]
+                  : [
+                      coalescedText(
+                        normalized.sort === 'address'
+                          ? last.address_street
+                          : last.parcel_identifier,
+                        normalized.sort,
+                      ),
+                      requiredText(last.property_id, 'property_id'),
+                    ],
             })
           : null,
       truncated: hasMore || result.truncated,
@@ -651,10 +688,20 @@ class VerifiedProductionServingService implements ProductionServingService {
       default:
         throw new ProductionServingError('INVALID_REQUEST', 'Operation is not an inquiry.');
     }
+    const query =
+      operation === 'find_regional_owner_properties'
+        ? Object.freeze({
+            ...response.query,
+            parameters: Object.freeze({
+              ...response.query.parameters,
+              regionPolicyId: REGIONAL_OWNER_POLICY_ID,
+            }),
+          })
+        : response.query;
     return this.#envelope({
       coverage: { [response.query.name]: response.capability },
       data: {
-        query: response.query,
+        query,
         capability: response.capability,
         results: response.results,
         resultCount: response.resultCount,
@@ -780,11 +827,11 @@ class VerifiedProductionServingService implements ProductionServingService {
       'cursor',
     ]);
     const policy =
-      optionalText(input.regionPolicyId, 'regionPolicyId', 256) ?? this.release.policyVersion;
-    if (policy !== this.release.policyVersion) {
+      optionalText(input.regionPolicyId, 'regionPolicyId', 256) ?? REGIONAL_OWNER_POLICY_ID;
+    if (policy !== REGIONAL_OWNER_POLICY_ID) {
       throw new ProductionServingError(
         'RELEASE_MISMATCH',
-        'Region policy differs from the release.',
+        'Region policy differs from the immutable inquiry policy.',
       );
     }
     if (input.requireCurrentOwner !== undefined && input.requireCurrentOwner !== true) {
@@ -973,6 +1020,15 @@ function optionalText(value: unknown, label: string, maximum: number): string | 
   return boundedText(value, label, maximum);
 }
 
+function optionalSearchQuery(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  const normalized = boundedText(value, 'query', 200);
+  if (Buffer.byteLength(normalized, 'utf8') < 3) {
+    throw new ProductionServingError('INVALID_REQUEST', 'query is outside its allowed bounds.');
+  }
+  return normalized;
+}
+
 function boundedText(value: unknown, label: string, maximum: number): string {
   if (typeof value !== 'string') {
     throw new ProductionServingError('INVALID_REQUEST', `${label} must be a string.`);
@@ -996,13 +1052,19 @@ function nullableText(value: unknown, label: string): string | null {
 function containsControlCharacter(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
-    if (code <= 31 || code === 127) return true;
+    if (code <= 31 || (code >= 127 && code <= 159)) return true;
   }
   return false;
 }
 
 function requiredText(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.length === 0) throw releaseInvalid(`${label} is invalid.`);
+  return value;
+}
+
+function coalescedText(value: unknown, label: string): string {
+  if (value === null) return '';
+  if (typeof value !== 'string') throw releaseInvalid(`${label} sort key is invalid.`);
   return value;
 }
 

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import { userEvent } from '@testing-library/user-event';
 import { axe } from 'vitest-axe';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -23,6 +23,26 @@ function renderRoute(route: string, client: ApiClient = createTestOnlyFixtureCli
       <App client={client} testFixtureLabel={TEST_ONLY_FIXTURE_LABEL} />
     </MemoryRouter>,
   );
+}
+
+type ResponseOverride = (
+  operation: ApplicationOperation,
+  input: Readonly<Record<string, unknown>>,
+  fixtureEnvelope: ApiEnvelope,
+) => ApiEnvelope | null | Promise<ApiEnvelope | null>;
+
+function createOverrideClient(override: ResponseOverride): ApiClient {
+  const fixtureClient = createTestOnlyFixtureClient();
+  return Object.freeze({
+    async execute(
+      operation: ApplicationOperation,
+      input: Readonly<Record<string, unknown>>,
+      signal?: AbortSignal,
+    ) {
+      const fixtureEnvelope = await fixtureClient.execute(operation, input, signal);
+      return (await override(operation, input, fixtureEnvelope)) ?? fixtureEnvelope;
+    },
+  });
 }
 
 describe('Oracle evaluator routes', () => {
@@ -277,6 +297,204 @@ describe('Oracle evaluator routes', () => {
     expect(
       screen.getByRole('checkbox', { name: 'Include clearly labeled proxy candidates' }),
     ).toHaveProperty('checked', true);
+  });
+
+  it('sends the frozen property search contract and renders an honest empty capability receipt', async () => {
+    let propertyInput: Readonly<Record<string, unknown>> | null = null;
+    const client = createOverrideClient((operation, input, envelope) => {
+      if (operation !== 'property.search') return null;
+      propertyInput = input;
+      return {
+        ...envelope,
+        limitations: ['Pilot release contains no qualifying Hamilton address evidence.'],
+        coverage: {
+          roof_age: {
+            state: 'partial',
+            supportClasses: ['unknown'],
+            numerator: 0,
+            denominator: 19,
+            limitations: ['Address coverage is incomplete for this release.'],
+          },
+        },
+        data: {
+          properties: [],
+          resultCount: 0,
+        },
+      };
+    });
+
+    renderRoute('/properties?q=Hamilton', client);
+    expect(
+      await screen.findByRole('heading', { level: 2, name: 'No verified records returned' }),
+    ).toBeTruthy();
+    const capability = screen.getByRole('region', { name: 'Returned capability' });
+    expect(within(capability).getByRole('heading', { name: 'roof age capability' })).toBeTruthy();
+    expect(within(capability).getByText('partial')).toBeTruthy();
+    expect(within(capability).getByText('unknown')).toBeTruthy();
+    expect(
+      within(capability).getByText('Address coverage is incomplete for this release.'),
+    ).toBeTruthy();
+    expect(
+      screen.getByText('Pilot release contains no qualifying Hamilton address evidence.'),
+    ).toBeTruthy();
+    expect(screen.queryByRole('link', { name: /Hamilton/u })).toBeNull();
+    await waitFor(() =>
+      expect(propertyInput).toEqual({
+        releaseId: TEST_ONLY_RELEASE_ID,
+        limit: 25,
+        sort: 'address',
+        query: 'Hamilton',
+      }),
+    );
+  });
+
+  it('renders the returned unsupported inquiry capability and both limitation layers', async () => {
+    const client = createOverrideClient((operation, _input, envelope) => {
+      if (operation !== 'inquiry.ownershipAge') return null;
+      return {
+        ...envelope,
+        limitations: ['Redistributable ownership history is unavailable in this release.'],
+        data: {
+          capability: {
+            state: 'blocked',
+            supportClasses: ['unsupported'],
+            numerator: 0,
+            denominator: 19,
+            limitations: ['Ownership-source coverage cannot establish tenure.'],
+          },
+          results: [],
+          resultCount: 0,
+        },
+      };
+    });
+
+    renderRoute('/inquiries/ownership-age', client);
+    const capability = await screen.findByRole('region', { name: 'Returned capability' });
+    expect(within(capability).getByText('blocked')).toBeTruthy();
+    expect(within(capability).getByText('unsupported')).toBeTruthy();
+    expect(
+      within(capability).getByText('Ownership-source coverage cannot establish tenure.'),
+    ).toBeTruthy();
+    expect(
+      screen.getByText('Redistributable ownership history is unavailable in this release.'),
+    ).toBeTruthy();
+  });
+
+  it('uses release-qualified transit and Starbucks constraints', async () => {
+    const inputs = new Map<ApplicationOperation, Readonly<Record<string, unknown>>>();
+    const client = createOverrideClient((operation, input) => {
+      inputs.set(operation, input);
+      return null;
+    });
+
+    renderRoute('/inquiries/transit-walkability', client);
+    await waitFor(() =>
+      expect(inputs.get('inquiry.transitWalkability')).toEqual({
+        releaseId: TEST_ONLY_RELEASE_ID,
+        limit: 25,
+        maximumNetworkDistanceMeters: 800,
+        maximumSnapDistanceMeters: 200,
+        includeProxy: false,
+      }),
+    );
+    expect(screen.getByRole('spinbutton', { name: 'Maximum snap distance (m)' })).toHaveProperty(
+      'value',
+      '200',
+    );
+
+    cleanup();
+    renderRoute('/inquiries/starbucks-walkability', client);
+    await waitFor(() =>
+      expect(inputs.get('inquiry.starbucksWalkability')).toEqual({
+        releaseId: TEST_ONLY_RELEASE_ID,
+        limit: 25,
+        maximumNetworkDistanceMeters: 800,
+        minimumValidationConfidence: 0.7,
+        includeProxy: false,
+      }),
+    );
+    expect(screen.getByRole('spinbutton', { name: 'Minimum place confidence' })).toHaveProperty(
+      'value',
+      '0.7',
+    );
+  });
+
+  it('renders returned ranking component fields and contribution values', async () => {
+    const client = createOverrideClient((operation, _input, envelope) => {
+      if (operation !== 'inquiry.rankCandidates') return null;
+      return {
+        ...envelope,
+        data: {
+          results: [
+            {
+              propertyId: 'TEST-RANKED-001',
+              address: '1 Ranked Fixture Way',
+              supportClass: 'supported',
+              evidence: [],
+              value: {
+                rank: 1,
+                score: 0.8,
+                evidenceCoverage: 1,
+                components: [
+                  {
+                    criterion: 'roof_age',
+                    supportClass: 'proxy',
+                    normalizedValue: 0.4,
+                    weight: 2,
+                    proxyMultiplier: 0.5,
+                    contribution: 0.8,
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      };
+    });
+
+    renderRoute('/rankings', client);
+    const componentTable = await screen.findByRole('table', {
+      name: 'Ranking components for TEST-RANKED-001',
+    });
+    expect(within(componentTable).getByRole('columnheader', { name: 'Contribution' })).toBeTruthy();
+    expect(within(componentTable).getByText('roof_age')).toBeTruthy();
+    expect(within(componentTable).getByText('0.8')).toBeTruthy();
+  });
+
+  it('renders snake_case dictionary fields while retaining supported aliases', async () => {
+    const client = createOverrideClient((operation, _input, envelope) => {
+      if (operation !== 'artifacts.getDataDictionary') return null;
+      return {
+        ...envelope,
+        data: {
+          fields: [
+            {
+              relation_name: 'property_query',
+              column_name: 'parcel_identifier',
+              duckdb_type: 'VARCHAR',
+              definition: 'Canonical parcel identifier.',
+              visibility: 'public',
+            },
+            {
+              entity: 'property_evidence',
+              field: 'evidence_id',
+              type: 'string',
+              description: 'Supported compatibility aliases.',
+              publicationClass: 'public',
+            },
+          ],
+        },
+      };
+    });
+
+    renderRoute('/dictionary', client);
+    const table = await screen.findByRole('table', { name: 'Release-bound data dictionary' });
+    expect(within(table).getByText('property_query')).toBeTruthy();
+    expect(within(table).getByText('parcel_identifier')).toBeTruthy();
+    expect(within(table).getByText('VARCHAR')).toBeTruthy();
+    expect(within(table).getByText('property_evidence')).toBeTruthy();
+    expect(within(table).getByText('evidence_id')).toBeTruthy();
+    expect(within(table).getByText('string')).toBeTruthy();
   });
 
   it('shows a model-unavailable state and then a cited tool trace', async () => {

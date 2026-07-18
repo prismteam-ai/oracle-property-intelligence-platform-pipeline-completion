@@ -9,6 +9,7 @@ import {
   type ProductionServingConfig,
   type ProductionServingService,
 } from '@oracle/query-core/serving/index';
+import { PROPERTY_SEARCH_EXTENDED_INPUT_FIELDS } from '@oracle/query-core/serving/contracts';
 import { describe, expect, it } from 'vitest';
 
 import { createProductionApiHandler } from './handler.js';
@@ -20,7 +21,7 @@ const expected = Object.freeze({
   manifestCid: 'bafybeiverifiedmanifest',
   asOf: '2026-07-17T00:00:00.000Z',
   schemaVersion: '1.0.0',
-  policyVersion: 'bay-area-nine-counties-v1',
+  policyVersion: 'owner-free-public-serving@1.0.0',
 });
 
 const criteria = [
@@ -210,7 +211,12 @@ describe('production API composition', () => {
         'get_pipeline_run',
         { releaseId, runId: expected.runId },
       ],
-      ['property.search', { releaseId }, 'search_properties', { releaseId, limit: 25 }],
+      [
+        'property.search',
+        { releaseId, query: ' Hamilton ', sort: 'address' },
+        'search_properties',
+        { releaseId, query: 'Hamilton', sort: 'address', limit: 25 },
+      ],
       ['property.get', { releaseId, propertyId }, 'get_property', { releaseId, propertyId }],
       [
         'property.getEvidence',
@@ -313,14 +319,14 @@ describe('production API composition', () => {
     expect(requests).toEqual(cases.map(([, , operation, input]) => ({ operation, input })));
     for (const request of requests) {
       const allowed =
-        PRODUCTION_SERVING_INPUT_FIELDS[
-          request.operation as keyof typeof PRODUCTION_SERVING_INPUT_FIELDS
-        ];
+        request.operation === 'search_properties'
+          ? PROPERTY_SEARCH_EXTENDED_INPUT_FIELDS
+          : PRODUCTION_SERVING_INPUT_FIELDS[
+              request.operation as keyof typeof PRODUCTION_SERVING_INPUT_FIELDS
+            ];
       expect(allowed, request.operation).toBeDefined();
       expect(
-        Object.keys(request.input).filter(
-          (field) => !(allowed as readonly string[]).includes(field),
-        ),
+        Object.keys(request.input).filter((field) => !allowed.includes(field)),
         request.operation,
       ).toEqual([]);
     }
@@ -436,6 +442,34 @@ describe('production API composition', () => {
     expect(serialized).not.toContain('parquet');
   });
 
+  it('forwards every public property sort without production rejection', async () => {
+    const environment = await productionEnvironment();
+    const requests: Readonly<{
+      operation: string;
+      input: Readonly<Record<string, unknown>>;
+    }>[] = [];
+    const api = createProductionApiHandler(environment, {
+      createServingService: async () => await Promise.resolve(servingService(requests)),
+    });
+    for (const sort of ['property_id', 'address', 'parcel_identifier'] as const) {
+      const result = await api(
+        event('/property.search', {
+          releaseId: expected.releaseId,
+          query: 'Hamilton',
+          sort,
+        }),
+        {} as Context,
+      );
+      expect(result, sort).toMatchObject({ statusCode: 200 });
+    }
+    expect(requests).toEqual(
+      ['property_id', 'address', 'parcel_identifier'].map((sort) => ({
+        operation: 'search_properties',
+        input: { releaseId: expected.releaseId, query: 'Hamilton', sort, limit: 25 },
+      })),
+    );
+  });
+
   it('rejects unsupported API-only filters instead of silently dropping them', async () => {
     const environment = await productionEnvironment();
     const requests: Readonly<{
@@ -446,7 +480,6 @@ describe('production API composition', () => {
       createServingService: async () => await Promise.resolve(servingService(requests)),
     });
     const attempts = [
-      ['/property.search', { releaseId: expected.releaseId, sort: 'address' }],
       ['/inquiry.transitWalkability', { releaseId: expected.releaseId, transitMode: 'rail' }],
       ['/artifacts.list', { releaseId: expected.releaseId, artifactType: 'manifest' }],
     ] as const;

@@ -14,7 +14,7 @@ import {
 import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 
-import { displayValue, rowsFromData, truthStateFrom, valueFor } from './api.js';
+import { displayValue, isRecord, rowsFromData, truthStateFrom, valueFor } from './api.js';
 import type { ApiEnvelope, DataRow, QueryState, TruthState } from './types.js';
 
 const truthContent: Readonly<Record<TruthState, Readonly<{ label: string; icon: ReactNode }>>> = {
@@ -97,6 +97,72 @@ function formatDate(value: string): string {
       }).format(date) + ' UTC';
 }
 
+function returnedCapabilities(envelope: ApiEnvelope) {
+  if (isRecord(envelope.data) && isRecord(envelope.data.capability)) {
+    return [{ name: 'Query', capability: envelope.data.capability }] as const;
+  }
+  if (!isRecord(envelope.coverage)) return [];
+  return Object.entries(envelope.coverage)
+    .filter((entry): entry is [string, Readonly<Record<string, unknown>>] => isRecord(entry[1]))
+    .filter(([, capability]) => typeof capability.state === 'string')
+    .map(([name, capability]) => ({ name, capability }));
+}
+
+function CapabilityDetails({ envelope }: Readonly<{ envelope: ApiEnvelope }>) {
+  const capabilities = returnedCapabilities(envelope);
+  if (capabilities.length === 0) return null;
+  return (
+    <section
+      className="capability-summary"
+      aria-label="Returned capability"
+      data-capability-state={
+        capabilities.length === 1 ? displayValue(capabilities[0].capability.state) : 'multiple'
+      }
+    >
+      <h3>Returned capability</h3>
+      {capabilities.map(({ name, capability }) => {
+        const supportClasses = Array.isArray(capability.supportClasses)
+          ? capability.supportClasses
+          : [];
+        const limitations = Array.isArray(capability.limitations)
+          ? capability.limitations.filter((value): value is string => typeof value === 'string')
+          : [];
+        return (
+          <article key={name}>
+            <h4>{name.replaceAll('_', ' ')} capability</h4>
+            <dl className="fact-grid">
+              <div>
+                <dt>Capability state</dt>
+                <dd>{displayValue(capability.state)}</dd>
+              </div>
+              <div>
+                <dt>Supported result classes</dt>
+                <dd>{displayValue(supportClasses)}</dd>
+              </div>
+              <div>
+                <dt>Evidence coverage</dt>
+                <dd>
+                  {displayValue(capability.numerator)} / {displayValue(capability.denominator)}
+                </dd>
+              </div>
+            </dl>
+            {limitations.length === 0 ? null : (
+              <div>
+                <strong>Capability limitations</strong>
+                <ul>
+                  {limitations.map((limitation) => (
+                    <li key={limitation}>{limitation}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </article>
+        );
+      })}
+    </section>
+  );
+}
+
 export function StatePanel({
   state,
   onRetry,
@@ -149,6 +215,8 @@ export function StatePanel({
         <div>
           <h2>{emptyTitle}</h2>
           <p>{emptyDetail}</p>
+          <CapabilityDetails envelope={successfulData} />
+          <EnvelopeNotes envelope={successfulData} />
         </div>
       </section>
     );
@@ -228,6 +296,19 @@ export function ResultViews({
   caption,
 }: Readonly<{ rows: readonly DataRow[]; caption: string }>) {
   const [view, setView] = useState<'table' | 'spatial'>('table');
+  const rankingComponents = rows.flatMap((row, index) => {
+    const value = valueFor(row, ['value']);
+    if (!isRecord(value) || !Array.isArray(value.components)) return [];
+    const components = value.components.filter(isRecord);
+    if (components.length === 0) return [];
+    return [
+      {
+        propertyId: displayValue(valueFor(row, ['propertyId', 'property_id', 'id'])),
+        index,
+        components,
+      },
+    ];
+  });
   return (
     <section className="result-section" aria-labelledby="result-heading">
       <div className="section-heading">
@@ -282,6 +363,26 @@ export function ResultViews({
             );
           })}
         </ol>
+      )}
+      {rankingComponents.length === 0 ? null : (
+        <section className="ranking-components" aria-label="Returned ranking components">
+          <h3>Score components and contributions</h3>
+          {rankingComponents.map(({ propertyId, index, components }) => (
+            <EvidenceTable
+              key={`${propertyId}-${index}`}
+              caption={`Ranking components for ${propertyId}`}
+              rows={components}
+              columns={[
+                { label: 'Criterion', keys: ['criterion'] },
+                { label: 'Evidence state', keys: ['supportClass'], kind: 'truth' },
+                { label: 'Normalized value', keys: ['normalizedValue'] },
+                { label: 'Weight', keys: ['weight'] },
+                { label: 'Proxy multiplier', keys: ['proxyMultiplier'] },
+                { label: 'Contribution', keys: ['contribution'] },
+              ]}
+            />
+          ))}
+        </section>
       )}
     </section>
   );

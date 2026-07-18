@@ -305,6 +305,32 @@ describe('Oracle application API contract', () => {
     expect(errorCode(huge)).toBe('RESPONSE_TOO_LARGE');
   });
 
+  it('normalizes and bounds public property search queries by UTF-8 bytes', async () => {
+    const api = createApiHandler(fixtureServices());
+    const valid = await api(
+      event('/property.search', {
+        releaseId: release.releaseId,
+        query: '  Hamilton Ave  ',
+        sort: 'parcel_identifier',
+      }),
+      context,
+    );
+    expect(valid).toMatchObject({ statusCode: 200 });
+    expect(parse(valid)).toMatchObject({
+      data: {
+        parameters: { query: 'Hamilton Ave', sort: 'parcel_identifier' },
+      },
+    });
+
+    for (const query of ['ab', 'a'.repeat(201), 'é'.repeat(101), 'Hamilton\u0085Ave']) {
+      const invalid = await api(
+        event('/property.search', { releaseId: release.releaseId, query }),
+        context,
+      );
+      expect(errorCode(invalid), JSON.stringify(query)).toBe('INVALID_REQUEST');
+    }
+  });
+
   it('fails closed for stale release and corrupt release metadata', async () => {
     const stale = await createApiHandler(fixtureServices())(
       event('/dataset.getCoverage', { releaseId: 'release-stale' }),

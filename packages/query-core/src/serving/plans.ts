@@ -11,7 +11,9 @@ export type GeneralPlanName =
   | 'get_dataset_coverage_relation'
   | 'list_pipeline_runs'
   | 'get_pipeline_run'
-  | 'search_properties'
+  | 'search_properties_by_property_id'
+  | 'search_properties_by_address'
+  | 'search_properties_by_parcel_identifier'
   | 'get_property'
   | 'get_property_evidence'
   | 'list_artifacts'
@@ -57,7 +59,7 @@ FROM pipeline_runs
 WHERE run_id = ?
 ORDER BY run_id ASC
 LIMIT 2`,
-  search_properties: `
+  search_properties_by_property_id: `
 SELECT property_id, parcel_identifier, address_street, address_city, address_zip,
   latitude, longitude, roof_support_class, water_support_class, ownership_support_class,
   regional_owner_support_class, transit_support_class, starbucks_support_class,
@@ -68,8 +70,44 @@ WHERE visibility = 'public'
   AND (? IS NULL OR address_zip = ?)
   AND (? IS NULL OR property_id = ?)
   AND (? IS NULL OR parcel_identifier = ?)
+  AND (? IS NULL OR property_id = ? OR parcel_identifier = ?
+    OR contains(lower(coalesce(address_street, '')), lower(?)))
   AND (? IS NULL OR property_id > ?)
 ORDER BY property_id ASC
+LIMIT ?`,
+  search_properties_by_address: `
+SELECT property_id, parcel_identifier, address_street, address_city, address_zip,
+  latitude, longitude, roof_support_class, water_support_class, ownership_support_class,
+  regional_owner_support_class, transit_support_class, starbucks_support_class,
+  combined_review_score, evidence_coverage
+FROM property_query
+WHERE visibility = 'public'
+  AND (? IS NULL OR address_city = ?)
+  AND (? IS NULL OR address_zip = ?)
+  AND (? IS NULL OR property_id = ?)
+  AND (? IS NULL OR parcel_identifier = ?)
+  AND (? IS NULL OR property_id = ? OR parcel_identifier = ?
+    OR contains(lower(coalesce(address_street, '')), lower(?)))
+  AND (? IS NULL OR coalesce(address_street, '') > ?
+    OR (coalesce(address_street, '') = ? AND property_id > ?))
+ORDER BY coalesce(address_street, '') ASC, property_id ASC
+LIMIT ?`,
+  search_properties_by_parcel_identifier: `
+SELECT property_id, parcel_identifier, address_street, address_city, address_zip,
+  latitude, longitude, roof_support_class, water_support_class, ownership_support_class,
+  regional_owner_support_class, transit_support_class, starbucks_support_class,
+  combined_review_score, evidence_coverage
+FROM property_query
+WHERE visibility = 'public'
+  AND (? IS NULL OR address_city = ?)
+  AND (? IS NULL OR address_zip = ?)
+  AND (? IS NULL OR property_id = ?)
+  AND (? IS NULL OR parcel_identifier = ?)
+  AND (? IS NULL OR property_id = ? OR parcel_identifier = ?
+    OR contains(lower(coalesce(address_street, '')), lower(?)))
+  AND (? IS NULL OR coalesce(parcel_identifier, '') > ?
+    OR (coalesce(parcel_identifier, '') = ? AND property_id > ?))
+ORDER BY coalesce(parcel_identifier, '') ASC, property_id ASC
 LIMIT ?`,
   get_property: `
 SELECT * FROM property_query
@@ -113,7 +151,9 @@ const operations: Readonly<Record<GeneralPlanName, string>> = Object.freeze({
   get_dataset_coverage_relation: 'serving.get_dataset_coverage.relation@1.0.0',
   list_pipeline_runs: 'serving.list_pipeline_runs@1.0.0',
   get_pipeline_run: 'serving.get_pipeline_run@1.0.0',
-  search_properties: 'serving.search_properties@1.0.0',
+  search_properties_by_property_id: 'serving.search_properties@1.0.0',
+  search_properties_by_address: 'serving.search_properties@1.0.0',
+  search_properties_by_parcel_identifier: 'serving.search_properties@1.0.0',
   get_property: 'serving.get_property@1.0.0',
   get_property_evidence: 'serving.get_property_evidence@1.0.0',
   list_artifacts: 'serving.list_artifacts@1.0.0',
