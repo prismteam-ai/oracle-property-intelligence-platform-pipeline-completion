@@ -44,7 +44,11 @@ import {
 import { sha256Hex } from '../../spi/bytes.js';
 import { createSharedRecordBudget } from '../../spi/record-budget.js';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../../spi/http.js';
-import { createCslbContractorAdapter } from './adapter.js';
+import {
+  CSLB_FINAL_EXPORT_HEADER_TIMEOUT_MS,
+  createCslbContractorAdapter,
+  isCslbGeneratedFinalExportRequest,
+} from './adapter.js';
 import {
   CSLB_CONTRACTOR_LICENSE_ID,
   CSLB_CONTRACTOR_SOURCE_ID,
@@ -474,6 +478,14 @@ describe('CSLB contractor adapter', () => {
     expect(delay.waits[0]).toBe(1_000);
     expect(http.requests[1]?.headers.cookie).toBeUndefined();
     expect(http.requests[2]?.headers.cookie).toBe('anon=two');
+    const selectRequest = http.requests[2];
+    const finalExportRequest = http.requests[3];
+    if (selectRequest === undefined || finalExportRequest === undefined) {
+      throw new Error('Expected CSLB selection and final-export requests');
+    }
+    expect(isCslbGeneratedFinalExportRequest(selectRequest)).toBe(false);
+    expect(isCslbGeneratedFinalExportRequest(finalExportRequest)).toBe(true);
+    expect(CSLB_FINAL_EXPORT_HEADER_TIMEOUT_MS).toBe(120_000);
     const resumed = await collect(adapter.acquire(plan, undefined, context));
     expect(resumed).toHaveLength(1);
     expect(resumed[0]?.metadata.sha256).toBe(acquiredArtifact.metadata.sha256);

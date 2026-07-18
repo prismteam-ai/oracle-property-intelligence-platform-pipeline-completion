@@ -11,6 +11,14 @@ import type {
   StreamingImmutableArtifactWrite,
   StoredArtifact,
 } from '@oracle/artifacts/artifact-store';
+import {
+  createCheckpointEnvelope,
+  type CheckpointCommit,
+  type CheckpointCommitResult,
+  type CheckpointEnvelope,
+  type CheckpointStore,
+  type CheckpointValue,
+} from '@oracle/artifacts/checkpoint-store';
 import { LocalCheckpointStore } from '@oracle/artifacts/implementations/local-checkpoint-store';
 import { runIdSchema, snapshotIdSchema } from '@oracle/contracts/ids';
 import type {
@@ -22,6 +30,12 @@ import type {
   AnalyticalSnapshot,
 } from '@oracle/data-runtime/analytical-runtime';
 import { createSantaClaraSocrataParcelsAdapter } from '@oracle/source-adapters/providers/santa-clara-socrata-parcels/index';
+import {
+  CSLB_MASTER_DOWNLOAD_EVENT,
+  CSLB_MASTER_SELECT_VALUE,
+  CSLB_PORTAL_SELECT_FIELD,
+  CSLB_PORTAL_URL,
+} from '@oracle/source-adapters/providers/cslb-contractors/constants';
 import {
   SANTA_CLARA_PARCELS_API_ROOT,
   SANTA_CLARA_PARCELS_COUNT_URLS,
@@ -58,6 +72,8 @@ const FIXED_INSTANT = '2026-07-17T13:00:00.000Z';
 const FIXTURE_RELATIVE_PATH =
   'packages/testkit/src/sources/santa-clara-socrata-parcels/duplicate-apn.geojson';
 const ORIGINAL_KEY_METADATA = 'oracleOriginalLogicalKey';
+const CSLB_FINAL_EXPORT_HEADER_TIMEOUT_MS = 120_000;
+const CSLB_FINAL_EXPORT_TIMEOUT_HEADER = 'x-oracle-header-timeout-ms';
 type DuckDBRuntimeModule = Readonly<{
   DuckDBAnalyticalRuntime: new (
     options: Readonly<{
@@ -256,14 +272,28 @@ class FixtureParcelTransport implements HttpTransport {
 export class FetchTransport implements HttpTransport {
   readonly #authorization: readonly AuthorizationRule[];
   readonly #requestTimeoutMs: number;
+  readonly #headerTimeoutMs: (request: HttpRequest) => number;
 
-  public constructor(authorization: readonly AuthorizationRule[], requestTimeoutMs: number) {
+  public constructor(
+    authorization: readonly AuthorizationRule[],
+    requestTimeoutMs: number,
+    options: Readonly<{ headerTimeoutMs?: (request: HttpRequest) => number }> = {},
+  ) {
+    if (!Number.isSafeInteger(requestTimeoutMs) || requestTimeoutMs < 1) {
+      throw new RangeError('requestTimeoutMs must be a positive safe integer');
+    }
     this.#authorization = authorization;
     this.#requestTimeoutMs = requestTimeoutMs;
+    this.#headerTimeoutMs = options.headerTimeoutMs ?? (() => requestTimeoutMs);
   }
 
   public async send(request: HttpRequest, signal: AbortSignal): Promise<HttpResponse> {
-    const headers: Record<string, string> = { ...request.headers };
+    signal.throwIfAborted();
+    const headers: Record<string, string> = Object.fromEntries(
+      Object.entries(request.headers).filter(
+        ([name]) => name.toLowerCase() !== CSLB_FINAL_EXPORT_TIMEOUT_HEADER,
+      ),
+    );
     for (const rule of this.#authorization) {
       if (!isWithinAuthorizationScope(request.url, rule.urlPrefix)) continue;
       const value = process.env[rule.environmentVariable];
@@ -277,33 +307,365 @@ export class FetchTransport implements HttpTransport {
       }
       headers[rule.headerName] = value;
     }
-    const boundedSignal = AbortSignal.any([signal, AbortSignal.timeout(this.#requestTimeoutMs)]);
-    const init: RequestInit = {
-      method: request.method,
+    const headerTimeoutMs = this.#headerTimeoutMs(request);
+    if (!Number.isSafeInteger(headerTimeoutMs) || headerTimeoutMs < 1) {
+      throw new RangeError('header timeout policy must return a positive safe integer');
+    }
+
+    const first = await fetchHeaders(
+      request.url,
+      request.method,
       headers,
-      signal: boundedSignal,
-      redirect: 'manual',
-      ...(request.body === undefined ? {} : { body: request.body }),
-    };
-    const response = await fetch(request.url, init);
-    if (response.status >= 300 && response.status < 400) {
-      throw new RedirectRejectedError(request.url, response.status);
+      request.body,
+      signal,
+      headerTimeoutMs,
+    );
+    let selected = first;
+    let redirected = false;
+    if (isRedirect(first.response.status)) {
+      const target = allowedSanJoseRedirect(request, first.response);
+      await discardRedirectBody(first);
+      if (target === undefined) {
+        throw new RedirectRejectedError(request.url, first.response.status);
+      }
+      selected = await fetchHeaders(
+        target.href,
+        request.method,
+        sanJoseRedirectHeaders(headers),
+        undefined,
+        signal,
+        headerTimeoutMs,
+      );
+      redirected = true;
+      if (isRedirect(selected.response.status)) {
+        const status = selected.response.status;
+        await discardRedirectBody(selected);
+        throw new RedirectRejectedError(target.href, status);
+      }
+    }
+
+    const response = selected.response;
+    const body = response.body;
+    const discardBody = response.status < 200 || response.status >= 300;
+    if (body === null || discardBody) {
+      try {
+        if (body !== null) await body.cancel();
+      } finally {
+        selected.detachGlobalAbort();
+      }
     }
     return Object.freeze({
       status: response.status,
       headers: collectResponseHeaders(response.headers),
-      body: response.body ?? oneChunk(new Uint8Array()),
-      finalUrl: response.url,
+      body:
+        body === null || discardBody
+          ? oneChunk(new Uint8Array())
+          : streamWithIdleTimeout(
+              body,
+              selected.controller,
+              signal,
+              this.#requestTimeoutMs,
+              selected.detachGlobalAbort,
+            ),
+      finalUrl: redirected ? urlWithoutQuery(response.url) : response.url,
     });
   }
+}
+
+type HeaderResponse = Readonly<{
+  response: Response;
+  controller: AbortController;
+  detachGlobalAbort: () => void;
+}>;
+
+async function fetchHeaders(
+  url: string,
+  method: HttpRequest['method'],
+  headers: Readonly<Record<string, string>>,
+  body: Uint8Array | undefined,
+  globalSignal: AbortSignal,
+  timeoutMs: number,
+): Promise<HeaderResponse> {
+  globalSignal.throwIfAborted();
+  const controller = new AbortController();
+  const propagateGlobalAbort = (): void => controller.abort(abortReason(globalSignal));
+  globalSignal.addEventListener('abort', propagateGlobalAbort, { once: true });
+  const detachGlobalAbort = (): void =>
+    globalSignal.removeEventListener('abort', propagateGlobalAbort);
+  const timeout = setTimeout(
+    () => controller.abort(new DOMException('Response headers timed out', 'AbortError')),
+    timeoutMs,
+  );
+  try {
+    const response = await fetch(url, {
+      method,
+      headers,
+      signal: controller.signal,
+      redirect: 'manual',
+      ...(body === undefined ? {} : { body }),
+    });
+    return Object.freeze({ response, controller, detachGlobalAbort });
+  } catch (error) {
+    detachGlobalAbort();
+    if (controller.signal.aborted) throw abortReason(controller.signal);
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function isRedirect(status: number): boolean {
+  return status >= 300 && status < 400;
+}
+
+function allowedSanJoseRedirect(request: HttpRequest, response: Response): URL | undefined {
+  if (request.method !== 'GET' && request.method !== 'HEAD') return undefined;
+  const source = new URL(request.url);
+  if (
+    source.origin !== 'https://data.sanjoseca.gov' ||
+    source.username !== '' ||
+    source.password !== '' ||
+    source.search !== '' ||
+    source.hash !== ''
+  ) {
+    return undefined;
+  }
+  const sourceMatch =
+    /^\/dataset\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/resource\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/download\/([^/]+)$/u.exec(
+      source.pathname,
+    );
+  const location = response.headers.get('location');
+  if (sourceMatch === null || location === null) return undefined;
+  const target = new URL(location, source);
+  const [, resourceId, fileName] = sourceMatch;
+  if (
+    target.origin !== 'https://s3.amazonaws.com' ||
+    target.username !== '' ||
+    target.password !== '' ||
+    target.hash !== '' ||
+    target.pathname !==
+      `/og-production-open-data-sanjoseca-892364687672/resources/${resourceId}/${fileName}`
+  ) {
+    return undefined;
+  }
+  return target;
+}
+
+function sanJoseRedirectHeaders(
+  headers: Readonly<Record<string, string>>,
+): Readonly<Record<string, string>> {
+  const accept = Object.entries(headers).find(([name]) => name.toLowerCase() === 'accept')?.[1];
+  return Object.freeze(accept === undefined ? {} : { accept });
+}
+
+function hasCslbFinalExportTimeoutHint(request: HttpRequest): boolean {
+  if (
+    request.method !== 'POST' ||
+    request.url !== CSLB_PORTAL_URL ||
+    request.body === undefined ||
+    requestHeader(request, 'content-type') !== 'application/x-www-form-urlencoded' ||
+    requestHeader(request, CSLB_FINAL_EXPORT_TIMEOUT_HEADER) !==
+      String(CSLB_FINAL_EXPORT_HEADER_TIMEOUT_MS)
+  ) {
+    return false;
+  }
+  try {
+    const parameters = new URLSearchParams(
+      new TextDecoder('utf-8', { fatal: true }).decode(request.body),
+    );
+    return (
+      parameters.get('__EVENTTARGET') === CSLB_MASTER_DOWNLOAD_EVENT &&
+      parameters.get('__EVENTARGUMENT') === '' &&
+      parameters.get(CSLB_PORTAL_SELECT_FIELD) === CSLB_MASTER_SELECT_VALUE &&
+      (parameters.get('__VIEWSTATE')?.length ?? 0) > 0 &&
+      (parameters.get('__EVENTVALIDATION')?.length ?? 0) > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+function requestHeader(request: HttpRequest, expected: string): string | undefined {
+  return Object.entries(request.headers).find(
+    ([name]) => name.toLowerCase() === expected.toLowerCase(),
+  )?.[1];
+}
+
+export function pipelineHeaderTimeoutMs(request: HttpRequest, defaultTimeoutMs: number): number {
+  return hasCslbFinalExportTimeoutHint(request)
+    ? CSLB_FINAL_EXPORT_HEADER_TIMEOUT_MS
+    : defaultTimeoutMs;
+}
+
+async function discardRedirectBody(response: HeaderResponse): Promise<void> {
+  try {
+    await response.response.body?.cancel();
+  } finally {
+    response.detachGlobalAbort();
+  }
+}
+
+async function* streamWithIdleTimeout(
+  body: ReadableStream<Uint8Array>,
+  requestController: AbortController,
+  globalSignal: AbortSignal,
+  idleTimeoutMs: number,
+  detachGlobalAbort: () => void,
+): AsyncIterable<Uint8Array> {
+  const reader = body.getReader();
+  let complete = false;
+  try {
+    for (;;) {
+      globalSignal.throwIfAborted();
+      const next = await readWithIdleTimeout(reader, requestController, idleTimeoutMs);
+      if (next.done) {
+        complete = true;
+        return;
+      }
+      yield next.value;
+    }
+  } finally {
+    detachGlobalAbort();
+    if (!complete) {
+      await reader.cancel().catch(() => undefined);
+    }
+    reader.releaseLock();
+  }
+}
+
+function readWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  controller: AbortController,
+  timeoutMs: number,
+): ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']> {
+  return new Promise((resolveRead, rejectRead) => {
+    let settled = false;
+    const settle = (
+      value: Awaited<ReturnType<ReadableStreamDefaultReader<Uint8Array>['read']>>,
+    ): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      controller.signal.removeEventListener('abort', onAbort);
+      resolveRead(value);
+    };
+    const reject = (error: unknown): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      controller.signal.removeEventListener('abort', onAbort);
+      rejectRead(error instanceof Error ? error : new Error(String(error)));
+    };
+    const onAbort = (): void => reject(abortReason(controller.signal));
+    const timeout = setTimeout(
+      () => controller.abort(new DOMException('Response body made no progress', 'AbortError')),
+      timeoutMs,
+    );
+    controller.signal.addEventListener('abort', onAbort, { once: true });
+    if (controller.signal.aborted) {
+      onAbort();
+      return;
+    }
+    reader.read().then(settle, reject);
+  });
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('Operation aborted', 'AbortError');
+}
+
+function urlWithoutQuery(value: string): string {
+  const url = new URL(value);
+  url.username = '';
+  url.password = '';
+  url.search = '';
+  url.hash = '';
+  return url.href;
 }
 
 export class RedirectRejectedError extends Error {
   public readonly code = 'HTTP_REDIRECT_REJECTED';
 
   public constructor(url: string, status: number) {
-    super(`HTTP redirect ${status} rejected for ${url}`);
+    super(`HTTP redirect ${status} rejected for ${urlWithoutQuery(url)}`);
     this.name = 'RedirectRejectedError';
+  }
+}
+
+function reopenFailedAcquisition(payload: CheckpointValue): CheckpointValue | undefined {
+  if (!isCheckpointObject(payload)) return undefined;
+  const run = payload;
+  if (run.schemaVersion !== 2 || run.manifestArtifact === null || !Array.isArray(run.sources)) {
+    return undefined;
+  }
+  const sourceValues = run.sources as readonly CheckpointValue[];
+  const shouldReopen = sourceValues.some(
+    (source) =>
+      isCheckpointObject(source) &&
+      source.terminalState === 'failed' &&
+      source.completedPhase === 'plan',
+  );
+  if (!shouldReopen) return undefined;
+  const sources: readonly CheckpointValue[] = sourceValues.map((source): CheckpointValue => {
+    if (!isCheckpointObject(source)) return source;
+    const state = source;
+    if (state.terminalState !== 'failed' || state.completedPhase !== 'plan') return source;
+    return Object.freeze({ ...state, terminalState: null });
+  });
+  return Object.freeze({
+    ...run,
+    sources: Object.freeze(sources),
+    reconcileArtifact: null,
+    featureArtifact: null,
+    martArtifact: null,
+    manifestArtifact: null,
+    completedPhase: null,
+  });
+}
+
+function isCheckpointObject(
+  value: CheckpointValue,
+): value is Readonly<Record<string, CheckpointValue>> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export class RetryableAcquisitionCheckpointStore implements CheckpointStore {
+  readonly #delegate: CheckpointStore;
+  readonly #now: () => string;
+
+  public constructor(delegate: CheckpointStore, now: () => string) {
+    this.#delegate = delegate;
+    this.#now = now;
+  }
+
+  public async load(scope: string): Promise<CheckpointEnvelope | undefined> {
+    let current = await this.#delegate.load(scope);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (current === undefined) return undefined;
+      const payload = reopenFailedAcquisition(current.payload);
+      if (payload === undefined) return current;
+      const checkpoint = createCheckpointEnvelope({
+        scope,
+        previousRevision: current.revision,
+        writtenAt: this.#now(),
+        payload,
+      });
+      const committed = await this.#delegate.commit({
+        expectedRevision: current.revision,
+        checkpoint,
+      });
+      if (committed.status === 'committed') return committed.checkpoint;
+      current = committed.current;
+    }
+    throw new Error(`Concurrent checkpoint conflict while reopening ${scope}`);
+  }
+
+  public commit<TPayload extends CheckpointValue>(
+    request: CheckpointCommit<TPayload>,
+  ): Promise<CheckpointCommitResult<TPayload>> {
+    return this.#delegate.commit(request);
   }
 }
 
@@ -506,6 +868,12 @@ export async function runCommand(options: RunCommandOptions): Promise<PipelineRe
   const artifactStore = new PortableLocalArtifactStore(resolve(outputDirectory, 'artifacts'), () =>
     clock.now(),
   );
+  const checkpointStore = new RetryableAcquisitionCheckpointStore(
+    new LocalCheckpointStore({
+      rootDirectory: resolve(outputDirectory, 'checkpoints'),
+    }),
+    () => clock.now(),
+  );
   const sources =
     fixture === undefined
       ? await composeProductionSources({
@@ -549,15 +917,17 @@ export async function runCommand(options: RunCommandOptions): Promise<PipelineRe
     }),
     Object.freeze({
       artifactStore,
-      checkpointStore: new LocalCheckpointStore({
-        rootDirectory: resolve(outputDirectory, 'checkpoints'),
-      }),
+      checkpointStore,
       analyticalRuntime: new PipelineAnalyticalRuntime(artifactStore),
       http:
         fixture === undefined
           ? new FetchTransport(
               sourceConfig.fallback511?.authorization ?? [],
               sourceConfig.runtime.requestTimeoutMs,
+              {
+                headerTimeoutMs: (request) =>
+                  pipelineHeaderTimeoutMs(request, sourceConfig.runtime.requestTimeoutMs),
+              },
             )
           : new FixtureParcelTransport(fixture),
       clock,

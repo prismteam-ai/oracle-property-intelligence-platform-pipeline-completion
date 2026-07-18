@@ -82,6 +82,8 @@ const PORTAL_MAXIMUM_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAXIMUM_ARTIFACT_BYTES = 512 * 1024 * 1024;
 const STREAM_CHUNK_BYTES = 64 * 1024;
 const MAXIMUM_CSV_RECORD_BYTES = 1024 * 1024;
+export const CSLB_FINAL_EXPORT_HEADER_TIMEOUT_MS = 120_000;
+export const CSLB_FINAL_EXPORT_TIMEOUT_HEADER = 'x-oracle-header-timeout-ms';
 const SCHEMA_FINGERPRINT = schemaFingerprintValueSchema.parse(CSLB_MASTER_SCHEMA_FINGERPRINT);
 const contractorIdSchema = entityIdSchemaFor('contractor');
 
@@ -203,6 +205,16 @@ function httpDateToIso(value: string | undefined): string | null {
   return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 }
 
+async function discardResponseBody(response: HttpResponse, signal: AbortSignal): Promise<void> {
+  const iterator = response.body[Symbol.asyncIterator]();
+  try {
+    await iterator.next();
+    signal.throwIfAborted();
+  } finally {
+    await iterator.return?.();
+  }
+}
+
 function parseRetryAfter(headers: HttpHeaders, now: string): number | undefined {
   const raw = headerValue(headers, 'retry-after');
   if (raw === undefined) return undefined;
@@ -253,6 +265,7 @@ async function sendWithRetry(
       continue;
     }
     if (response.status >= 200 && response.status < 300) return { response, attempt };
+    await discardResponseBody(response, context.signal);
     if (response.status === 401)
       throw oracleError('AUTHENTICATION', `HTTP 401 for ${requestKey}`, phase);
     if (response.status === 403)
@@ -340,6 +353,33 @@ function eventBody(html: string, eventTarget: string): Uint8Array {
     __EVENTARGUMENT: '',
     [CSLB_PORTAL_SELECT_FIELD]: CSLB_MASTER_SELECT_VALUE,
   });
+}
+
+export function isCslbGeneratedFinalExportRequest(request: HttpRequest): boolean {
+  if (
+    request.method !== 'POST' ||
+    request.url !== CSLB_PORTAL_URL ||
+    request.body === undefined ||
+    headerValue(request.headers, 'content-type') !== 'application/x-www-form-urlencoded'
+  ) {
+    return false;
+  }
+  try {
+    const parameters = new URLSearchParams(
+      new TextDecoder('utf-8', { fatal: true }).decode(request.body),
+    );
+    return (
+      parameters.get('__EVENTTARGET') === CSLB_MASTER_DOWNLOAD_EVENT &&
+      parameters.get('__EVENTARGUMENT') === '' &&
+      parameters.get(CSLB_PORTAL_SELECT_FIELD) === CSLB_MASTER_SELECT_VALUE &&
+      (parameters.get('__VIEWSTATE')?.length ?? 0) > 0 &&
+      (parameters.get('__EVENTVALIDATION')?.length ?? 0) > 0 &&
+      headerValue(request.headers, CSLB_FINAL_EXPORT_TIMEOUT_HEADER) ===
+        String(CSLB_FINAL_EXPORT_HEADER_TIMEOUT_MS)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function anonymousCookie(headers: HttpHeaders): string | undefined {
@@ -1046,6 +1086,7 @@ export class CslbContractorAdapter implements StreamingSourceAdapter<
     const requestHeadersValue = Object.freeze({
       accept: 'text/csv',
       'content-type': 'application/x-www-form-urlencoded',
+      [CSLB_FINAL_EXPORT_TIMEOUT_HEADER]: String(CSLB_FINAL_EXPORT_HEADER_TIMEOUT_MS),
       ...(selected.cookie === undefined ? {} : { cookie: selected.cookie }),
     });
     const downloaded = await sendWithRetry(
@@ -1059,6 +1100,7 @@ export class CslbContractorAdapter implements StreamingSourceAdapter<
       ?.trim()
       .toLowerCase();
     if (mediaType !== 'text/csv') {
+      await discardResponseBody(downloaded.response, context.signal);
       throw oracleError(
         'SCHEMA_DRIFT',
         `Expected text/csv, received ${mediaType ?? 'missing'}`,

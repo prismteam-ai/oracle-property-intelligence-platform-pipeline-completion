@@ -226,6 +226,7 @@ interface ScriptedResponse {
   readonly status: number;
   readonly headers: Readonly<Record<string, string>>;
   readonly bytes: Uint8Array;
+  readonly finalUrl?: string;
 }
 
 async function* responseBody(bytes: Uint8Array, signal: AbortSignal): AsyncIterable<Uint8Array> {
@@ -257,6 +258,7 @@ class ScriptedTransport implements HttpTransport {
         status: response.status,
         headers: response.headers,
         body: responseBody(response.bytes, signal),
+        ...(response.finalUrl === undefined ? {} : { finalUrl: response.finalUrl }),
       }),
     );
   }
@@ -484,7 +486,7 @@ function acquisitionContext(
   };
 }
 
-function csvResponse(bytes: Uint8Array, status = 200): ScriptedResponse {
+function csvResponse(bytes: Uint8Array, status = 200, finalUrl?: string): ScriptedResponse {
   return Object.freeze({
     status,
     headers: Object.freeze({
@@ -493,6 +495,7 @@ function csvResponse(bytes: Uint8Array, status = 200): ScriptedResponse {
       etag: '"fixture"',
     }),
     bytes,
+    ...(finalUrl === undefined ? {} : { finalUrl }),
   });
 }
 
@@ -566,7 +569,11 @@ describe('San Jose building permit source family', () => {
     );
     const transport = new ScriptedTransport([
       { status: 503, headers: Object.freeze({ 'retry-after': '0' }), bytes: new Uint8Array() },
-      csvResponse(active ?? new Uint8Array()),
+      csvResponse(
+        active ?? new Uint8Array(),
+        200,
+        'https://s3.amazonaws.com/og-production-open-data-sanjoseca-892364687672/resources/761b7ae8-3be1-4ad6-923d-c7af6404a904/buildingpermitsactive.csv',
+      ),
       csvResponse(expired ?? new Uint8Array()),
       csvResponse(inspection ?? new Uint8Array()),
     ]);
@@ -585,6 +592,9 @@ describe('San Jose building permit source family', () => {
       SAN_JOSE_FEEDS,
     );
     expect(acquired[0]?.metadata.request.attempt).toBe(2);
+    expect(acquired[0]?.metadata.response.finalUrl).toBe(
+      'https://s3.amazonaws.com/og-production-open-data-sanjoseca-892364687672/resources/761b7ae8-3be1-4ad6-923d-c7af6404a904/buildingpermitsactive.csv',
+    );
     expect(checkpoints.commits).toHaveLength(3);
     expect(artifacts.writes).toHaveLength(3);
     expect(delay.waits[0]).toBe(0);

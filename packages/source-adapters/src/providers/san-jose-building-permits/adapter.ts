@@ -187,6 +187,16 @@ function httpDateToIso(value: string | undefined): string | null {
   return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 }
 
+async function discardResponseBody(response: HttpResponse, signal: AbortSignal): Promise<void> {
+  const iterator = response.body[Symbol.asyncIterator]();
+  try {
+    await iterator.next();
+    signal.throwIfAborted();
+  } finally {
+    await iterator.return?.();
+  }
+}
+
 function metadataDateToIso(value: string): string {
   const timestamp = Date.parse(/[zZ]|[+-]\d\d:\d\d$/u.test(value) ? value : `${value}Z`);
   if (!Number.isFinite(timestamp)) {
@@ -280,6 +290,7 @@ async function requestWithRetry(
     if (response.status >= 200 && response.status < 300) {
       return Object.freeze({ response, attempt });
     }
+    await discardResponseBody(response, context.signal);
     if (response.status === 401) {
       throw oracleError('AUTHENTICATION', `Official source returned 401 for ${requestKey}`, phase);
     }
@@ -1204,6 +1215,7 @@ class SanJoseBuildingPermitAdapter implements StreamingSourceAdapter<
         );
         const contentType = headerValue(response.headers, 'content-type');
         if (contentType === undefined) {
+          await discardResponseBody(response, context.signal);
           throw oracleError(
             'SCHEMA_DRIFT',
             `Missing Content-Type for ${item.requestKey}`,
@@ -1212,6 +1224,7 @@ class SanJoseBuildingPermitAdapter implements StreamingSourceAdapter<
         }
         const mediaType = contentType.split(';', 1)[0]?.trim().toLowerCase();
         if (mediaType === undefined || !item.expectedMediaTypes.includes(mediaType)) {
+          await discardResponseBody(response, context.signal);
           throw oracleError(
             'SCHEMA_DRIFT',
             `Unexpected media type for ${item.requestKey}`,
@@ -1242,7 +1255,7 @@ class SanJoseBuildingPermitAdapter implements StreamingSourceAdapter<
             httpStatus: String(response.status),
             etag: headerValue(response.headers, 'etag') ?? '',
             lastModified: lastModified ?? '',
-            finalUrl: item.url,
+            finalUrl: response.finalUrl ?? item.url,
           }),
           signal: context.signal,
         });

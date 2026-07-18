@@ -191,6 +191,16 @@ function parseHttpInstant(value: string | undefined): string | null {
   return Number.isNaN(instant.valueOf()) ? null : instant.toISOString();
 }
 
+async function discardResponseBody(response: HttpResponse, signal: AbortSignal): Promise<void> {
+  const iterator = response.body[Symbol.asyncIterator]();
+  try {
+    await iterator.next();
+    signal.throwIfAborted();
+  } finally {
+    await iterator.return?.();
+  }
+}
+
 function retryAfterMs(response: HttpResponse): number | undefined {
   const value = header(response.headers, 'retry-after');
   if (value === undefined) return undefined;
@@ -213,6 +223,7 @@ async function requestWithRetry(
       if (response.status >= 200 && response.status < 300) {
         return Object.freeze({ response, attempt });
       }
+      await discardResponseBody(response, context.signal);
       if (response.status === 401 || response.status === 403) {
         throw providerError(
           response.status === 401 ? 'AUTHENTICATION' : 'TERMS_ACCESS',
@@ -903,7 +914,12 @@ export class OvertureStarbucksAdapter implements StreamingSourceAdapter<
       { method: 'HEAD', url: this.#artifact.url, accept: this.#artifact.mediaTypes.join(', ') },
       context,
     );
-    assertFrozenHeaders(result.response, this.#artifact, 'discover');
+    try {
+      assertFrozenHeaders(result.response, this.#artifact, 'discover');
+    } catch (error) {
+      await discardResponseBody(result.response, context.signal);
+      throw error;
+    }
     return Object.freeze({
       sourceId: OVERTURE_STARBUCKS_DESCRIPTOR.sourceId,
       discoveredAt: context.clock.now(),
@@ -1023,12 +1039,17 @@ export class OvertureStarbucksAdapter implements StreamingSourceAdapter<
         { method: 'GET', url: item.url, accept: item.expectedMediaTypes.join(', ') },
         context,
       );
-      assertFrozenHeaders(result.response, this.#artifact, 'acquire');
-      mediaType = contentType(result.response);
-      if (!item.expectedMediaTypes.includes(mediaType)) {
-        throw providerError('SCHEMA_DRIFT', 'Overture artifact media type changed', 'acquire', {
-          mediaType,
-        });
+      try {
+        assertFrozenHeaders(result.response, this.#artifact, 'acquire');
+        mediaType = contentType(result.response);
+        if (!item.expectedMediaTypes.includes(mediaType)) {
+          throw providerError('SCHEMA_DRIFT', 'Overture artifact media type changed', 'acquire', {
+            mediaType,
+          });
+        }
+      } catch (error) {
+        await discardResponseBody(result.response, context.signal);
+        throw error;
       }
       retrievedAt = context.clock.now();
       responseEtag = header(result.response.headers, 'etag') ?? null;
