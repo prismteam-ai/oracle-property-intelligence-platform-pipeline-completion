@@ -23,6 +23,8 @@ import {
 import { useEffect, useState, type ReactNode } from 'react';
 import { NavLink, useLocation } from 'react-router-dom';
 
+import { useOracle } from './app-context.js';
+
 const navigation = [
   { to: '/', label: 'Overview', icon: Home, end: true },
   { to: '/pipeline', label: 'Pipeline', icon: Activity },
@@ -93,6 +95,26 @@ function RouteFocus() {
   return null;
 }
 
+function ReleaseIdentityStatus() {
+  const { release } = useOracle();
+  if (release.status !== 'success') return null;
+
+  const { releaseId } = release.data;
+  return (
+    <div
+      className="shell-release-status"
+      role="status"
+      aria-label={`Immutable dataset release identity: ${releaseId}`}
+    >
+      <DatabaseZap aria-hidden="true" />
+      <span>Immutable verified release</span>
+      <strong data-release-id={releaseId} data-testid="release-id">
+        {releaseId}
+      </strong>
+    </div>
+  );
+}
+
 export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
   return (
     <div className="app-shell">
@@ -144,6 +166,7 @@ export function AppShell({ children }: Readonly<{ children: ReactNode }>) {
             </details>
           </div>
         </header>
+        <ReleaseIdentityStatus />
         <RouteFocus />
         <main id="main-content" tabIndex={-1}>
           {children}

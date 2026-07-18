@@ -66,7 +66,7 @@ export function ReleaseBar({ envelope }: Readonly<{ envelope: ApiEnvelope }>) {
       <Database aria-hidden="true" />
       <div>
         <span className="release-label">Immutable verified release</span>
-        <strong data-testid="release-id">{envelope.releaseId}</strong>
+        <strong>{envelope.releaseId}</strong>
       </div>
       <dl>
         <div>

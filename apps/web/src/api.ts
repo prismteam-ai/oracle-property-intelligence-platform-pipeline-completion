@@ -22,6 +22,32 @@ export class OracleApiError extends Error {
   }
 }
 
+type QueryRequestOwner = Readonly<{
+  client: ApiClient;
+  operation: ApplicationOperation;
+  inputKey: string;
+  enabled: boolean;
+  attempt: number;
+}>;
+
+type QueryRequestState = QueryRequestOwner & Readonly<{ query: QueryState }>;
+
+function initialQueryState(enabled: boolean): QueryState {
+  return enabled
+    ? { status: 'loading', data: null, error: null }
+    : { status: 'idle', data: null, error: null };
+}
+
+function ownsQueryRequest(state: QueryRequestState, owner: QueryRequestOwner): boolean {
+  return (
+    state.client === owner.client &&
+    state.operation === owner.operation &&
+    state.inputKey === owner.inputKey &&
+    state.enabled === owner.enabled &&
+    state.attempt === owner.attempt
+  );
+}
+
 export function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -139,29 +165,51 @@ export function useApiQuery(
     [inputKey],
   );
   const [attempt, setAttempt] = useState(0);
-  const [state, setState] = useState<QueryState>(
-    enabled
-      ? { status: 'loading', data: null, error: null }
-      : { status: 'idle', data: null, error: null },
-  );
+  const currentOwner = { client, operation, inputKey, enabled, attempt } as const;
+  const [requestState, setRequestState] = useState<QueryRequestState>(() => ({
+    ...currentOwner,
+    query: initialQueryState(enabled),
+  }));
   const retry = useCallback(() => setAttempt((value) => value + 1), []);
+  const state = ownsQueryRequest(requestState, currentOwner)
+    ? requestState.query
+    : initialQueryState(enabled);
 
   useEffect(() => {
+    const effectOwner = { client, operation, inputKey, enabled, attempt } as const;
     if (!enabled) {
-      setState({ status: 'idle', data: null, error: null });
+      setRequestState({ ...effectOwner, query: initialQueryState(false) });
       return;
     }
     const controller = new AbortController();
-    setState({ status: 'loading', data: null, error: null });
+    setRequestState({ ...effectOwner, query: initialQueryState(true) });
     void client.execute(operation, stableInput, controller.signal).then(
-      (data) => setState({ status: 'success', data, error: null }),
+      (data) => {
+        if (controller.signal.aborted) return;
+        setRequestState((current) =>
+          ownsQueryRequest(current, effectOwner)
+            ? { ...effectOwner, query: { status: 'success', data, error: null } }
+            : current,
+        );
+      },
       (error: unknown) => {
-        if (error instanceof DOMException && error.name === 'AbortError') return;
-        setState({
-          status: 'error',
-          data: null,
-          error: error instanceof Error ? error : new Error('Unknown API failure'),
-        });
+        if (
+          controller.signal.aborted ||
+          (error instanceof DOMException && error.name === 'AbortError')
+        )
+          return;
+        setRequestState((current) =>
+          ownsQueryRequest(current, effectOwner)
+            ? {
+                ...effectOwner,
+                query: {
+                  status: 'error',
+                  data: null,
+                  error: error instanceof Error ? error : new Error('Unknown API failure'),
+                },
+              }
+            : current,
+        );
       },
     );
     return () => controller.abort();

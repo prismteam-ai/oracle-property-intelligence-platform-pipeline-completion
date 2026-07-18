@@ -119,4 +119,5 @@ export function createTestOnlyFixtureClient(): ApiClient {
   });
 }
 
+export const TEST_ONLY_RELEASE_ID = release.releaseId;
 export const TEST_ONLY_FIXTURE_LABEL = FIXTURE_LABEL;

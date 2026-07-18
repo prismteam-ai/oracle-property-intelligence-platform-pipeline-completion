@@ -294,6 +294,42 @@ svg {
   gap: 8px;
 }
 
+.shell-release-status {
+  position: sticky;
+  z-index: 25;
+  top: 72px;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid color-mix(in srgb, var(--accent) 22%, var(--border));
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--bg) 94%, transparent);
+  backdrop-filter: blur(14px);
+  font-size: 11px;
+}
+
+.shell-release-status svg {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.shell-release-status span {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+.shell-release-status strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
 .icon-button {
   display: inline-grid;
   width: 44px;
@@ -1443,6 +1479,10 @@ pre {
 }
 
 @media (min-width: 600px) {
+  .shell-release-status {
+    padding-inline: 28px;
+  }
+
   main {
     padding: 48px 28px 116px;
   }
@@ -1490,6 +1530,10 @@ pre {
 }
 
 @media (min-width: 768px) {
+  .shell-release-status {
+    padding-inline: 40px;
+  }
+
   main {
     padding-inline: 40px;
   }
@@ -1527,6 +1571,11 @@ pre {
   .mobile-header,
   .bottom-navigation {
     display: none;
+  }
+
+  .shell-release-status {
+    top: 0;
+    padding: 10px clamp(40px, 5vw, 72px);
   }
 
   main {
