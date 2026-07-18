@@ -1,10 +1,14 @@
-import { createHash } from 'node:crypto';
+import { createHash, createPublicKey, verify as verifySignature } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import {
   access,
   copyFile,
+  lstat,
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
+  realpath,
   rename,
   rm,
   stat,
@@ -14,6 +18,11 @@ import { basename, dirname, join, relative, resolve } from 'node:path';
 
 import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 
+import type {
+  BoundedPortableReleaseArtifact,
+  BoundedServingReleaseEvidence,
+  BoundedServingReleaseManifest,
+} from './bounded-release.js';
 import {
   buildPortableServingRelease,
   type BuiltServingArtifact,
@@ -242,13 +251,59 @@ export type OwnerFreePublicReleasePaths = Readonly<{
   outputDirectory: string;
 }>;
 
-export type OwnerFreePublicServingClosure = Readonly<{
+export type PublicServingClosure = Readonly<{
   outputDirectory: string;
   manifestSha256: string;
   manifestFileSha256: string;
   manifestCid: string;
   publicArtifactCount: 7;
 }>;
+
+export type OwnerFreePublicServingClosure = PublicServingClosure;
+
+export type BoundedPublicLicenseVerificationInput = Readonly<{
+  authorizationVersion: 'bounded-public-serving-license@1.0.0';
+  trustRootSha256: string;
+  releaseId: string;
+  runId: string;
+  manifestSha256: string;
+  publicArtifactSha256s: readonly string[];
+}>;
+
+export type TrustedBoundedPublicLicenseApproval = Readonly<{
+  authorizationVersion: 'bounded-public-serving-license@1.0.0';
+  trustRootSha256: string;
+  releaseId: string;
+  runId: string;
+  manifestSha256: string;
+  publicArtifactSha256s: readonly string[];
+  decision: 'allowed_public';
+  policyVersion: string;
+  licenseSnapshotRefs: readonly string[];
+}>;
+
+export type SignedBoundedPublicLicenseApproval = Readonly<{
+  authorization: TrustedBoundedPublicLicenseApproval;
+  signatureBase64: string;
+}>;
+
+export interface BoundedPublicLicenseTrust {
+  readonly trustRootSha256: string;
+  readonly publicKeyPem: string;
+  authorizePublicRelease(
+    input: BoundedPublicLicenseVerificationInput,
+  ): Promise<SignedBoundedPublicLicenseApproval | null>;
+}
+
+export type BoundedPublicServingClosureOptions = Readonly<{
+  licenseTrust: BoundedPublicLicenseTrust;
+}>;
+
+export function boundedPublicLicenseAuthorizationBytes(
+  authorization: TrustedBoundedPublicLicenseApproval,
+): Uint8Array {
+  return Buffer.from(`${stableJson(authorization)}\n`);
+}
 
 type AcceptedPipelineManifest = Readonly<{
   runId: string;
@@ -500,6 +555,12 @@ export async function buildOwnerFreePublicServingClosure(
 ): Promise<OwnerFreePublicServingClosure> {
   const sourceRoot = resolve(verifiedBundleDirectory);
   const outputDirectory = resolve(outputDirectoryPath);
+  assertDistinctReleaseRoots(sourceRoot, outputDirectory);
+  await assertPathAncestorsAreReal(sourceRoot);
+  await assertPathAncestorsAreReal(outputDirectory);
+  await rejectReleaseSymlinks(sourceRoot);
+  await assertPathAbsent(outputDirectory);
+  const outputParentIdentity = await prepareRealOutputParent(outputDirectory);
   const verified = await verifyRealCountyReleaseBundle(sourceRoot);
   if (
     verified.releaseId !== OWNER_FREE_RELEASE_ID ||
@@ -550,6 +611,123 @@ export async function buildOwnerFreePublicServingClosure(
   });
   const manifestBytes = Buffer.from(`${stableJson(manifest)}\n`);
   const manifestCid = rawCidV1Sha256(manifestBytes);
+  const servingConfig = createP8ServingConfig(sourceManifest, manifest, manifestCid);
+
+  return stagePublicServingClosure({
+    sourceRoot,
+    outputDirectory,
+    publicArtifacts,
+    manifestBytes,
+    manifestSha256: manifest.manifestSha256,
+    manifestCid,
+    servingConfig,
+    outputParentIdentity,
+  });
+}
+
+/**
+ * Converts any fully verified bounded operator release into the exact nine-file public closure
+ * consumed by CDK. Operator evidence, catalogs, checkpoints, and restricted bytes are verification
+ * inputs only and are never staged.
+ */
+export async function buildBoundedPublicServingClosure(
+  verifiedBundleDirectory: string,
+  outputDirectoryPath: string,
+  options: BoundedPublicServingClosureOptions,
+): Promise<PublicServingClosure> {
+  const sourceRoot = resolve(verifiedBundleDirectory);
+  const outputDirectory = resolve(outputDirectoryPath);
+  assertDistinctReleaseRoots(sourceRoot, outputDirectory);
+  await assertPathAncestorsAreReal(sourceRoot);
+  await assertPathAncestorsAreReal(outputDirectory);
+  await rejectReleaseSymlinks(sourceRoot);
+  await assertPathAbsent(outputDirectory);
+  const outputParentIdentity = await prepareRealOutputParent(outputDirectory);
+
+  // Dynamic import avoids a runtime initialization cycle: bounded-release uses the capability
+  // contract exported by this module.
+  const { verifyBoundedServingRelease } = await import('./bounded-release.js');
+  const verified = await verifyBoundedServingRelease(sourceRoot);
+  const [sourceManifest, sourceEvidence] = await Promise.all([
+    readCanonicalDocument<BoundedServingReleaseManifest>(join(sourceRoot, MANIFEST_FILE)),
+    readCanonicalDocument<BoundedServingReleaseEvidence>(join(sourceRoot, EVIDENCE_FILE)),
+  ]);
+  if (
+    stableJson(sourceManifest) !== stableJson(verified.manifest) ||
+    stableJson(sourceEvidence) !== stableJson(verified.evidence)
+  ) {
+    throw new ReleaseManifestError('Bounded verifier result differs from canonical release files');
+  }
+
+  assertBoundedPublicClosure(sourceManifest, sourceEvidence);
+  const suppliedOptions = options as BoundedPublicServingClosureOptions | undefined;
+
+  const outputParent = dirname(outputDirectory);
+  await assertDirectoryIdentity(outputParent, outputParentIdentity);
+  const projectionRoot = await mkdtemp(
+    join(outputParent, `.${basename(outputDirectory)}.projection-`),
+  );
+  try {
+    await assertDirectoryIdentity(outputParent, outputParentIdentity);
+    const deploymentArtifacts = await materializeCdkPublicArtifacts(
+      sourceRoot,
+      projectionRoot,
+      sourceManifest.artifacts,
+    );
+    const publicManifestPayload = Object.freeze({
+      ...Object.fromEntries(
+        Object.entries(sourceManifest).filter(
+          ([key]) => key !== 'artifacts' && key !== 'manifestSha256',
+        ),
+      ),
+      artifacts: Object.freeze(deploymentArtifacts),
+    });
+    const manifest = Object.freeze({
+      ...publicManifestPayload,
+      manifestSha256: sha256(Buffer.from(`${stableJson(publicManifestPayload)}\n`)),
+    });
+    const manifestBytes = Buffer.from(`${stableJson(manifest)}\n`);
+    const manifestCid = rawCidV1Sha256(manifestBytes);
+    const servingConfig = await createBoundedServingConfig(
+      projectionRoot,
+      sourceManifest,
+      sourceEvidence,
+      manifest,
+      manifestCid,
+    );
+    await requireTrustedPublicLicenseApproval(
+      suppliedOptions?.licenseTrust,
+      Object.freeze({
+        releaseId: sourceManifest.releaseId,
+        runId: sourceManifest.runId,
+        manifestSha256: manifest.manifestSha256,
+      }),
+      deploymentArtifacts,
+    );
+    await assertDirectoryIdentity(outputParent, outputParentIdentity);
+
+    return await stagePublicServingClosure({
+      sourceRoot: projectionRoot,
+      outputDirectory,
+      publicArtifacts: deploymentArtifacts,
+      manifestBytes,
+      manifestSha256: manifest.manifestSha256,
+      manifestCid,
+      servingConfig,
+      outputParentIdentity,
+    });
+  } finally {
+    if (await directoryIdentityMatches(outputParent, outputParentIdentity)) {
+      await rm(projectionRoot, { recursive: true, force: true });
+    }
+  }
+}
+
+function createP8ServingConfig(
+  sourceManifest: RealCountyPortableManifest,
+  manifest: Readonly<{ manifestSha256: string }>,
+  manifestCid: string,
+): Readonly<Record<string, unknown>> {
   const denominator = 19;
   const unsupportedOwnershipLimitation =
     'The accepted public snapshot contains no redistributable ownership-transfer evidence.';
@@ -575,7 +753,7 @@ export async function buildOwnerFreePublicServingClosure(
       }),
     ]),
   );
-  const servingConfig = Object.freeze({
+  return Object.freeze({
     manifestRelativePath: MANIFEST_FILE,
     expected: Object.freeze({
       releaseId: OWNER_FREE_RELEASE_ID,
@@ -598,41 +776,712 @@ export async function buildOwnerFreePublicServingClosure(
       'Owner, applicant, contractor, address, contact, raw payload, and restricted comparison bytes are absent.',
     ]),
   });
+}
 
+async function stagePublicServingClosure(
+  input: Readonly<{
+    sourceRoot: string;
+    outputDirectory: string;
+    publicArtifacts: readonly Pick<
+      BoundedPortableReleaseArtifact,
+      'relation' | 'relativePath' | 'byteSize' | 'sha256'
+    >[];
+    manifestBytes: Uint8Array;
+    manifestSha256: string;
+    manifestCid: string;
+    servingConfig: Readonly<Record<string, unknown>>;
+    outputParentIdentity: DirectoryIdentity;
+  }>,
+): Promise<PublicServingClosure> {
+  const {
+    sourceRoot,
+    outputDirectory,
+    publicArtifacts,
+    manifestBytes,
+    manifestSha256,
+    manifestCid,
+    servingConfig,
+    outputParentIdentity,
+  } = input;
   await assertPathAbsent(outputDirectory);
-  await mkdir(dirname(outputDirectory), { recursive: true });
-  const staging = await mkdtemp(
-    join(dirname(outputDirectory), `.${basename(outputDirectory)}.tmp-`),
-  );
+  const outputParent = dirname(outputDirectory);
+  await assertDirectoryIdentity(outputParent, outputParentIdentity);
+  const staging = await mkdtemp(join(outputParent, `.${basename(outputDirectory)}.tmp-`));
   try {
+    await assertDirectoryIdentity(outputParent, outputParentIdentity);
     await mkdir(join(staging, 'public'), { recursive: true });
     await writeFile(join(staging, MANIFEST_FILE), manifestBytes, { flag: 'wx' });
     await writeCanonicalCreateOnly(join(staging, 'serving-config.json'), servingConfig);
     for (const artifact of publicArtifacts) {
-      const sourcePath = resolve(sourceRoot, artifact.relativePath);
-      const targetPath = resolve(staging, artifact.relativePath);
-      if (!isInside(sourceRoot, sourcePath) || !isInside(staging, targetPath)) {
-        throw new ReleaseSegregationError('Public artifact path escapes the deployment closure');
-      }
+      const sourcePath = await verifiedRegularFile(sourceRoot, artifact.relativePath);
+      const targetPath = resolveInside(staging, artifact.relativePath);
       await copyFile(sourcePath, targetPath, 1);
-      const bytes = await readFile(targetPath);
-      if (bytes.byteLength !== artifact.byteSize || sha256(bytes) !== artifact.sha256) {
+      const copied = await hashRegularFile(targetPath);
+      if (copied.byteSize !== artifact.byteSize || copied.sha256 !== artifact.sha256) {
         throw new ReleaseParityError(`Deployment artifact drifted: ${artifact.relation}`);
       }
     }
+    const stagedFiles = await releaseFiles(staging);
+    const expectedFiles = [
+      MANIFEST_FILE,
+      'serving-config.json',
+      ...OWNER_FREE_PUBLIC_RELATIONS.map(
+        (relation) => `public/${SERVING_RELATIONS[relation].fileName}`,
+      ),
+    ].sort();
+    if (stableJson(stagedFiles) !== stableJson(expectedFiles)) {
+      throw new ReleaseSegregationError('Deployment closure is not the exact nine-file set');
+    }
+    await assertDirectoryIdentity(outputParent, outputParentIdentity);
     await rename(staging, outputDirectory);
   } catch (error) {
+    if (!(await directoryIdentityMatches(outputParent, outputParentIdentity))) {
+      throw new ReleaseSegregationError(
+        'Output parent identity changed; unsafe temporary cleanup was refused',
+      );
+    }
     await rm(staging, { recursive: true, force: true });
     throw error;
   }
 
   return Object.freeze({
     outputDirectory,
-    manifestSha256: manifest.manifestSha256,
+    manifestSha256,
     manifestFileSha256: sha256(manifestBytes),
     manifestCid,
     publicArtifactCount: 7,
   });
+}
+
+function assertBoundedPublicClosure(
+  manifest: BoundedServingReleaseManifest,
+  evidence: BoundedServingReleaseEvidence,
+): readonly BoundedPortableReleaseArtifact[] {
+  if (evidence.releaseScope !== 'partial_county') {
+    throw new ReleaseManifestError(
+      'Generic bounded public closure requires exact partial_county release scope',
+    );
+  }
+  const evidenceRecord = evidence as unknown as Readonly<Record<string, unknown>>;
+  const gates = evidence.gates as unknown as Readonly<Record<string, unknown>>;
+  if (
+    gates.license !== 'passed' ||
+    gates.manifest !== 'passed' ||
+    gates.parquet !== 'passed' ||
+    gates.cleanReopen !== 'passed' ||
+    gates.publicRestrictedSegregation !== 'passed' ||
+    gates.ownerBearingPublicValues !== 0 ||
+    evidenceRecord.publicRestrictedValueOverlap !== 0 ||
+    evidenceRecord.publicRelationCount !== 7 ||
+    evidenceRecord.restrictedRelationCount !== 7 ||
+    evidenceRecord.portableReopen !== 'passed' ||
+    evidenceRecord.schemaOrder !== 'passed' ||
+    evidenceRecord.rowOrder !== 'passed' ||
+    evidenceRecord.immutableHashes !== 'passed'
+  ) {
+    throw new ReleasePrivacyError('Bounded release owner-free verification gates did not pass');
+  }
+  if (
+    manifest.releaseId !== evidence.releaseId ||
+    manifest.runId !== evidence.runId ||
+    manifest.manifestSha256 !== evidence.manifestSha256
+  ) {
+    throw new ReleaseManifestError('Bounded manifest and evidence identities are mixed');
+  }
+  const evidenceArtifacts = manifest.artifacts.map(
+    ({ relation, visibility, relativePath, rowCount, byteSize, sha256: hash }) => ({
+      relation,
+      visibility,
+      relativePath,
+      rowCount,
+      byteSize,
+      sha256: hash,
+    }),
+  );
+  if (stableJson(evidence.artifacts) !== stableJson(evidenceArtifacts)) {
+    throw new ReleaseManifestError('Bounded evidence artifact inventory differs from the manifest');
+  }
+  const expectedCatalogs = new Map<ServingVisibility, string>([
+    ['public', 'public/oracle-public.duckdb'],
+    ['restricted', 'restricted/oracle-restricted.duckdb'],
+  ]);
+  if (
+    evidence.catalogs.length !== expectedCatalogs.size ||
+    evidence.catalogs.some(
+      ({ visibility, relativePath, relationCount }) =>
+        expectedCatalogs.get(visibility) !== relativePath || (relationCount as unknown) !== 7,
+    )
+  ) {
+    throw new ReleaseParityError('Bounded release portable catalog evidence is incomplete');
+  }
+
+  const publicArtifacts = manifest.artifacts.filter(({ visibility }) => visibility === 'public');
+  const restrictedArtifacts = manifest.artifacts.filter(
+    ({ visibility }) => visibility === 'restricted',
+  );
+  assertExactRelationInventory(publicArtifacts, 'public');
+  assertExactRelationInventory(restrictedArtifacts, 'restricted');
+  for (const artifact of publicArtifacts) assertPublicArtifactLineage(manifest, artifact);
+  return Object.freeze(publicArtifacts);
+}
+
+async function requireTrustedPublicLicenseApproval(
+  trust: BoundedPublicLicenseTrust | undefined,
+  manifest: Readonly<{ releaseId: string; runId: string; manifestSha256: string }>,
+  publicArtifacts: readonly Pick<ReleaseArtifact, 'relation' | 'relativePath' | 'sha256'>[],
+): Promise<void> {
+  if (trust === undefined || typeof trust.authorizePublicRelease !== 'function') {
+    throw new ReleaseLicenseError(
+      'Bounded public closure requires an explicit trusted license authorizer',
+    );
+  }
+  assertSha256(trust.trustRootSha256, 'bounded public license trust root');
+  let publicKey;
+  try {
+    publicKey = createPublicKey(trust.publicKeyPem);
+  } catch {
+    throw new ReleaseLicenseError('Bounded public license trust root is not a valid public key');
+  }
+  if (publicKey.asymmetricKeyType !== 'ed25519') {
+    throw new ReleaseLicenseError(
+      'Bounded public license trust root must be an Ed25519 public key',
+    );
+  }
+  const actualTrustRootSha256 = sha256(publicKey.export({ format: 'der', type: 'spki' }));
+  if (actualTrustRootSha256 !== trust.trustRootSha256) {
+    throw new ReleaseLicenseError(
+      'Bounded public license trust-root fingerprint does not match the supplied public key',
+    );
+  }
+  const verificationInput = Object.freeze({
+    authorizationVersion: 'bounded-public-serving-license@1.0.0' as const,
+    trustRootSha256: actualTrustRootSha256,
+    releaseId: manifest.releaseId,
+    runId: manifest.runId,
+    manifestSha256: manifest.manifestSha256,
+    publicArtifactSha256s: Object.freeze(
+      publicArtifacts
+        .map(
+          ({ relation, relativePath, sha256: artifactSha256 }) =>
+            `${relation}:${relativePath}:${artifactSha256}`,
+        )
+        .sort(),
+    ),
+  } satisfies BoundedPublicLicenseVerificationInput);
+  const signedApproval = await trust.authorizePublicRelease(verificationInput);
+  if (signedApproval === null) {
+    throw new ReleaseLicenseError('Trusted license authorizer denied this release');
+  }
+  const approval = signedApproval.authorization;
+  const authorizationVersion: string = approval.authorizationVersion;
+  const decision: string = approval.decision;
+  if (
+    authorizationVersion !== verificationInput.authorizationVersion ||
+    approval.trustRootSha256 !== verificationInput.trustRootSha256 ||
+    approval.releaseId !== verificationInput.releaseId ||
+    approval.runId !== verificationInput.runId ||
+    decision !== 'allowed_public' ||
+    approval.policyVersion.trim().length === 0 ||
+    approval.manifestSha256 !== verificationInput.manifestSha256 ||
+    stableJson(approval.publicArtifactSha256s) !==
+      stableJson(verificationInput.publicArtifactSha256s) ||
+    approval.licenseSnapshotRefs.length === 0 ||
+    approval.licenseSnapshotRefs.some((reference) => reference.trim().length === 0) ||
+    new Set(approval.licenseSnapshotRefs).size !== approval.licenseSnapshotRefs.length
+  ) {
+    throw new ReleaseLicenseError('Trusted license authorizer did not approve this exact release');
+  }
+  const signature = strictBase64(signedApproval.signatureBase64, 'license authorization signature');
+  if (
+    signature.byteLength !== 64 ||
+    !verifySignature(null, boundedPublicLicenseAuthorizationBytes(approval), publicKey, signature)
+  ) {
+    throw new ReleaseLicenseError('Trusted license authorization signature is invalid');
+  }
+}
+
+function assertExactRelationInventory(
+  artifacts: readonly BoundedPortableReleaseArtifact[],
+  visibility: ServingVisibility,
+): void {
+  const relations = artifacts.map(({ relation }) => relation).sort();
+  if (stableJson(relations) !== stableJson([...OWNER_FREE_PUBLIC_RELATIONS].sort())) {
+    throw new ReleaseManifestError(
+      `Bounded ${visibility} release must contain the exact seven serving relations`,
+    );
+  }
+  for (const artifact of artifacts) {
+    const expectedPath = `${visibility}/${SERVING_RELATIONS[artifact.relation].fileName}`;
+    if (artifact.visibility !== visibility || artifact.relativePath !== expectedPath) {
+      throw new ReleaseSegregationError(
+        `Bounded ${visibility}/${artifact.relation} path is not canonical`,
+      );
+    }
+    resolveInside('.', artifact.relativePath);
+  }
+}
+
+function assertPublicArtifactLineage(
+  manifest: BoundedServingReleaseManifest,
+  artifact: BoundedPortableReleaseArtifact,
+): void {
+  if (artifact.sourceLineage.length === 0) {
+    throw new ReleaseManifestError(`Public ${artifact.relation} has no source lineage`);
+  }
+  const identities = new Set<string>();
+  for (const lineage of artifact.sourceLineage) {
+    const lineageRecord = lineage as unknown as Readonly<Record<string, unknown>>;
+    const identity = `${lineage.sourceId}\0${lineage.snapshotId}`;
+    if (
+      identities.has(identity) ||
+      !manifest.sourceIds.includes(lineage.sourceId) ||
+      lineage.snapshotId.trim().length === 0 ||
+      (lineageRecord.role !== 'direct' && lineageRecord.role !== 'derived') ||
+      lineage.contributors.length === 0 ||
+      lineage.contributors.some((contributor) => contributor.trim().length === 0) ||
+      new Set(lineage.contributors).size !== lineage.contributors.length
+    ) {
+      throw new ReleaseManifestError(`Public ${artifact.relation} lineage is malformed`);
+    }
+    assertSha256(lineage.sourceSha256, `${artifact.relation} source lineage hash`);
+    assertSha256(lineage.schemaSha256, `${artifact.relation} schema lineage hash`);
+    if (lineage.asOf !== null) assertInstant(lineage.asOf, `${artifact.relation} lineage asOf`);
+    identities.add(identity);
+  }
+}
+
+function toPrivacyArtifact(
+  artifact: Pick<
+    BoundedPortableReleaseArtifact,
+    | 'relation'
+    | 'relativePath'
+    | 'visibility'
+    | 'mediaType'
+    | 'byteSize'
+    | 'sha256'
+    | 'rowCount'
+    | 'schemaSha256'
+    | 'columns'
+    | 'nonNullCounts'
+  >,
+): BuiltServingArtifact {
+  return Object.freeze({
+    relation: artifact.relation,
+    relativePath: artifact.relativePath,
+    visibility: artifact.visibility,
+    mediaType: artifact.mediaType,
+    byteSize: artifact.byteSize,
+    sha256: artifact.sha256,
+    rowCount: artifact.rowCount,
+    schemaSha256: artifact.schemaSha256,
+    columns: artifact.columns,
+    nonNullCounts: artifact.nonNullCounts,
+  });
+}
+
+async function materializeCdkPublicArtifacts(
+  sourceRoot: string,
+  projectionRoot: string,
+  sourceArtifacts: readonly BoundedPortableReleaseArtifact[],
+): Promise<readonly ReleaseArtifact[]> {
+  await mkdir(join(projectionRoot, 'public'), { recursive: true });
+  await mkdir(join(projectionRoot, 'restricted'), { recursive: true });
+  for (const artifact of sourceArtifacts) {
+    const sourcePath = await verifiedRegularFile(sourceRoot, artifact.relativePath);
+    const targetPath = resolveInside(projectionRoot, artifact.relativePath);
+    await copyFile(sourcePath, targetPath, 1);
+    const copied = await hashRegularFile(targetPath);
+    if (copied.byteSize !== artifact.byteSize || copied.sha256 !== artifact.sha256) {
+      throw new ReleaseParityError(`Operator artifact changed while copying: ${artifact.relation}`);
+    }
+  }
+  await rejectReleaseSymlinks(sourceRoot);
+
+  const instance = await DuckDBInstance.create(':memory:', { threads: '1' });
+  const connection = await instance.connect();
+  const artifacts: ReleaseArtifact[] = [];
+  try {
+    for (const artifact of sourceArtifacts.filter(({ visibility }) => visibility === 'public')) {
+      const targetPath = resolveInside(projectionRoot, artifact.relativePath);
+      if (artifact.relation !== 'property_query' && artifact.relation !== 'data_dictionary') {
+        artifacts.push(toRuntimePublicArtifact(artifact));
+        continue;
+      }
+
+      const definition = SERVING_RELATIONS[artifact.relation];
+      const columns = definition.columns.map(({ name }) => quoteIdentifier(name)).join(', ');
+      const predicate =
+        artifact.relation === 'data_dictionary'
+          ? " WHERE NOT (relation_name = 'property_query' AND column_name IN ('source_ids_json', 'field_source_ids_json'))"
+          : '';
+      const order = definition.sortColumns.map(quoteIdentifier).join(', ');
+      const projectedPath = `${targetPath}.projected`;
+      await connection.run(
+        `COPY (SELECT ${columns} FROM read_parquet('${sqlPath(targetPath)}')${predicate} ORDER BY ${order}) TO '${sqlPath(projectedPath)}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)`,
+      );
+      await rm(targetPath);
+      await rename(projectedPath, targetPath);
+      const file = await hashRegularFile(targetPath);
+      const rowCount = await scalarCount(
+        connection,
+        `SELECT count(*)::BIGINT AS count FROM read_parquet('${sqlPath(targetPath)}')`,
+      );
+      const nonNullSelections = definition.columns
+        .map(({ name }) => `count(${quoteIdentifier(name)})::BIGINT AS ${quoteIdentifier(name)}`)
+        .join(', ');
+      const nonNullResult = await connection.runAndReadAll(
+        `SELECT ${nonNullSelections} FROM read_parquet('${sqlPath(targetPath)}')`,
+      );
+      const nonNullRow = nonNullResult.getRowObjects()[0];
+      if (nonNullRow === undefined) {
+        throw new ReleaseParityError(`Projected artifact counts are absent: ${artifact.relation}`);
+      }
+      const nonNullCounts = Object.fromEntries(
+        definition.columns.map(({ name }) => {
+          const count = Number(nonNullRow[name]);
+          if (!Number.isSafeInteger(count) || count < 0 || count > rowCount) {
+            throw new ReleaseParityError(
+              `Projected artifact count is invalid: ${artifact.relation}.${name}`,
+            );
+          }
+          return [name, count];
+        }),
+      );
+      artifacts.push(
+        toRuntimePublicArtifact(artifact, {
+          ...artifact,
+          byteSize: file.byteSize,
+          sha256: file.sha256,
+          rowCount,
+          schemaSha256: sha256(Buffer.from(stableJson(definition.columns))),
+          columns: definition.columns,
+          nonNullCounts: Object.freeze(nonNullCounts),
+          grain: definition.grain,
+        }),
+      );
+    }
+  } finally {
+    connection.closeSync();
+    instance.closeSync();
+  }
+  const frozen = Object.freeze(artifacts);
+  await verifyServingArtifacts(projectionRoot, frozen.map(toPrivacyArtifact));
+  const restrictedArtifacts = sourceArtifacts
+    .filter(({ visibility }) => visibility === 'restricted')
+    .map(toPrivacyArtifact);
+  const privacy = await verifyPublicRestrictedPrivacy(projectionRoot, [
+    ...frozen.map(toPrivacyArtifact),
+    ...restrictedArtifacts,
+  ]);
+  if (privacy.ownerBearingPublicValues !== 0) {
+    throw new ReleasePrivacyError(
+      `Final public projection intersects ${privacy.ownerBearingPublicValues} restricted value hashes`,
+    );
+  }
+  return frozen;
+}
+
+function toRuntimePublicArtifact(
+  source: BoundedPortableReleaseArtifact,
+  values: BoundedPortableReleaseArtifact = source,
+): ReleaseArtifact {
+  return Object.freeze({
+    relation: values.relation,
+    relativePath: values.relativePath,
+    visibility: values.visibility,
+    mediaType: values.mediaType,
+    byteSize: values.byteSize,
+    sha256: values.sha256,
+    rowCount: values.rowCount,
+    schemaSha256: values.schemaSha256,
+    columns: values.columns,
+    nonNullCounts: values.nonNullCounts,
+    grain: values.grain,
+    sourceLineage: Object.freeze(
+      source.sourceLineage.map(({ sourceId, snapshotId, sourceSha256, schemaSha256, asOf, role }) =>
+        Object.freeze({ sourceId, snapshotId, sourceSha256, schemaSha256, asOf, role }),
+      ),
+    ),
+    limitations: values.limitations,
+  });
+}
+
+const FEATURE_SUPPORT_COLUMNS = Object.freeze({
+  roof_age: 'roof_support_class',
+  water_view_candidate: 'water_support_class',
+  ownership_age: 'ownership_support_class',
+  regional_owner: 'regional_owner_support_class',
+  transit_walkability: 'transit_support_class',
+  starbucks_walkability: 'starbucks_support_class',
+} as const satisfies Readonly<Record<OwnerFreeFeature, string>>);
+
+async function createBoundedServingConfig(
+  projectionRoot: string,
+  sourceManifest: BoundedServingReleaseManifest,
+  sourceEvidence: BoundedServingReleaseEvidence,
+  manifest: Readonly<{ manifestSha256: string }>,
+  manifestCid: string,
+): Promise<Readonly<Record<string, unknown>>> {
+  const propertyPath = await verifiedRegularFile(projectionRoot, 'public/property-query.parquet');
+  const pipelinePath = await verifiedRegularFile(projectionRoot, 'public/pipeline-runs.parquet');
+  const instance = await DuckDBInstance.create(':memory:', { threads: '1' });
+  const connection = await instance.connect();
+  try {
+    const matchingRuns = await scalarCount(
+      connection,
+      `SELECT count(*)::BIGINT AS count FROM read_parquet('${sqlPath(pipelinePath)}') WHERE run_id = '${sqlLiteral(sourceManifest.runId)}' AND status = '${sqlLiteral(sourceEvidence.runStatus)}'`,
+    );
+    if (matchingRuns !== 1) {
+      throw new ReleaseManifestError(
+        'Pipeline run rows are mixed with the bounded release identity',
+      );
+    }
+    const propertyArtifact = sourceManifest.artifacts.find(
+      ({ visibility, relation }) => visibility === 'public' && relation === 'property_query',
+    );
+    if (propertyArtifact === undefined) {
+      throw new ReleaseCompletenessError('Bounded release has no public property relation');
+    }
+    const capabilities = Object.fromEntries(
+      await Promise.all(
+        OWNER_FREE_FEATURES.map(async (criterion) => {
+          const column = quoteIdentifier(FEATURE_SUPPORT_COLUMNS[criterion]);
+          const grouped = await connection.runAndReadAll(
+            `SELECT ${column} AS support_class, count(*)::BIGINT AS count FROM read_parquet('${sqlPath(propertyPath)}') GROUP BY ${column} ORDER BY ${column}`,
+          );
+          const counts = new Map<string, number>();
+          for (const row of grouped.getRowObjects()) {
+            const supportClass = row.support_class;
+            const count = Number(row.count);
+            if (
+              typeof supportClass !== 'string' ||
+              !['supported', 'proxy', 'unknown', 'unsupported'].includes(supportClass) ||
+              !Number.isSafeInteger(count) ||
+              count < 0
+            ) {
+              throw new ReleaseCompletenessError(
+                `Public ${criterion} support-class coverage is invalid`,
+              );
+            }
+            counts.set(supportClass, count);
+          }
+          const observed = [...counts.values()].reduce((total, count) => total + count, 0);
+          if (observed !== propertyArtifact.rowCount) {
+            throw new ReleaseParityError(`Public ${criterion} coverage denominator drifted`);
+          }
+          const denominator = propertyArtifact.rowCount;
+          const numerator = counts.get('supported') ?? 0;
+          const positive = numerator + (counts.get('proxy') ?? 0);
+          const state =
+            denominator > 0 && numerator === denominator
+              ? ('supported' as const)
+              : positive > 0
+                ? ('partial' as const)
+                : ('blocked' as const);
+          const supportClasses =
+            counts.size === 0
+              ? Object.freeze(['unknown'])
+              : Object.freeze([...counts.keys()].sort());
+          const limitations =
+            state === 'supported'
+              ? Object.freeze([])
+              : Object.freeze([
+                  state === 'partial'
+                    ? `Public ${criterion} evidence is partial in bounded release ${sourceManifest.releaseId}.`
+                    : `No supported or proxy public ${criterion} evidence is present in bounded release ${sourceManifest.releaseId}.`,
+                ]);
+          return [
+            criterion,
+            Object.freeze({ state, supportClasses, numerator, denominator, limitations }),
+          ] as const;
+        }),
+      ),
+    );
+
+    return Object.freeze({
+      manifestRelativePath: MANIFEST_FILE,
+      expected: Object.freeze({
+        releaseId: sourceManifest.releaseId,
+        runId: sourceManifest.runId,
+        manifestSha256: manifest.manifestSha256,
+        manifestCid,
+        asOf: sourceManifest.generatedAt,
+        schemaVersion: sourceManifest.contractVersion,
+        policyVersion: 'owner-free-public-serving@1.0.0',
+      }),
+      rankingWeights: Object.freeze(
+        OWNER_FREE_FEATURES.map((criterion) =>
+          Object.freeze({ criterion, weight: 1, proxyMultiplier: 0.5 }),
+        ),
+      ),
+      capabilities: Object.freeze(capabilities),
+      limitations: Object.freeze([
+        `Verified ${sourceEvidence.releaseScope} bounded release; run status ${sourceEvidence.runStatus}.`,
+        'Restricted artifacts, operator evidence, catalogs, and checkpoints are absent from this public closure.',
+      ]),
+    });
+  } finally {
+    connection.closeSync();
+    instance.closeSync();
+  }
+}
+
+function assertDistinctReleaseRoots(sourceRoot: string, outputDirectory: string): void {
+  if (
+    sourceRoot === outputDirectory ||
+    isInside(sourceRoot, outputDirectory) ||
+    isInside(outputDirectory, sourceRoot)
+  ) {
+    throw new ReleaseSegregationError('Source and public closure directories must be disjoint');
+  }
+}
+
+type DirectoryIdentity = Readonly<{
+  device: string;
+  inode: string;
+  realPath: string;
+}>;
+
+async function prepareRealOutputParent(outputDirectory: string): Promise<DirectoryIdentity> {
+  await assertPathAncestorsAreReal(outputDirectory);
+  const parent = dirname(outputDirectory);
+  await mkdir(parent, { recursive: true });
+  await assertPathAncestorsAreReal(parent);
+  return directoryIdentity(parent);
+}
+
+async function assertPathAncestorsAreReal(path: string): Promise<void> {
+  const ancestors: string[] = [];
+  let cursor = resolve(path);
+  for (;;) {
+    ancestors.push(cursor);
+    const parent = dirname(cursor);
+    if (parent === cursor) break;
+    cursor = parent;
+  }
+  for (const ancestor of ancestors.reverse()) {
+    let metadata;
+    try {
+      metadata = await lstat(ancestor);
+    } catch (error) {
+      if (isMissingPathError(error)) continue;
+      throw error;
+    }
+    if (metadata.isSymbolicLink()) {
+      throw new ReleaseSegregationError(`Symlink or junction ancestor is prohibited: ${ancestor}`);
+    }
+    const actual = await realpath(ancestor);
+    if (normalizedFilesystemPath(actual) !== normalizedFilesystemPath(ancestor)) {
+      throw new ReleaseSegregationError(`Reparse ancestor is prohibited: ${ancestor}`);
+    }
+  }
+}
+
+async function directoryIdentity(path: string): Promise<DirectoryIdentity> {
+  const metadata = await lstat(path);
+  if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+    throw new ReleaseSegregationError(`Output parent must remain a real directory: ${path}`);
+  }
+  return Object.freeze({
+    device: String(metadata.dev),
+    inode: String(metadata.ino),
+    realPath: normalizedFilesystemPath(await realpath(path)),
+  });
+}
+
+async function assertDirectoryIdentity(path: string, expected: DirectoryIdentity): Promise<void> {
+  const current = await directoryIdentity(path);
+  if (stableJson(current) !== stableJson(expected)) {
+    throw new ReleaseSegregationError('Output parent identity changed during closure staging');
+  }
+}
+
+async function directoryIdentityMatches(
+  path: string,
+  expected: DirectoryIdentity,
+): Promise<boolean> {
+  try {
+    return stableJson(await directoryIdentity(path)) === stableJson(expected);
+  } catch {
+    return false;
+  }
+}
+
+function normalizedFilesystemPath(path: string): string {
+  const normalized = resolve(path);
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    'code' in error &&
+    (error as Readonly<{ code?: unknown }>).code === 'ENOENT'
+  );
+}
+
+async function rejectReleaseSymlinks(root: string): Promise<void> {
+  const rootEntry = await lstat(root);
+  if (rootEntry.isSymbolicLink() || !rootEntry.isDirectory()) {
+    throw new ReleaseSegregationError('Operator release root must be a real directory');
+  }
+  const visit = async (directory: string): Promise<void> => {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const path = join(directory, entry.name);
+      const metadata = await lstat(path);
+      if (metadata.isSymbolicLink()) {
+        throw new ReleaseSegregationError(
+          `Symlinks are prohibited in operator releases: ${entry.name}`,
+        );
+      }
+      if (metadata.isDirectory()) await visit(path);
+      else if (!metadata.isFile()) {
+        throw new ReleaseSegregationError(`Unsupported operator release entry: ${entry.name}`);
+      }
+    }
+  };
+  await visit(root);
+}
+
+async function verifiedRegularFile(root: string, relativePath: string): Promise<string> {
+  const path = resolveInside(root, relativePath);
+  const metadata = await lstat(path);
+  if (metadata.isSymbolicLink() || !metadata.isFile()) {
+    throw new ReleaseSegregationError(`Release entry must be a regular file: ${relativePath}`);
+  }
+  const [realRoot, realPath] = await Promise.all([realpath(root), realpath(path)]);
+  if (!isInside(realRoot, realPath)) {
+    throw new ReleaseSegregationError(`Release entry escapes its root: ${relativePath}`);
+  }
+  return path;
+}
+
+async function hashRegularFile(
+  path: string,
+): Promise<Readonly<{ byteSize: number; sha256: string }>> {
+  const hash = createHash('sha256');
+  let byteSize = 0;
+  for await (const chunk of createReadStream(path)) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    hash.update(bytes);
+    byteSize += bytes.byteLength;
+  }
+  return Object.freeze({ byteSize, sha256: hash.digest('hex') });
+}
+
+async function releaseFiles(root: string, prefix = ''): Promise<string[]> {
+  const files: string[] = [];
+  for (const entry of await readdir(join(root, prefix), { withFileTypes: true })) {
+    const relativePath = prefix.length === 0 ? entry.name : `${prefix}/${entry.name}`;
+    if (entry.isSymbolicLink()) {
+      throw new ReleaseSegregationError(`Symlink entered staged closure: ${relativePath}`);
+    }
+    if (entry.isDirectory()) files.push(...(await releaseFiles(root, relativePath)));
+    else if (entry.isFile()) files.push(relativePath);
+    else throw new ReleaseSegregationError(`Unsupported staged entry: ${relativePath}`);
+  }
+  return files.sort();
 }
 
 function acceptedPipelineManifest(value: unknown): AcceptedPipelineManifest {
@@ -2355,6 +3204,22 @@ function rawCidV1Sha256(bytes: Uint8Array): string {
 
 function sha256(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+function strictBase64(value: unknown, label: string): Buffer {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value.length % 4 !== 0 ||
+    !/^[A-Za-z0-9+/]*={0,2}$/u.test(value)
+  ) {
+    throw new ReleaseLicenseError(`${label} must be canonical base64`);
+  }
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.toString('base64') !== value) {
+    throw new ReleaseLicenseError(`${label} must be canonical base64`);
+  }
+  return bytes;
 }
 
 export class ReleaseCompletenessError extends Error {
