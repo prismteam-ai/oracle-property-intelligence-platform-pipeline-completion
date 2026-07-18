@@ -497,15 +497,206 @@ describe('Oracle evaluator routes', () => {
     expect(within(table).getByText('string')).toBeTruthy();
   });
 
-  it('shows a model-unavailable state and then a cited tool trace', async () => {
+  it('renders a terminal cited answer with the selected profile, release, limitations, and safe named-tool trace', async () => {
+    renderRoute('/agent?q=Which+properties+have+old+roofs%3F');
+    expect(await screen.findByRole('status', { name: 'Agent available' })).toHaveProperty(
+      'textContent',
+      expect.stringContaining('test-only-bedrock-profile'),
+    );
+    expect(
+      screen.getByText('Test-only model profile; no live provider call was performed.'),
+    ).toBeTruthy();
+    expect(await screen.findByRole('heading', { name: 'Answer' })).toBeTruthy();
+    expect(screen.getByText('complete')).toBeTruthy();
+    expect(screen.getAllByText(TEST_ONLY_RELEASE_ID).length).toBeGreaterThanOrEqual(2);
+    const citations = screen.getByRole('heading', { name: 'Exact citations' }).closest('section');
+    expect(citations).not.toBeNull();
+    if (citations === null) throw new Error('Citation section was not rendered.');
+    expect(within(citations).getByText('TEST-EVIDENCE-001')).toBeTruthy();
+    const trace = screen.getByRole('heading', { name: 'Named-tool trace' }).closest('section');
+    expect(trace).not.toBeNull();
+    if (trace === null) throw new Error('Named-tool trace was not rendered.');
+    expect(within(trace).getByText('find_roof_age_candidates')).toBeTruthy();
+    expect(within(trace).getByText('Call 1')).toBeTruthy();
+    expect(trace.textContent).not.toMatch(/raw arguments|reasoning payload|SELECT_SECRET/iu);
+  });
+
+  it('waits for the agent status probe before enabling controls or sending an answer request', async () => {
+    const fixtureClient = createTestOnlyFixtureClient();
+    let resolveStatus: ((value: ApiEnvelope) => void) | undefined;
+    const pendingStatus = new Promise<ApiEnvelope>((resolve) => {
+      resolveStatus = resolve;
+    });
+    let askCalls = 0;
+    const client: ApiClient = {
+      execute(operation, input, signal) {
+        if (operation === 'agent.status') return pendingStatus;
+        if (operation === 'agent.ask') askCalls += 1;
+        return fixtureClient.execute(operation, input, signal);
+      },
+    };
+    renderRoute('/agent?q=Bounded+question', client);
+    expect(
+      await screen.findByRole('heading', { name: 'Checking agent availability' }),
+    ).toBeTruthy();
+    expect(screen.getByRole('textbox', { name: 'Property intelligence question' })).toHaveProperty(
+      'disabled',
+      true,
+    );
+    expect(askCalls).toBe(0);
+
+    const statusEnvelope = await fixtureClient.execute('agent.status', {
+      releaseId: TEST_ONLY_RELEASE_ID,
+    });
+    resolveStatus?.(statusEnvelope);
+    expect(await screen.findByRole('heading', { name: 'Answer' })).toBeTruthy();
+    expect(askCalls).toBe(1);
+  });
+
+  it('keeps degraded agent status conspicuous and never requests or displays a canned answer', async () => {
+    let askCalls = 0;
+    const client = createOverrideClient((operation, _input, envelope) => {
+      if (operation === 'agent.ask') {
+        askCalls += 1;
+        return null;
+      }
+      if (operation !== 'agent.status') return null;
+      return {
+        ...envelope,
+        limitations: ['The selected model probe failed.'],
+        data: {
+          status: 'unavailable',
+          modelProfileId: null,
+          policyHash: 'sha256:test-only-policy',
+          limitations: ['Agent synthesis is disabled until the profile is qualified.'],
+        },
+      };
+    });
+    renderRoute('/agent?q=Do+not+substitute', client);
+    expect(await screen.findByRole('alert', { name: 'Agent unavailable' })).toHaveProperty(
+      'textContent',
+      expect.stringContaining('Agent synthesis is disabled'),
+    );
+    expect(screen.getByRole('heading', { name: 'Agent answer unavailable' })).toBeTruthy();
+    expect(
+      screen.getByText(/No canned or deterministic answer has been substituted/u),
+    ).toBeTruthy();
+    expect(screen.queryByRole('heading', { name: 'Answer' })).toBeNull();
+    expect(askCalls).toBe(0);
+  });
+
+  it('announces a terminal agent error without exposing provider output or fallback text', async () => {
+    const client = createOverrideClient((operation) => {
+      if (operation === 'agent.ask')
+        return Promise.reject(new Error('Bounded agent request failed.'));
+      return null;
+    });
+    renderRoute('/agent?q=Trigger+the+bounded+request', client);
+    const alerts = await screen.findAllByRole('alert');
+    expect(
+      alerts.some((alert) => alert.textContent.includes('Bounded agent request failed.')),
+    ).toBe(true);
+    expect(screen.queryByRole('heading', { name: 'Answer' })).toBeNull();
+    expect(screen.queryByText(/provider raw output|fallback synthesis/iu)).toBeNull();
+  });
+
+  it('rejects a release-mismatched named-tool trace instead of rendering a partial answer', async () => {
+    const client = createOverrideClient((operation, _input, envelope) => {
+      if (operation !== 'agent.ask') return null;
+      return {
+        ...envelope,
+        data: {
+          status: 'complete',
+          answer: 'This synthesis must not be displayed.',
+          citations: ['TEST-EVIDENCE-001'],
+          toolCalls: [
+            {
+              callIndex: 1,
+              toolName: 'find_roof_age_candidates',
+              releaseId: 'release-mismatch',
+              evidenceIds: ['TEST-EVIDENCE-001'],
+            },
+          ],
+        },
+      };
+    });
+    renderRoute('/agent?q=Check+release+continuity', client);
+    expect(await screen.findByRole('heading', { name: 'Agent response unavailable' })).toBeTruthy();
+    expect(screen.queryByText('This synthesis must not be displayed.')).toBeNull();
+    expect(screen.queryByRole('heading', { name: 'Exact citations' })).toBeNull();
+  });
+
+  it('deep-links to the SQL-free console and renders complete DuckDB terminal metadata accessibly', async () => {
+    const result = renderRoute('/query-console');
+    expect(
+      await screen.findByRole('heading', { level: 1, name: 'SQL-free DuckDB named query console' }),
+    ).toBeTruthy();
+    expect(screen.getByRole('combobox', { name: 'Fixed named operation' })).toHaveProperty(
+      'value',
+      'get_dataset_info',
+    );
+    const receipt = await screen.findByRole('heading', {
+      name: 'DuckDB named query complete',
+    });
+    const receiptSection = receipt.closest('section');
+    expect(receiptSection).not.toBeNull();
+    if (receiptSection === null) throw new Error('Query receipt was not rendered.');
+    expect(within(receiptSection).getByText('get_dataset_info')).toBeTruthy();
+    expect(within(receiptSection).getByText('v1.4.5-test')).toBeTruthy();
+    expect(within(receiptSection).getByText('1')).toBeTruthy();
+    expect(within(receiptSection).getByText(TEST_ONLY_RELEASE_ID)).toBeTruthy();
+    expect(screen.queryByRole('textbox')).toBeNull();
+    expect((await axe(result.container)).violations).toHaveLength(0);
+  });
+
+  it('sends only the selected fixed operation and its bounded structured fields', async () => {
     const user = userEvent.setup();
-    renderRoute('/agent');
-    expect((await screen.findByRole('alert')).textContent).toContain('Agent unavailable');
-    const prompt = screen.getByRole('textbox', { name: 'Property intelligence question' });
-    await user.type(prompt, 'Which properties have old roofs?');
-    await user.click(screen.getByRole('button', { name: 'Ask agent' }));
-    expect(await screen.findByRole('heading', { name: 'Tool trace' })).toBeTruthy();
-    expect(screen.getAllByText(/TEST-EVIDENCE-001/u).length).toBeGreaterThanOrEqual(1);
+    let inquiryInput: Readonly<Record<string, unknown>> | null = null;
+    const client = createOverrideClient((operation, input) => {
+      if (operation === 'inquiry.roofAge') inquiryInput = input;
+      return null;
+    });
+    renderRoute('/query-console', client);
+    await screen.findByRole('heading', { name: 'DuckDB named query complete' });
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Fixed named operation' }),
+      'find_roof_age_candidates',
+    );
+    await user.clear(screen.getByRole('spinbutton', { name: 'Maximum rows' }));
+    await user.type(screen.getByRole('spinbutton', { name: 'Maximum rows' }), '10');
+    await user.clear(screen.getByRole('spinbutton', { name: 'Minimum roof age (years)' }));
+    await user.type(screen.getByRole('spinbutton', { name: 'Minimum roof age (years)' }), '20');
+    await user.type(screen.getByRole('textbox', { name: 'City' }), 'Palo Alto');
+    await user.click(screen.getByRole('button', { name: 'Run fixed operation' }));
+    await waitFor(() =>
+      expect(inquiryInput).toEqual({
+        releaseId: TEST_ONLY_RELEASE_ID,
+        limit: 10,
+        city: 'Palo Alto',
+        minimumAgeYears: 20,
+        includeProxy: false,
+      }),
+    );
+    expect(await screen.findByText('find_roof_age_candidates')).toBeTruthy();
+  });
+
+  it('rejects arbitrary console authority without echoing it or dispatching a second metadata request', async () => {
+    let datasetInfoCalls = 0;
+    const client = createOverrideClient((operation) => {
+      if (operation === 'dataset.getInfo') datasetInfoCalls += 1;
+      return null;
+    });
+    renderRoute(
+      '/query-console?operation=get_dataset_info&sql=SELECT_SECRET&url=https%3A%2F%2Fblocked.example',
+      client,
+    );
+    expect(await screen.findByRole('alert')).toHaveProperty(
+      'textContent',
+      expect.stringContaining('unsupported authority'),
+    );
+    expect(screen.queryByText(/SELECT_SECRET|blocked\.example/u)).toBeNull();
+    expect(screen.queryByRole('textbox')).toBeNull();
+    expect(datasetInfoCalls).toBe(1);
   });
 
   it('renders a conspicuous fail-closed production composition error', async () => {

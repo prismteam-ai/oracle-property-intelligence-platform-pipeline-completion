@@ -3,6 +3,11 @@ import { isAbsolute, resolve } from 'node:path';
 
 import type { NamedQueryName } from '@oracle/contracts';
 import {
+  createProductionOracleAgent,
+  type ProductionOracleAgentComposition,
+  type ProductionOracleAgentDependencies,
+} from '@oracle/agent';
+import {
   ProductionServingError,
   createProductionServingService,
   type ProductionServingConfig,
@@ -12,6 +17,8 @@ import type { RankingWeight } from '@oracle/query-core/inquiries/contracts';
 
 import { ApiFailure } from './errors.js';
 import type {
+  AgentRequest,
+  BoundedAgentService,
   ImmutableQueryService,
   QueryRequest,
   QueryResult,
@@ -45,6 +52,10 @@ type ServingConfigDocument = Omit<ProductionServingConfig, 'releaseRoot' | 'curs
 
 export type ProductionCompositionDependencies = Readonly<{
   createServingService?: (config: ProductionServingConfig) => Promise<ProductionServingService>;
+  testOnlyAgentDependencies?: Readonly<{
+    label: 'TEST_ONLY_DETERMINISTIC_AGENT';
+    dependencies: ProductionOracleAgentDependencies;
+  }>;
 }>;
 
 export function productionConfigurationState(
@@ -412,6 +423,77 @@ function immutableQueryService(
   });
 }
 
+function releaseDescriptor(service: ProductionServingService) {
+  return Object.freeze({
+    schemaVersion: service.release.schemaVersion,
+    releaseId: service.release.releaseId,
+    runId: service.release.runId,
+    manifestCid: service.release.manifestCid,
+    asOf: service.release.asOf,
+    immutable: true as const,
+    verified: true as const,
+  });
+}
+
+function immutableAgentService(
+  service: ProductionServingService,
+  composition: ProductionOracleAgentComposition,
+): BoundedAgentService {
+  const release = releaseDescriptor(service);
+  return Object.freeze({
+    kind: 'no-fallback-bounded-agent' as const,
+    status: async (releaseId: string, signal: AbortSignal) => {
+      if (signal.aborted) throw new ApiFailure('AGENT_UNAVAILABLE');
+      if (releaseId !== release.releaseId) throw new ApiFailure('RELEASE_MISMATCH');
+      return await Promise.resolve(
+        Object.freeze({
+          release,
+          status: 'available' as const,
+          modelProfileId: composition.agent.model.modelId,
+          policyHash: composition.policy.hash,
+          limitations: composition.limitations,
+        }),
+      );
+    },
+    ask: async (request: AgentRequest) => {
+      if (request.releaseId !== release.releaseId || request.timeoutMs !== 25_000) {
+        throw new ApiFailure(
+          request.releaseId === release.releaseId ? 'INVALID_REQUEST' : 'RELEASE_MISMATCH',
+        );
+      }
+      const startedAt = Date.now();
+      try {
+        const answer = await composition.agent.ask(
+          request.prompt,
+          request.releaseId,
+          request.signal,
+        );
+        return Object.freeze({
+          release,
+          status: 'complete' as const,
+          answer: answer.text,
+          citations: Object.freeze([...answer.citedEvidenceIds].sort()),
+          toolCalls: Object.freeze(
+            answer.trace.map((trace) =>
+              Object.freeze({
+                callIndex: trace.callIndex,
+                toolName: trace.toolName,
+                releaseId: trace.releaseId,
+                evidenceIds: Object.freeze([...trace.evidenceIds].sort()),
+              }),
+            ),
+          ),
+          limitations: composition.limitations,
+          timing: Object.freeze({ elapsedMs: Date.now() - startedAt, bytesScanned: null }),
+        });
+      } catch (error) {
+        if (error instanceof ApiFailure) throw error;
+        throw new ApiFailure('AGENT_UNAVAILABLE');
+      }
+    },
+  });
+}
+
 export function unconfiguredProductionServices(
   environment: ProductionEnvironment,
   readiness: 'unconfigured' | 'configuration_error' = 'unconfigured',
@@ -442,12 +524,29 @@ export async function loadProductionRuntimeServices(
   const createServingService = dependencies.createServingService ?? createProductionServingService;
   const config = await servingConfig(environment);
   const service = await createServingService(config);
+  let agent: BoundedAgentService | null;
+  try {
+    const testDependencies = dependencies.testOnlyAgentDependencies;
+    const composition = await createProductionOracleAgent(
+      {
+        environment,
+        serving: service,
+        rankingWeights: config.rankingWeights,
+        capabilities: config.capabilities,
+        ...(config.limitations === undefined ? {} : { limitations: config.limitations }),
+      },
+      testDependencies?.dependencies,
+    );
+    agent = immutableAgentService(service, composition);
+  } catch {
+    agent = null;
+  }
   return Object.freeze({
     deployment: 'production' as const,
     readiness: 'ready' as const,
     allowedOrigins: allowedOrigins(environment),
     cursorSecret: config.cursorSecret,
-    agent: null,
+    agent,
     query: immutableQueryService(service, config.rankingWeights),
   });
 }

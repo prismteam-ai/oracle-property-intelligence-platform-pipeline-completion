@@ -2,6 +2,7 @@ import type { LanguageModel } from 'ai';
 import { describe, expect, it, vi } from 'vitest';
 
 import { GatewayConfigurationError, loadBedrockGatewayConfig } from './config.js';
+import { GatewayProbeError, probeOracleModelGateway } from './gateway.js';
 import { createBedrockPromptCacheMiddleware } from './prompt-cache.js';
 
 const usage = {
@@ -22,6 +23,27 @@ describe('Bedrock gateway startup', () => {
         ORACLE_AGENT_POLICY_HASH: `sha256:${'a'.repeat(64)}`,
       }),
     ).toThrow(GatewayConfigurationError);
+  });
+
+  it('uses a query-free construction probe and rejects model/profile drift', () => {
+    const gateway = {
+      provider: 'amazon-bedrock' as const,
+      modelId: 'test-profile',
+      region: 'us-east-2' as const,
+      semanticPolicyHash: `sha256:${'a'.repeat(64)}`,
+      model: {
+        specificationVersion: 'v3' as const,
+        provider: 'amazon-bedrock',
+        modelId: 'test-profile',
+        supportedUrls: {},
+        doGenerate: () => Promise.reject(new Error('probe must not generate')),
+        doStream: () => Promise.resolve({ stream: new ReadableStream() }),
+      },
+    };
+    expect(() => probeOracleModelGateway(gateway)).not.toThrow();
+    expect(() => probeOracleModelGateway({ ...gateway, modelId: 'different-profile' })).toThrow(
+      GatewayProbeError,
+    );
   });
 });
 

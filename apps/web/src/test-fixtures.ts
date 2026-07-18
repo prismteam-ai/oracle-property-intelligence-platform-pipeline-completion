@@ -38,7 +38,13 @@ const propertyRows = [
 function dataFor(operation: ApplicationOperation): unknown {
   switch (operation) {
     case 'dataset.getInfo':
-      return { fixtureLabel: FIXTURE_LABEL, county: 'Santa Clara County' };
+      return {
+        fixtureLabel: FIXTURE_LABEL,
+        county: 'Santa Clara County',
+        duckdbVersion: 'v1.4.5-test',
+        propertyCount: 2,
+        sourceCount: 1,
+      };
     case 'dataset.getCoverage':
       return {
         results: [
@@ -70,16 +76,24 @@ function dataFor(operation: ApplicationOperation): unknown {
       };
     case 'agent.status':
       return {
-        status: 'unavailable',
-        modelProfile: null,
+        status: 'available',
+        modelProfileId: 'test-only-bedrock-profile',
         policyHash: 'sha256:test-only-policy',
+        limitations: ['Test-only model profile; no live provider call was performed.'],
       };
     case 'agent.ask':
       return {
-        status: 'available',
+        status: 'complete',
         answer: 'Test-only cited synthesis. [evidence:TEST-EVIDENCE-001]',
         citations: ['TEST-EVIDENCE-001'],
-        toolCalls: [{ name: 'find_roof_age_candidates', resultCount: 1 }],
+        toolCalls: [
+          {
+            callIndex: 1,
+            toolName: 'find_roof_age_candidates',
+            releaseId: release.releaseId,
+            evidenceIds: ['TEST-EVIDENCE-001'],
+          },
+        ],
       };
     case 'artifacts.list':
       return {

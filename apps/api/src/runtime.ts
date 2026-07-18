@@ -53,9 +53,15 @@ export type AgentRequest = Readonly<{
 
 export type AgentResult = Readonly<{
   release: ReleaseDescriptor;
-  status: 'available';
-  answer: unknown;
+  status: 'available' | 'complete';
+  answer: string;
   citations: readonly string[];
+  toolCalls: readonly Readonly<{
+    callIndex: number;
+    toolName: string;
+    releaseId: string;
+    evidenceIds: readonly string[];
+  }>[];
   limitations: readonly string[];
   timing: RuntimeTiming;
 }>;
@@ -63,7 +69,7 @@ export type AgentResult = Readonly<{
 export type AgentStatus = Readonly<{
   release: ReleaseDescriptor;
   status: 'available' | 'unavailable' | 'policy_drift';
-  modelProfile: string | null;
+  modelProfileId: string | null;
   policyHash: string | null;
   limitations: readonly string[];
 }>;

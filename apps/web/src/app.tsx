@@ -18,6 +18,7 @@ import {
   PipelinePage,
   PropertiesPage,
   PropertyDetailPage,
+  QueryConsolePage,
   RankingsPage,
 } from './pages.js';
 import type { ApiClient } from './types.js';
@@ -47,6 +48,7 @@ export function App({
           ))}
           <Route path="/rankings" element={<RankingsPage />} />
           <Route path="/agent" element={<AgentPage />} />
+          <Route path="/query-console" element={<QueryConsolePage />} />
           <Route path="/artifacts" element={<ArtifactsPage />} />
           <Route path="/dictionary" element={<DictionaryPage />} />
           <Route path="/mcp" element={<McpPage />} />

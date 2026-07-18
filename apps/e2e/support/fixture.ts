@@ -203,9 +203,10 @@ function data(operation: string): Readonly<Record<string, unknown>> {
       citations: [FIXTURE_EVIDENCE_ID],
       toolCalls: [
         {
-          name: 'rank_review_candidates',
+          callIndex: 1,
+          toolName: 'rank_review_candidates',
           releaseId: FIXTURE_RELEASE_ID,
-          status: 'complete',
+          evidenceIds: [FIXTURE_EVIDENCE_ID],
         },
       ],
       truthLabel: 'Supported — direct evidence',

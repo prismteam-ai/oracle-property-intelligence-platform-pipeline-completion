@@ -16,7 +16,15 @@ export interface InvocationLedger {
   failures: number;
   evidenceIds: Set<string>;
   supportStates: Set<EvidenceSupportState>;
+  trace: NamedToolTraceRecord[];
 }
+
+export type NamedToolTraceRecord = Readonly<{
+  callIndex: number;
+  toolName: NamedEvidenceToolName;
+  releaseId: string;
+  evidenceIds: readonly string[];
+}>;
 
 export type NamedEvidenceTools = Record<
   NamedEvidenceToolName,
@@ -40,7 +48,7 @@ function invocationLedger(value: unknown): InvocationLedger {
 }
 
 const prohibitedPayloadKey =
-  /(?:sql|statement|relation|table|path|uri|url|host|objectkey|raw|secret|ownername|owneraddress|mailingaddress)$/iu;
+  /(?:sql|statement|relationpath|tablepath|path|uri|url|host|objectkey|raw|secret|ownername|owneraddress|mailingaddress)$/iu;
 const prohibitedPayloadValue = /(?:file:\/\/|s3:\/\/|https?:\/\/|[a-z]:\\)/iu;
 
 function assertSafePayload(value: unknown, path = '$'): void {
@@ -77,7 +85,7 @@ export function createNamedEvidenceTools(executor: NamedEvidenceExecutor): Named
             throw new RangeError('Named evidence tool-call budget exceeded');
           }
           const parsedInput = namedEvidenceInputSchemas[name].parse(input);
-          if (parsedInput.releaseId !== ledger.releaseId) {
+          if (parsedInput.releaseId !== undefined && parsedInput.releaseId !== ledger.releaseId) {
             throw new TypeError('Tool release does not match the immutable agent release');
           }
           let raw: unknown;
@@ -98,6 +106,16 @@ export function createNamedEvidenceTools(executor: NamedEvidenceExecutor): Named
             ledger.evidenceIds.add(item.evidenceId);
             ledger.supportStates.add(item.supportState);
           }
+          ledger.trace.push(
+            Object.freeze({
+              callIndex: ledger.calls,
+              toolName: name,
+              releaseId: ledger.releaseId,
+              evidenceIds: Object.freeze(
+                envelope.evidence.map(({ evidenceId }) => evidenceId).sort(),
+              ),
+            }),
+          );
           return envelope;
         },
       });

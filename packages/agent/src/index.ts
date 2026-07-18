@@ -17,4 +17,19 @@ export type {
 export { ORACLE_AGENT_PROMPT_POLICY, createSemanticPolicy } from './policy.js';
 export type { EvidenceCapability, SemanticPolicy, SemanticPolicyInput } from './policy.js';
 export { createNamedEvidenceTools } from './tools.js';
-export type { InvocationLedger, NamedEvidenceTools } from './tools.js';
+export type { InvocationLedger, NamedEvidenceTools, NamedToolTraceRecord } from './tools.js';
+export {
+  ORACLE_AGENT_SERVING_ADAPTER_VERSION,
+  ORACLE_AGENT_SERVING_LIMITS,
+  ORACLE_AGENT_SERVING_SCHEMA_VERSION,
+  OracleAgentServingAdapterError,
+  createProductionServingExecutor,
+} from './serving-adapter.js';
+export {
+  createProductionAgentSemanticPolicy,
+  createProductionOracleAgent,
+} from './production-composition.js';
+export type {
+  ProductionOracleAgentComposition,
+  ProductionOracleAgentDependencies,
+} from './production-composition.js';

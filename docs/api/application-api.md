@@ -30,7 +30,7 @@ Production composition calls `createProductionServingService` from `@oracle/quer
 }
 ```
 
-Except for `dataset.getInfo`, every request requires `releaseId`. Page size defaults to 25 and is bounded to 1–100. Cursors are opaque, HMAC-protected, operation-bound, release-bound, and at most 512 bytes. Query execution is bounded to 5 seconds, 512 MiB scanned, and the requested page limit. Agent execution is bounded to 30 seconds, 3 model steps, and 6 named-tool calls.
+Except for `dataset.getInfo`, every request requires `releaseId`. Page size defaults to 25 and is bounded to 1–100. Cursors are opaque, HMAC-protected, operation-bound, release-bound, and at most 512 bytes. Query execution is bounded to 5 seconds, 512 MiB scanned, and the requested page limit. Agent execution is bounded to 25 seconds, 3 model steps, and 6 named-tool calls, leaving 5 seconds of the HTTP API/Lambda ceiling for handler and cold-start overhead.
 
 The production cursor HMAC secret is injected by composition, must contain at least 32 random bytes, and must remain stable for the lifetime of the release. It is neither accepted from callers nor returned in responses. The API returns the shared serving cursor unchanged, so the same operation/input/release has cursor parity with MCP; there is no transport-specific second wrapper.
 
@@ -58,6 +58,39 @@ All fields below are optional unless marked required. Common paged fields are `r
 | `artifacts.getDataDictionary`  | common page                                                                                                                         | `get_data_dictionary`                |
 | `agent.ask`                    | `releaseId`, `prompt` (required, at most 2000 characters)                                                                           | no-fallback named-tool agent         |
 | `agent.status`                 | `releaseId`                                                                                                                         | no-fallback agent status             |
+
+`agent.status` returns the selected production identity, never a generic model
+claim:
+
+```json
+{
+  "status": "available",
+  "modelProfileId": "<exact configured Bedrock model or inference-profile ID>",
+  "policyHash": "sha256:<semantic-policy hash>",
+  "limitations": []
+}
+```
+
+`agent.ask` returns a terminal answer plus deterministic public proof:
+
+```json
+{
+  "status": "complete",
+  "answer": "Evidence-backed answer [evidence:<id>]",
+  "citations": ["<exact returned evidence ID>"],
+  "toolCalls": [
+    {
+      "callIndex": 1,
+      "toolName": "find_roof_age_candidates",
+      "releaseId": "<immutable release ID>",
+      "evidenceIds": ["<exact returned evidence ID>"]
+    }
+  ]
+}
+```
+
+The trace never contains prompts, arguments, results, SQL, paths, locators,
+provider payloads, or model chain-of-thought.
 
 The combined ranking service, not the model, owns component scores. Inputs select signals and explicit numeric weights; output data must retain component contribution, support/proxy/unknown state, evidence coverage, and stable tie-break information.
 
@@ -92,7 +125,7 @@ Evidence is not duplicated into a second transport-only field. Inquiry results p
 
 ## Production environment contract
 
-The default Lambda accepts only these server-owned configuration inputs:
+The default Lambda requires these server-owned serving configuration inputs:
 
 - `ORACLE_ALLOWED_ORIGINS`: comma-separated, unique, exact HTTPS origins; wildcard, paths, query strings, and fragments are rejected.
 - `ORACLE_RELEASE_ROOT`: absolute path to the packaged, read-only release directory.
@@ -121,7 +154,23 @@ The serving JSON is strict and contains only:
 
 Paths, URLs, buckets, prefixes, SQL, tables, or object keys are never accepted from a request. An absent release configuration is cached as `unconfigured`; partial, malformed, out-of-root, stale, hash-drifted, schema-drifted, or non-public configuration is cached as `configuration_error`. In both cases `/health` is degraded and every operation returns redacted `SERVICE_UNAVAILABLE`/release-integrity errors. A failed cold-start composition is not retried within the same warm process.
 
-`ORACLE_MODEL_PROVIDER`, `ORACLE_BEDROCK_MODEL_ID`, `ORACLE_BEDROCK_REGION`, and `ORACLE_AGENT_POLICY_HASH` do not by themselves enable `/agent.ask`. This wave keeps the agent unavailable until a promoted semantic-policy hash, release capability/data-dictionary policy, named-evidence adapter, and no-fallback Bedrock profile can be composed and qualified together. Deterministic production queries remain available independently.
+The optional Bedrock promotion is all-or-none:
+
+- `ORACLE_MODEL_PROVIDER=amazon-bedrock`;
+- `ORACLE_BEDROCK_MODEL_ID=<exact promoted model or inference-profile ID>`;
+- `ORACLE_BEDROCK_REGION=us-east-1|us-east-2`; and
+- `ORACLE_AGENT_POLICY_HASH=sha256:<64 lowercase hex>`.
+
+With all four values, production composes adapter
+`oracle-agent-serving@1.0.0` over the already verified serving service. The
+adapter injects the server-owned release identity, translates only the frozen
+named fields, forces public artifact/evidence boundaries, verifies every
+release metadata field, extracts a redacted top-level evidence envelope, and
+enforces the stricter 900 KiB tool-payload ceiling. Missing/partial/invalid
+configuration, semantic-policy drift, model construction/probe failure,
+release mismatch, restricted output, timeout, or provider failure never claims
+availability and never selects a fallback. Deterministic production queries
+remain independently usable.
 
 ## Lambda/CDK asset requirements
 

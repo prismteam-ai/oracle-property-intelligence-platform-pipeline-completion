@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { APIGatewayProxyEventV2, APIGatewayProxyResultV2, Context } from 'aws-lambda';
+import { createProductionAgentSemanticPolicy } from '@oracle/agent';
 import {
   PRODUCTION_SERVING_INPUT_FIELDS,
   ProductionServingError,
@@ -32,6 +33,50 @@ const criteria = [
   'transit_walkability',
   'starbucks_walkability',
 ] as const;
+const testCapabilities = Object.freeze({
+  roof_age: Object.freeze({
+    state: 'supported' as const,
+    supportClasses: Object.freeze(['supported'] as const),
+    numerator: 1,
+    denominator: 1,
+    limitations: Object.freeze(['Roof evidence is limited to the immutable public release.']),
+  }),
+  water_view_candidate: Object.freeze({
+    state: 'supported' as const,
+    supportClasses: Object.freeze(['supported'] as const),
+    numerator: 1,
+    denominator: 1,
+    limitations: Object.freeze([]),
+  }),
+  ownership_age: Object.freeze({
+    state: 'supported' as const,
+    supportClasses: Object.freeze(['supported'] as const),
+    numerator: 1,
+    denominator: 1,
+    limitations: Object.freeze([]),
+  }),
+  regional_owner: Object.freeze({
+    state: 'supported' as const,
+    supportClasses: Object.freeze(['supported'] as const),
+    numerator: 1,
+    denominator: 1,
+    limitations: Object.freeze([]),
+  }),
+  transit_walkability: Object.freeze({
+    state: 'supported' as const,
+    supportClasses: Object.freeze(['supported'] as const),
+    numerator: 1,
+    denominator: 1,
+    limitations: Object.freeze([]),
+  }),
+  starbucks_walkability: Object.freeze({
+    state: 'supported' as const,
+    supportClasses: Object.freeze(['supported'] as const),
+    numerator: 1,
+    denominator: 1,
+    limitations: Object.freeze([]),
+  }),
+});
 
 function event(rawPath: string, body: unknown = {}): APIGatewayProxyEventV2 {
   return {
@@ -68,20 +113,10 @@ function parse(response: APIGatewayProxyResultV2): Readonly<Record<string, unkno
   return JSON.parse(response.body ?? '{}') as Readonly<Record<string, unknown>>;
 }
 
-async function productionEnvironment(): Promise<Readonly<Record<string, string>>> {
+async function productionEnvironment(
+  includeAgent = false,
+): Promise<Readonly<Record<string, string>>> {
   const releaseRoot = await mkdtemp(join(tmpdir(), 'oracle-api-release-'));
-  const capabilities = Object.fromEntries(
-    criteria.map((criterion) => [
-      criterion,
-      {
-        state: 'supported',
-        supportClasses: ['supported'],
-        numerator: 1,
-        denominator: 1,
-        limitations: [],
-      },
-    ]),
-  );
   await writeFile(
     join(releaseRoot, 'serving.json'),
     JSON.stringify({
@@ -92,15 +127,24 @@ async function productionEnvironment(): Promise<Readonly<Record<string, string>>
         weight: 1,
         proxyMultiplier: 0.5,
       })),
-      capabilities,
+      capabilities: testCapabilities,
       limitations: ['Production test composition; no fixture selected from environment.'],
     }),
   );
+  const policy = createProductionAgentSemanticPolicy(testCapabilities);
   return Object.freeze({
     ORACLE_ALLOWED_ORIGINS: 'https://oracle.test',
     ORACLE_RELEASE_ROOT: releaseRoot,
     ORACLE_SERVING_CONFIG_RELATIVE_PATH: 'serving.json',
     ORACLE_CURSOR_HMAC_SECRET_BASE64: Buffer.alloc(32, 7).toString('base64'),
+    ...(includeAgent
+      ? {
+          ORACLE_MODEL_PROVIDER: 'amazon-bedrock',
+          ORACLE_BEDROCK_MODEL_ID: 'test-profile',
+          ORACLE_BEDROCK_REGION: 'us-east-2',
+          ORACLE_AGENT_POLICY_HASH: policy.hash,
+        }
+      : {}),
   });
 }
 
@@ -140,6 +184,133 @@ function servingService(
 }
 
 describe('production API composition', () => {
+  it('composes the actual selected model and returns the frozen status/answer trace shapes', async () => {
+    const environment = await productionEnvironment(true);
+    const evidenceId = `sc:evidence:${'c'.repeat(64)}`;
+    const base = servingService([]);
+    let modelCall = 0;
+    const api = createProductionApiHandler(environment, {
+      createServingService: async () =>
+        await Promise.resolve({
+          ...base,
+          execute: async () =>
+            await Promise.resolve({
+              schemaVersion: expected.schemaVersion,
+              releaseId: expected.releaseId,
+              runId: expected.runId,
+              manifestCid: expected.manifestCid,
+              asOf: expected.asOf,
+              coverage: { roof_age: testCapabilities.roof_age },
+              limitations: ['Returned roof evidence is release-bound.'],
+              data: {
+                results: [
+                  {
+                    propertyId: 'sc:property:test',
+                    evidence: [
+                      {
+                        evidenceId,
+                        supportClass: 'supported',
+                        sourceIds: ['sc:source:test'],
+                        limitations: [],
+                        visibility: 'public',
+                      },
+                    ],
+                  },
+                ],
+              },
+              nextCursor: null,
+              truncated: false,
+              timing: { elapsedMs: 1, bytesScanned: 128 },
+            }),
+        }),
+      testOnlyAgentDependencies: {
+        label: 'TEST_ONLY_DETERMINISTIC_AGENT',
+        dependencies: {
+          createGateway: (config) => ({
+            ...config,
+            model: {
+              specificationVersion: 'v3',
+              provider: 'amazon-bedrock',
+              modelId: config.modelId,
+              supportedUrls: {},
+              doGenerate: () => {
+                modelCall += 1;
+                const tool = modelCall === 1;
+                return Promise.resolve({
+                  content: tool
+                    ? [
+                        {
+                          type: 'tool-call' as const,
+                          toolCallId: 'call-1',
+                          toolName: 'find_roof_age_candidates',
+                          input: JSON.stringify({ minimumAgeYears: 15 }),
+                        },
+                      ]
+                    : [{ type: 'text' as const, text: `Qualified [evidence:${evidenceId}].` }],
+                  finishReason: {
+                    unified: tool ? ('tool-calls' as const) : ('stop' as const),
+                    raw: tool ? 'tool_use' : 'end_turn',
+                  },
+                  usage: {
+                    inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 },
+                    outputTokens: { total: 1, text: 1, reasoning: 0 },
+                  },
+                  warnings: [],
+                });
+              },
+              doStream: () => Promise.resolve({ stream: new ReadableStream() }),
+            },
+          }),
+        },
+      },
+    });
+
+    const health = parse(await api(event('/health'), {} as Context));
+    expect(health).toMatchObject({ dataQueryPerformed: false, status: 'ready' });
+    expect(modelCall).toBe(0);
+    const status = parse(
+      await api(event('/agent.status', { releaseId: expected.releaseId }), {} as Context),
+    );
+    expect(status).toMatchObject({
+      limitations: [
+        'Production test composition; no fixture selected from environment.',
+        'Roof evidence is limited to the immutable public release.',
+      ],
+      data: {
+        status: 'available',
+        modelProfileId: 'test-profile',
+        policyHash: environment.ORACLE_AGENT_POLICY_HASH,
+        limitations: [
+          'Production test composition; no fixture selected from environment.',
+          'Roof evidence is limited to the immutable public release.',
+        ],
+      },
+    });
+    expect(modelCall).toBe(0);
+    const answer = parse(
+      await api(
+        event('/agent.ask', { releaseId: expected.releaseId, prompt: 'Find roof candidates.' }),
+        {} as Context,
+      ),
+    );
+    expect(answer).toMatchObject({
+      data: {
+        status: 'complete',
+        answer: `Qualified [evidence:${evidenceId}].`,
+        citations: [evidenceId],
+        toolCalls: [
+          {
+            callIndex: 1,
+            toolName: 'find_roof_age_candidates',
+            releaseId: expected.releaseId,
+            evidenceIds: [evidenceId],
+          },
+        ],
+      },
+    });
+    expect(JSON.stringify(answer)).not.toMatch(/reasoning|chain.of.thought|tool.*input/iu);
+  });
+
   it('composes the default-style handler over the shared production serving boundary', async () => {
     const environment = await productionEnvironment();
     const requests: Readonly<{

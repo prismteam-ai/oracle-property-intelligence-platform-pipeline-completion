@@ -237,7 +237,7 @@ describe('Oracle named-tool agent', () => {
       const assertion = expect(timed.ask('Find candidates.', RELEASE)).rejects.toThrow(
         'failed without fallback',
       );
-      await vi.advanceTimersByTimeAsync(30_001);
+      await vi.advanceTimersByTimeAsync(25_001);
       await assertion;
     } finally {
       vi.useRealTimers();

@@ -8,18 +8,25 @@ silent fallback.
 ## Runtime boundary
 
 The agent receives only the sixteen frozen, SQL-free named evidence functions.
-The host must inject a release-bound `NamedEvidenceExecutor`; startup fails when
-the executor is absent. Every tool input is a strict Zod object, every result is
-validated against the common evidence envelope, and release mismatch fails
-closed. The payload guard rejects raw fields, restricted owner fields, query
-authority, physical locations, and network/object locators before a result is
-shown to the model.
+Production composes `oracle-agent-serving@1.0.0` over the same verified
+`ProductionServingService` used by API and MCP. The adapter injects the
+server-owned immutable release, verifies an optional matching tool release,
+translates only explicit contract fields, and fails closed on an unknown tool,
+field, release, policy, or response shape.
 
-The inherited Wave 3A baseline does not contain executable six-inquiry query
-implementations in `query-core`. Consequently this package does not fabricate a
-production executor. The API/MCP integration owner must inject the frozen
-release adapter after that dependency exists; until then, live agent
-qualification and direct-query parity remain blocked.
+The serving envelope keeps schema version `1.0.0`; the adapter version is a
+separate literal. `get_dataset_info` validates release continuity but calls the
+serving discovery operation without a release input. Other operations receive
+the exact verified release ID. Fixed policy fields—complete ownership history,
+current regional owner, 200 m snap distance, 0.7 place confidence, the six
+immutable ranking weights, and public artifact visibility—are server-owned and
+cannot be overridden by the model.
+
+Operation-specific evidence is removed from nested result payloads, normalized
+into one top-level public evidence envelope, deduplicated, sorted, and limited.
+The redaction boundary rejects restricted owner/contact data, SQL/query
+authority, credentials, raw fields, physical paths, buckets/object keys,
+connections, and network locators before anything reaches the model.
 
 ## Required configuration
 
@@ -42,13 +49,19 @@ to the exact Bedrock profile.
 
 - at most 3 model steps and 6 tool calls;
 - at most 2,048 output tokens;
-- 30-second total and 10-second step timeouts;
+- 25-second total and 10-second step timeouts, inside the 30-second Lambda/HTTP boundary;
 - prompts at most 8,000 characters;
+- tool envelopes at most 900 KiB, 100 returned rows, and 1,000 evidence references;
+- each analytical call at most 5 seconds and 512 MiB scanned;
 - exact immutable release binding;
 - returned property facts require `[evidence:<returned ID>]` citations;
 - fabricated IDs, omitted citations, and erased unknown/unsupported states fail
   the request;
 - dependency/model failures return errors and never model-authored fallback text.
+
+The deterministic public trace contains only call index, tool name, immutable
+release ID, and sorted returned evidence IDs. It contains no prompts, tool
+arguments/results, provider payload, or model chain-of-thought.
 
 The Bedrock middleware preserves existing provider options, places prompt cache
 points on the first system and last non-system message, and reports cache
@@ -71,6 +84,9 @@ corepack pnpm --filter @oracle/agent test
 corepack pnpm --filter @oracle/agent build
 ```
 
-Tests use deterministic scripted language models and mocked evidence executors.
-They make no paid Bedrock calls. A paid live qualification is intentionally out
-of scope for Wave 3A.
+Tests use deterministic scripted language models and mocked serving executors.
+They cover all translations, release drift, prompt injection, restricted-output
+redaction, unknown tools/fields, timeouts, limits, citations, traces, and
+model/policy composition failure without network access or paid Bedrock calls.
+Only the parent performs the single bounded hosted Bedrock qualification after
+local review passes.

@@ -72,26 +72,37 @@ The local target rejects non-loopback URLs.
 
 ## Hosted lane
 
-Hosted runs have no default URL. Both the web and API origins must be explicit
-HTTPS URLs without credentials, query strings, fragments, or loopback hosts.
-This prevents an accidental run against an inferred preview, provider console,
-or unrelated environment.
+Hosted runs have no default URL. The parent supplies all four stable deployment
+outputs explicitly. The suite
+does not infer, discover, or reconstruct them:
 
 ```powershell
-$env:Path = 'E:\nvm\v22.18.0;' + $env:Path
 $env:ORACLE_E2E_TARGET = 'hosted'
-$env:ORACLE_E2E_BASE_URL = 'https://<explicit-cloudfront-host>'
-$env:ORACLE_E2E_API_BASE_URL = 'https://<explicit-api-host>'
+$env:ORACLE_E2E_BASE_URL = 'https://<WebUrl-host>'
+$env:ORACLE_E2E_API_BASE_URL = 'https://<ApiUrl-host>'
+$env:ORACLE_E2E_MCP_URL = 'https://<exact-McpUrl-output-ending-in-mcp>'
+$env:ORACLE_E2E_PUBLIC_ARTIFACT_BASE_URL = 'https://<PublicArtifactUrl-host>'
 pnpm --filter @oracle/e2e test
 ```
 
-The hosted health test requires `readiness: ready`, `fixture: null`, and
-`dataQueryPerformed: false`. Browser pages must not display
-`TEST_ONLY_DETERMINISTIC_FIXTURE`. A hosted agent journey may perform one
-read-only named-evidence prompt; it never dispatches provider effects, publishes
+Every URL must be explicit HTTPS without credentials, query, fragment, or
+loopback authority. `ORACLE_E2E_MCP_URL` must end in `/mcp`.
+
+The hosted gate requires API and MCP readiness, `fixture: null`, and query-free
+health. It executes `initialize -> tools/list -> tools/call`, proves strict
+unknown-field rejection, and compares API/MCP/manifest release identity. It
+also checks public artifact `HEAD`, a four-byte Parquet range, bounded full-file
+SHA-256 for the smallest public artifact, and representative SPA deep links.
+Browser pages must not display `TEST_ONLY_DETERMINISTIC_FIXTURE`.
+
+The hosted agent journey performs exactly one read-only named-evidence prompt
+and requires a terminal successful answer, exact citations, a named-tool trace,
+and the actual selected model/profile. Once the agent is promoted, unavailable,
+degraded, policy-drifted, canned, or trace-free agent behavior fails the hosted
+release suite. Hosted Playwright retries are disabled so this proof cannot spend
+a second model request after a failure. The journey never dispatches provider effects, publishes
 artifacts, mutates IPNS/public data, changes cloud configuration, or writes a
-dataset. If the exact promoted model is unavailable, the test accepts only an
-explicit degraded/no-fallback presentation.
+dataset.
 
 ## Targeted commands
 
@@ -103,6 +114,7 @@ pnpm --filter @oracle/e2e exec playwright test tests/health.spec.ts --project ev
 pnpm --filter @oracle/e2e exec playwright test tests/evaluator-flow.spec.ts --project evaluator-desktop
 pnpm --filter @oracle/e2e exec playwright test tests/keyboard.spec.ts --project evaluator-desktop
 pnpm --filter @oracle/e2e exec playwright test tests/responsive.spec.ts
+pnpm --filter @oracle/e2e exec playwright test tests/hosted-release.spec.ts --project evaluator-desktop
 ```
 
 Static package verification is:
@@ -148,24 +160,16 @@ immutable release identifier. Every public route provides:
 - visible loading, error, empty, or degraded feedback where applicable.
 
 The route contract is `/`, `/pipeline`, `/coverage`, `/properties`, the six
-`/inquiries/*` routes, `/rankings`, `/agent`, `/artifacts`, `/dictionary`,
-`/capabilities`, `/mcp`, `/evidence`, and `/about/architecture`. Property results
-link to `/properties/:propertyId` and expose evidence on the detail route.
+`/inquiries/*` routes, `/rankings`, `/agent`, `/query-console`, `/artifacts`,
+`/dictionary`, `/capabilities`, `/mcp`, `/evidence`, and
+`/about/architecture`. Property results link to `/properties/:propertyId` and
+expose evidence on the detail route.
 
-## Production-composition gap
+## Proof boundary
 
-Committed Wave 3A API `b92e2a0`, MCP `2c872c1`, and agent `5399fc2` deliberately
-fail closed because their default production composition does not yet inject an
-executable, verified immutable-release six-inquiry query service. The separately
-authorized inquiry-adapter recovery owns that missing query-core implementation.
-
-Therefore:
-
-- local fixture success proves browser behavior and the committed injected API
-  contract only;
-- it does not prove DuckDB parity, a live county release, MCP tool execution, or
-  Bedrock qualification;
-- hosted tests must receive the explicit production web/API URLs and must see a
-  ready, non-fixture release before they can close runtime verification;
-- the suite never substitutes deterministic fixture rows for a hosted response
-  and never upgrades a blocked/partial/proxy capability label.
+Local fixture success proves browser and injected contract behavior only. It
+does not prove DuckDB parity, a hosted county release, public artifact delivery,
+MCP tool execution, IAM, or Bedrock qualification. The hosted suite is the
+mandatory release proof for those composed read-only surfaces. It never
+substitutes deterministic rows for a hosted response or upgrades a
+blocked/partial/proxy capability label.

@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "lint": "eslint .",
+    "lint": "eslint playwright.config.ts support tests",
     "test": "playwright test",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

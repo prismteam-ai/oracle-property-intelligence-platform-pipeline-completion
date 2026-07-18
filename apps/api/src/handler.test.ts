@@ -84,8 +84,9 @@ function fixtureServices(options: FixtureOptions = {}): RuntimeServices {
               await Promise.resolve({
                 release: fixtureRelease,
                 status: 'available',
-                answer: { text: `Fixture answer for: ${request.prompt}` },
+                answer: `Fixture answer for: ${request.prompt}`,
                 citations: ['evidence:test:1'],
+                toolCalls: [],
                 limitations: ['TEST ONLY — mocked provider.'],
                 timing: { elapsedMs: 3, bytesScanned: 0 },
               }),
@@ -93,7 +94,7 @@ function fixtureServices(options: FixtureOptions = {}): RuntimeServices {
               await Promise.resolve({
                 release: fixtureRelease,
                 status: 'available',
-                modelProfile: 'test-only-mocked-provider',
+                modelProfileId: 'test-only-mocked-provider',
                 policyHash: 'test-only-policy-hash',
                 limitations: ['TEST ONLY — mocked provider.'],
               }),

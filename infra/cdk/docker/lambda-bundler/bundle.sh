@@ -43,12 +43,17 @@ common_esbuild_arguments=(
   --alias:@aws-lambda-powertools/logger=/tmp/oracle-bundle/packages/observability/node_modules/@aws-lambda-powertools/logger
   --alias:@aws-lambda-powertools/metrics=/tmp/oracle-bundle/packages/observability/node_modules/@aws-lambda-powertools/metrics
   --alias:@aws-lambda-powertools/tracer=/tmp/oracle-bundle/packages/observability/node_modules/@aws-lambda-powertools/tracer
+  --alias:@ai-sdk/amazon-bedrock=/tmp/oracle-bundle/packages/model-gateway/node_modules/@ai-sdk/amazon-bedrock
+  --alias:@aws-sdk/credential-providers=/tmp/oracle-bundle/packages/model-gateway/node_modules/@aws-sdk/credential-providers
+  --alias:@oracle/agent=/asset-input/packages/agent/src/index.ts
   --alias:@oracle/artifacts=/asset-input/packages/artifacts/src
   --alias:@oracle/contracts=/asset-input/packages/contracts/src
   --alias:@oracle/data-runtime=/asset-input/packages/data-runtime/src
   --alias:@oracle/features=/asset-input/packages/features/src
+  --alias:@oracle/model-gateway=/asset-input/packages/model-gateway/src/index.ts
   --alias:@oracle/observability=/asset-input/packages/observability/src/index.ts
   --alias:@oracle/query-core=/asset-input/packages/query-core/src
+  --alias:ai=/tmp/oracle-bundle/packages/agent/node_modules/ai
   --alias:zod=/tmp/oracle-bundle/packages/contracts/node_modules/zod
 )
 

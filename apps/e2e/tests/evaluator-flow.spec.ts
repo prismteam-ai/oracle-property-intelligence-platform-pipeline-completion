@@ -295,27 +295,13 @@ test('agent shows named-tool trace and exact citations when available', async ({
   await page.getByRole('button', { name: /ask|run/i }).click();
   const response = await responsePromise;
   const body: unknown = await response.json();
-
-  if (isHostedTarget() && response.status() === 503) {
-    expect(body).toMatchObject({ error: { code: 'AGENT_UNAVAILABLE' } });
-    const degraded = page
-      .getByRole('alert')
-      .filter({ hasText: /no fallback|fallback answer/i })
-      .last();
-    await expect(degraded).toBeVisible();
-    await expect(degraded).toContainText(/no fallback|fallback answer/i);
-    await expect(page.getByRole('heading', { name: /tool.*trace|trace/i })).toHaveCount(0);
-    await expect(page.getByRole('heading', { name: /^Answer$/i })).toHaveCount(0);
-    await expectReleaseIdentity(page);
-    return;
-  }
-
   expect(response.status()).toBe(200);
   const data = asRecord(asRecord(body)?.data);
   const citations = stringItems(data?.citations);
   const toolNames = Array.isArray(data?.toolCalls)
     ? data.toolCalls.flatMap((value) => {
-        const name = asRecord(value)?.name;
+        const call = asRecord(value);
+        const name = call?.toolName ?? call?.name;
         return typeof name === 'string' ? [name] : [];
       })
     : [];
@@ -329,24 +315,34 @@ test('agent shows named-tool trace and exact citations when available', async ({
 
 test('agent degradation is explicit and never replaced with a canned answer', async ({ page }) => {
   if (isHostedTarget()) {
+    const statusResponsePromise = operationResponse(page, 'agent.status');
     await openEvaluatorRoute(page, '/agent');
+    const statusResponse = await statusResponsePromise;
+    expect(statusResponse.status()).toBe(200);
+    const body: unknown = await statusResponse.json();
+    const status = asRecord(asRecord(body)?.data);
+    expect(status?.status).toBe('available');
+    const modelProfile = status?.modelProfileId ?? status?.modelProfile ?? status?.model;
+    expect(typeof modelProfile === 'string' && modelProfile.length > 0).toBe(true);
+    await expect(page.getByText(String(modelProfile), { exact: false }).first()).toBeVisible();
     await expect(page.locator('main')).toContainText(/no silent fallback|no fallback/i);
-    const degraded = page.getByRole('alert').filter({ hasText: /agent.*unavailable|degraded/i });
-    if (await degraded.isVisible()) await expect(degraded).toContainText(/unavailable|degraded/i);
+    await expect(
+      page.getByRole('alert').filter({ hasText: /agent.*unavailable|degraded/i }),
+    ).toHaveCount(0);
     return;
   }
   if (fixture === null) throw new Error('The deterministic local fixture controller is missing.');
   fixture.setMode('agent-degraded');
   await openEvaluatorRoute(page, '/agent');
   const prompt = page.getByRole('textbox', { name: /ask|prompt|question/i });
-  await prompt.fill('Rank review candidates.');
-  await page.getByRole('button', { name: /ask|run/i }).click();
-  const degradedAlerts = page
+  await expect(prompt).toBeDisabled();
+  await expect(page.getByRole('button', { name: /ask|run/i })).toBeDisabled();
+  const degradedAlert = page
     .getByRole('alert')
     .filter({ hasText: /selected model profile is unavailable|no fallback answer was generated/i });
-  await expect(degradedAlerts).toHaveCount(2);
-  await expect(degradedAlerts.first()).toContainText(/unavailable|no fallback/i);
-  await expect(degradedAlerts.last()).toContainText(/unavailable|no fallback/i);
+  await expect(degradedAlert).toHaveCount(1);
+  await expect(degradedAlert).toContainText(/unavailable|no fallback/i);
+  await expect(page.getByRole('heading', { name: /answer|tool trace/i })).toHaveCount(0);
   await expect(page.locator('main')).not.toContainText('The deterministic tool returned');
 });
 

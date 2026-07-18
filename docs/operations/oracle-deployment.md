@@ -23,10 +23,15 @@ against one verified immutable public release packaged read-only at
 `/var/task/release` in their shared Lambda code asset.
 
 Both functions use Node.js 22, x86_64, 1,024 MiB memory, 2 GiB ephemeral storage,
-a 30-second timeout, active X-Ray tracing, and 90-day logs. They do not set
-reserved concurrency because the target account must retain Lambda's mandatory
-unreserved concurrency floor. HTTP API stage throttles bound ingress at burst 20
-and rate 10 requests/second.
+a 30-second timeout, active X-Ray tracing, and 90-day logs. Their HTTP API
+integrations stop at 29 seconds. The API retains the five-second deterministic
+query budget and bounds agent generation at 25 seconds, leaving four seconds
+inside API Gateway and five seconds inside Lambda for handler/composition
+overhead. They do not set reserved concurrency because the target account must
+retain Lambda's mandatory unreserved concurrency floor. HTTP API stage
+throttles bound ingress at burst 20 and rate 10 requests/second. The explicit
+29-second integration remains below the AWS HTTP API
+[30-second maximum](https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-quotas.html).
 
 ## Required immutable release input
 
@@ -98,7 +103,11 @@ API and MCP share one output-hashed asset. CDK always runs its bundler in a
 Linux `amd64` Docker image pinned to Node `22.18.0`, pnpm `10.33.0`, and esbuild
 `0.28.1`. The bundler installs from the committed frozen lockfile, bundles the
 production API and MCP compositions as `api.mjs` and `mcp.mjs`, and embeds the
-validated release under `release/`.
+validated release under `release/`. The API bundle includes the source-owned
+`@oracle/agent` and `@oracle/model-gateway` closure plus the Vercel AI SDK
+Bedrock provider. Those JavaScript dependencies are bundled into `api.mjs`;
+they are not copied from host `node_modules` and are not added to the MCP
+bundle.
 
 Only the exact native DuckDB closure is externalized and copied:
 
@@ -107,11 +116,14 @@ Only the exact native DuckDB closure is externalized and copied:
 - `@duckdb/node-bindings-linux-x64@1.4.5-r.1`.
 
 The bundler verifies every package identity and rejects Windows, Darwin, or
-ARM64 native package directories. It never copies host `node_modules`. The
-opt-in regression gate mounts the synthesized asset read-only in the official
-Lambda Node 22 x86_64 image, imports DuckDB, executes `SELECT 1`, imports each
-handler, and invokes the query-free health route. Both services must report the
-packaged production release ready.
+ARM64 native package directories. The synthesized asset's only external
+`node_modules` closure is the three-package DuckDB list above. The opt-in
+regression gate mounts the synthesized asset read-only in the official Lambda
+Node 22 x86_64 image, imports DuckDB, executes `SELECT 1`, imports each handler,
+and invokes the query-free health route. It also proves the API bundle contains
+the four production agent/model configuration fields and no deterministic
+fixture label. Both services must report the packaged production release ready;
+the import gate never invokes Bedrock.
 
 ## Runtime environment and stable cursor secret
 
@@ -221,15 +233,70 @@ all five promotion contexts or none:
 
 | CDK context | Required value |
 |---|---|
-| `oracleBedrockInferenceProfileArn` | exact promoted inference-profile ARN |
-| `oracleBedrockInvocationResourceArns` | comma-separated exact profile and required foundation-model ARNs; no wildcard |
-| `oracleBedrockModelId` | exact promoted model/inference-profile ID |
-| `oracleBedrockRegion` | `us-east-1` or `us-east-2` |
+| `oracleBedrockInferenceProfileArn` | exact promoted inference-profile ARN in deployment account `417242953053` |
+| `oracleBedrockInvocationResourceArns` | comma-separated exact profile ARN followed by every required foundation-model ARN; unique values, no wildcard |
+| `oracleBedrockModelId` | exact promoted inference-profile ID, or the same exact profile ARN |
+| `oracleBedrockRegion` | `us-east-1` or `us-east-2`; must equal the profile ARN region |
 | `oracleAgentPolicyHash` | exact `sha256:<64 lowercase hex>` semantic-policy hash |
 
-Partial input fails synthesis. Complete input grants only the listed resources,
-conditioned on the exact inference-profile ARN. Use the GT-O13 promotion
-receipt; candidate qualification alone is not promotion evidence.
+Partial input fails before stack synthesis. Empty, duplicate, wildcard,
+wrong-account, wrong-region, unrelated-model, non-foundation-model, or
+malformed-hash values also fail. The parent supplies the promoted values from
+the approved promotion receipt; this repository does not guess a model or
+embed a current profile. Candidate qualification alone is not promotion
+evidence.
+
+Complete promotion adds exactly these API Lambda fields together, and never
+adds them to MCP:
+
+```text
+ORACLE_MODEL_PROVIDER=amazon-bedrock
+ORACLE_BEDROCK_MODEL_ID=<oracleBedrockModelId>
+ORACLE_BEDROCK_REGION=<oracleBedrockRegion>
+ORACLE_AGENT_POLICY_HASH=<oracleAgentPolicyHash>
+```
+
+There is no fallback, fixture, alternate-provider, profile-ARN, or credential
+environment switch. The profile ARN remains IAM authority. IAM grants the API
+role `bedrock:InvokeModel` on the exact profile ARN in one statement. A second
+`bedrock:InvokeModel` statement covers only the exact foundation-model ARNs and
+uses `StringEquals` on `bedrock:InferenceProfileArn` for the exact promoted
+profile. The role receives neither streaming invocation nor Bedrock control
+plane actions. Baseline synth has neither statement. This mirrors AWS's
+[profile-resource plus conditioned foundation-resource pattern](https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-prereq.html)
+without its broad example wildcards.
+
+Before promotion synth, verify without invoking the model:
+
+1. the profile ARN account and region match the selected deployment identity;
+2. `oracleBedrockModelId` is the profile ID after `inference-profile/` (or the
+   same full ARN);
+3. the invocation resource list contains that profile exactly once and every
+   foundation-model ARN required by the profile, with no other ARN;
+4. the semantic-policy hash was computed from the exact packaged release
+   capability/data-dictionary policy; and
+5. the five context values are supplied to `cdk synth`, `cdk diff`, and the
+   later authorized `cdk deploy` without changing between commands.
+
+Use placeholders in shell history and operator notes until the parent supplies
+the approved values. Do not put them in `cdk.json`, source, outputs, or a
+committed environment file.
+
+The promotion synth uses the same immutable release inputs as baseline plus all
+five promotion contexts in one command:
+
+```powershell
+corepack pnpm --dir infra/cdk exec cdk synth --app "node dist/bin/app.js" --no-lookups `
+  -c oraclePublicReleaseDirectory='<verified-repository-child-directory>' `
+  -c oracleServingConfigRelativePath='<portable-serving-config-path>' `
+  -c oracleBedrockInferenceProfileArn='<approved-profile-arn>' `
+  -c oracleBedrockInvocationResourceArns='<profile-arn>,<foundation-model-arn-list>' `
+  -c oracleBedrockModelId='<approved-profile-id-or-arn>' `
+  -c oracleBedrockRegion='<approved-us-east-region>' `
+  -c oracleAgentPolicyHash='<approved-sha256-policy-hash>'
+```
+
+An unpromoted synth must omit all five rather than pass blank placeholders.
 
 ## Verification before any deploy
 
@@ -288,9 +355,15 @@ Deployment is a separate authorized action. After all gates pass:
    `/mcp/health`; one real named API query; one MCP tool through same-origin
    `POST /mcp`; a `GET /mcp` SPA refresh; another SPA deep-link refresh;
    API/MCP/assets misses; and public artifact byte/hash/range behavior;
-6. confirm the release ID, manifest hash, capabilities, and cursor continuity;
+6. for a promoted release, require `agent.status` to report available with the
+   exact profile/model ID and policy hash, confirm the synthesized API
+   environment has the approved `amazon-bedrock` provider and region, then let
+   the parent execute the single bounded live `agent.ask` proof; degraded status
+   or an unlabeled/different model fails promotion rather than selecting a
+   fallback;
+7. confirm the release ID, manifest hash, capabilities, and cursor continuity;
    and
-7. retain the prior release directory, deployed asset, and web object versions
+8. retain the prior release directory, deployed asset, and web object versions
    until hosted checks pass.
 
 Web deployment uses `prune: false`, retained object versions, seven-day object
@@ -319,3 +392,25 @@ replace real-query hosted smoke.
 
 Treat these logical output names, operation routes, and the MCP path as
 deployment contracts. Changing them requires an explicit migration plan.
+
+The parent owns the deployment and supplies the resulting output document to
+the hosted-proof lane. Documentation and tests must consume those supplied
+values; they must not preserve a previously observed URL as a default. A
+PowerShell handoff can bind an explicitly supplied CDK output JSON without
+printing credentials:
+
+```powershell
+$oracleOutputs = Get-Content -Raw '<parent-supplied-cdk-output-json>' | ConvertFrom-Json
+$stackOutputs = $oracleOutputs.OracleFoundationStack
+$env:ORACLE_E2E_TARGET = 'hosted'
+$env:ORACLE_E2E_BASE_URL = $stackOutputs.WebUrl
+$env:ORACLE_E2E_API_BASE_URL = $stackOutputs.ApiUrl
+$env:ORACLE_E2E_MCP_URL = $stackOutputs.McpUrl
+$env:ORACLE_E2E_PUBLIC_ARTIFACT_BASE_URL = $stackOutputs.PublicArtifactUrl
+```
+
+Stop if the document lacks any stable output, if the four evaluator endpoints
+are not explicit HTTPS URLs, or if a value differs from the just-completed deploy.
+The public artifact proof uses `PublicArtifactUrl`; MCP protocol proof uses
+`McpUrl`. Bucket names and the alarm topic are operator evidence, never browser
+configuration.

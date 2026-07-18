@@ -828,7 +828,8 @@ main {
 }
 
 .field input,
-.field textarea {
+.field textarea,
+.field select {
   width: 100%;
   min-height: 44px;
   padding: 10px 12px;
@@ -1181,6 +1182,43 @@ tbody tr:hover td {
   background: color-mix(in srgb, var(--direct) 5%, var(--surface));
 }
 
+.agent-status-card {
+  margin-bottom: 18px;
+  padding: 16px;
+  border: 1px solid color-mix(in srgb, var(--direct) 30%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--direct) 4%, var(--surface));
+}
+
+.agent-status-card.degraded {
+  border-color: color-mix(in srgb, var(--blocked) 42%, var(--border));
+  background: color-mix(in srgb, var(--blocked) 5%, var(--surface));
+}
+
+.agent-status-card .agent-status {
+  margin-bottom: 14px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.agent-runtime-facts,
+.agent-answer-facts {
+  margin-bottom: 0;
+}
+
+.agent-limitations {
+  margin: 14px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.agent-limitations ul {
+  margin: 8px 0 0;
+  padding-left: 20px;
+}
+
 .agent-status.degraded {
   border-color: color-mix(in srgb, var(--blocked) 38%, var(--border));
 }
@@ -1240,6 +1278,11 @@ tbody tr:hover td {
   border-color: var(--border-strong);
 }
 
+.prompt-card:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
 .answer-card,
 .trace-panel,
 .setup-card,
@@ -1266,8 +1309,104 @@ tbody tr:hover td {
   overflow-wrap: anywhere;
 }
 
+.citation-section {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+
+.citation-section h3 {
+  margin: 0 0 10px;
+  font-size: 15px;
+}
+
+.citation-section ol {
+  margin: 0;
+  padding-left: 22px;
+}
+
+.citation-section li {
+  margin: 6px 0;
+  overflow-wrap: anywhere;
+}
+
 .trace-panel {
   margin-top: 12px;
+}
+
+.tool-trace {
+  display: grid;
+  gap: 10px;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.tool-trace > li {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-subtle);
+}
+
+.tool-trace > li > div span,
+.tool-trace > li > div strong {
+  display: block;
+}
+
+.tool-trace > li > div span {
+  color: var(--text-faint);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.tool-trace > li > div strong {
+  margin-top: 5px;
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+
+.tool-trace dl {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+}
+
+.tool-trace dt {
+  color: var(--text-faint);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.tool-trace dd {
+  margin: 3px 0 0;
+  overflow-wrap: anywhere;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.trace-boundary {
+  margin: 14px 0 0;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.query-console-receipt {
+  margin-bottom: 18px;
+  padding: 22px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--accent) 4%, var(--surface));
+}
+
+.query-console-receipt .fact-grid {
+  margin-bottom: 0;
 }
 
 pre,
@@ -1554,6 +1693,14 @@ pre {
   }
 
   .evidence-timeline dl {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .tool-trace > li {
+    grid-template-columns: minmax(180px, 0.7fr) minmax(0, 1.3fr);
+  }
+
+  .tool-trace dl {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

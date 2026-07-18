@@ -30,6 +30,7 @@ import {
 } from './api.js';
 import { useOracle } from './app-context.js';
 import {
+  CapabilityDetails,
   EnvelopeNotes,
   EvidenceTable,
   PageHeader,
@@ -828,11 +829,234 @@ const agentPrompts = [
   'Which properties appear to be strong candidates for further review based on ownership age, roof age, and location signals?',
 ] as const;
 
+const namedEvidenceTools = [
+  'get_dataset_info',
+  'get_dataset_coverage',
+  'list_pipeline_runs',
+  'get_pipeline_run',
+  'search_properties',
+  'get_property',
+  'get_property_evidence',
+  'find_roof_age_candidates',
+  'find_water_view_candidates',
+  'find_ownership_age_candidates',
+  'find_regional_owner_properties',
+  'find_transit_walkable_properties',
+  'find_starbucks_walkable_properties',
+  'rank_review_candidates',
+  'list_artifacts',
+  'get_data_dictionary',
+] as const;
+
+type NamedEvidenceTool = (typeof namedEvidenceTools)[number];
+
+function stringList(value: unknown): readonly string[] {
+  return Array.isArray(value)
+    ? value.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
+    : [];
+}
+
+function namedTool(value: unknown): NamedEvidenceTool | null {
+  return typeof value === 'string' && namedEvidenceTools.some((tool) => tool === value)
+    ? (value as NamedEvidenceTool)
+    : null;
+}
+
+function isQualifiedAgentStatus(record: Readonly<Record<string, unknown>> | null): boolean {
+  return (
+    record?.status === 'available' &&
+    typeof record.modelProfileId === 'string' &&
+    record.modelProfileId.length > 0 &&
+    typeof record.policyHash === 'string' &&
+    record.policyHash.length > 0
+  );
+}
+
+function AgentStatusCard({ envelope }: Readonly<{ envelope: ApiEnvelope }>) {
+  const record = isRecord(envelope.data) ? envelope.data : {};
+  const reportedStatus = typeof record.status === 'string' ? record.status : 'unavailable';
+  const available = isQualifiedAgentStatus(record);
+  const status = available
+    ? 'available'
+    : reportedStatus === 'available'
+      ? 'configuration error'
+      : reportedStatus;
+  const limitations = [...new Set([...envelope.limitations, ...stringList(record.limitations)])];
+  return (
+    <section
+      className={available ? 'agent-status-card' : 'agent-status-card degraded'}
+      role={available ? 'status' : 'alert'}
+      aria-label={`Agent ${status}`}
+    >
+      <div className="agent-status">
+        <Bot aria-hidden="true" />
+        <div>
+          <strong>Agent {status}</strong>
+          <span>
+            {available
+              ? 'The selected Bedrock profile passed composition and release checks.'
+              : 'No answer can be generated while the composed model profile is unavailable.'}
+          </span>
+        </div>
+      </div>
+      <dl className="fact-grid agent-runtime-facts">
+        <div>
+          <dt>Selected model profile</dt>
+          <dd>{displayValue(record.modelProfileId)}</dd>
+        </div>
+        <div>
+          <dt>Immutable release</dt>
+          <dd>{envelope.releaseId}</dd>
+        </div>
+        <div>
+          <dt>Policy hash</dt>
+          <dd>{displayValue(record.policyHash)}</dd>
+        </div>
+        <div>
+          <dt>Readiness</dt>
+          <dd>{available ? 'Probe passed' : 'Unavailable — no fallback'}</dd>
+        </div>
+      </dl>
+      {limitations.length === 0 ? (
+        <p className="agent-limitations">No agent limitations were returned.</p>
+      ) : (
+        <div className="agent-limitations">
+          <strong>Capability limitations</strong>
+          <ul>
+            {limitations.map((limitation) => (
+              <li key={limitation}>{limitation}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function AgentAnswer({
+  envelope,
+  modelProfileId,
+}: Readonly<{ envelope: ApiEnvelope; modelProfileId: unknown }>) {
+  const record = isRecord(envelope.data) ? envelope.data : {};
+  const citations = stringList(record.citations);
+  const trace = Array.isArray(record.toolCalls) ? record.toolCalls.filter(isRecord) : [];
+  const validTerminalAnswer =
+    (record.status === 'available' || record.status === 'complete') &&
+    typeof record.answer === 'string' &&
+    Array.isArray(record.citations) &&
+    Array.isArray(record.toolCalls) &&
+    trace.length === record.toolCalls.length &&
+    trace.every(
+      (entry) =>
+        typeof entry.callIndex === 'number' &&
+        namedTool(entry.toolName) !== null &&
+        entry.releaseId === envelope.releaseId &&
+        Array.isArray(entry.evidenceIds) &&
+        entry.evidenceIds.every((identifier) => typeof identifier === 'string'),
+    );
+  if (!validTerminalAnswer) {
+    return (
+      <section className="state-panel error-state" role="alert">
+        <AlertTriangle aria-hidden="true" />
+        <div>
+          <h2>Agent response unavailable</h2>
+          <p>
+            The terminal answer or named-tool trace did not match the immutable public response
+            contract. No partial synthesis is displayed.
+          </p>
+        </div>
+      </section>
+    );
+  }
+  return (
+    <>
+      <article className="answer-card" aria-labelledby="agent-answer-heading">
+        <p className="eyebrow">Terminal model synthesis</p>
+        <h2 id="agent-answer-heading">Answer</h2>
+        <p>{displayValue(record.answer)}</p>
+        <dl className="fact-grid agent-answer-facts">
+          <div>
+            <dt>Selected model profile</dt>
+            <dd>{displayValue(modelProfileId)}</dd>
+          </div>
+          <div>
+            <dt>Immutable release</dt>
+            <dd>{envelope.releaseId}</dd>
+          </div>
+          <div>
+            <dt>Terminal state</dt>
+            <dd>{displayValue(record.status)}</dd>
+          </div>
+          <div>
+            <dt>Named tool calls</dt>
+            <dd>{trace.length.toLocaleString()}</dd>
+          </div>
+        </dl>
+        <section className="citation-section" aria-labelledby="citation-heading">
+          <h3 id="citation-heading">Exact citations</h3>
+          {citations.length === 0 ? (
+            <p>No evidence citation was returned.</p>
+          ) : (
+            <ol>
+              {citations.map((citation) => (
+                <li key={citation}>
+                  <code>{citation}</code>
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+      </article>
+      <section className="trace-panel" aria-labelledby="trace-heading">
+        <p className="eyebrow">Deterministic execution</p>
+        <h2 id="trace-heading">Named-tool trace</h2>
+        {trace.length === 0 ? (
+          <p>No named tool was called for this response.</p>
+        ) : (
+          <ol className="tool-trace">
+            {trace.map((entry, index) => {
+              const name = namedTool(entry.toolName);
+              const evidenceIds = stringList(entry.evidenceIds);
+              return (
+                <li key={`${displayValue(entry.callIndex)}-${name ?? index}`}>
+                  <div>
+                    <span>Call {displayValue(entry.callIndex)}</span>
+                    <strong>{name ?? 'Unrecognized named tool'}</strong>
+                  </div>
+                  <dl>
+                    <div>
+                      <dt>Release</dt>
+                      <dd>{displayValue(entry.releaseId)}</dd>
+                    </div>
+                    <div>
+                      <dt>Evidence IDs</dt>
+                      <dd>{evidenceIds.length === 0 ? 'None returned' : evidenceIds.join(', ')}</dd>
+                    </div>
+                  </dl>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+        <p className="trace-boundary">
+          Only tool names, release binding, and public evidence identifiers are shown. Prompts, tool
+          payloads, model reasoning, and chain-of-thought are not exposed.
+        </p>
+      </section>
+      <EnvelopeNotes envelope={envelope} />
+    </>
+  );
+}
+
 export function AgentPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const prompt = searchParams.get('q') ?? '';
   const status = useReleaseQuery('agent.status', {});
-  const answer = useReleaseQuery('agent.ask', { prompt }, prompt !== '');
+  const statusRecord =
+    status.status === 'success' && isRecord(status.data.data) ? status.data.data : null;
+  const agentAvailable = isQualifiedAgentStatus(statusRecord);
+  const statusModelProfileId = statusRecord?.modelProfileId;
+  const answer = useReleaseQuery('agent.ask', { prompt }, prompt !== '' && agentAvailable);
   const [draft, setDraft] = useState(prompt);
   function submit(event: FormSubmitEvent) {
     event.preventDefault();
@@ -853,28 +1077,7 @@ export function AgentPage() {
             <section className="agent-layout">
               <div className="agent-compose">
                 <StatePanel state={status} onRetry={status.retry}>
-                  {(data) => {
-                    const record = rowsFromData(data.data)[0] ?? {};
-                    const agentState = displayValue(valueFor(record, ['status']));
-                    return (
-                      <div
-                        className={
-                          agentState === 'available' ? 'agent-status' : 'agent-status degraded'
-                        }
-                        role={agentState === 'available' ? 'status' : 'alert'}
-                      >
-                        <Bot aria-hidden="true" />
-                        <div>
-                          <strong>Agent {agentState}</strong>
-                          <span>
-                            Profile{' '}
-                            {displayValue(valueFor(record, ['modelProfile', 'modelProfileId']))} ·
-                            policy {displayValue(valueFor(record, ['policyHash']))}
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  }}
+                  {(data) => <AgentStatusCard envelope={data} />}
                 </StatePanel>
                 <form onSubmit={submit}>
                   <label className="field">
@@ -884,10 +1087,15 @@ export function AgentPage() {
                       onChange={(event) => setDraft(event.currentTarget.value)}
                       maxLength={2000}
                       rows={6}
+                      disabled={!agentAvailable}
                       placeholder="Ask a bounded, evidence-backed question"
                     />
                   </label>
-                  <button className="button primary" type="submit" disabled={draft.trim() === ''}>
+                  <button
+                    className="button primary"
+                    type="submit"
+                    disabled={draft.trim() === '' || !agentAvailable}
+                  >
                     <Bot aria-hidden="true" /> Ask agent
                   </button>
                 </form>
@@ -897,6 +1105,7 @@ export function AgentPage() {
                       className="prompt-card"
                       type="button"
                       key={preset}
+                      disabled={!agentAvailable}
                       onClick={() => setDraft(preset)}
                     >
                       {preset}
@@ -905,7 +1114,7 @@ export function AgentPage() {
                   ))}
                 </div>
               </div>
-              <div className="agent-result" aria-live="polite">
+              <div className="agent-result" aria-live="polite" aria-atomic="true">
                 {prompt === '' ? (
                   <div className="state-panel empty-state">
                     <Bot aria-hidden="true" />
@@ -916,36 +1125,425 @@ export function AgentPage() {
                       </p>
                     </div>
                   </div>
+                ) : status.status === 'loading' || status.status === 'idle' ? (
+                  <section className="state-panel loading-state" aria-busy="true">
+                    <span className="loading-orbit" aria-hidden="true" />
+                    <div>
+                      <h2>Checking agent availability</h2>
+                      <p>No request is sent until the selected profile passes its release probe.</p>
+                    </div>
+                  </section>
+                ) : !agentAvailable ? (
+                  <section className="state-panel error-state" role="alert">
+                    <AlertTriangle aria-hidden="true" />
+                    <div>
+                      <h2>Agent answer unavailable</h2>
+                      <p>
+                        The composed model profile is not available. No canned or deterministic
+                        answer has been substituted.
+                      </p>
+                    </div>
+                  </section>
                 ) : (
                   <StatePanel state={answer} onRetry={answer.retry}>
-                    {(data) => {
-                      const record = rowsFromData(data.data)[0] ?? {};
-                      const answerValue = valueFor(record, ['answer', 'response', 'text']);
-                      const trace = valueFor(record, ['toolCalls', 'toolTrace', 'trace']);
-                      return (
-                        <>
-                          <article className="answer-card">
-                            <p className="eyebrow">Model-authored synthesis</p>
-                            <h2>Answer</h2>
-                            <p>{displayValue(answerValue)}</p>
-                            <p className="citation-line">
-                              Citations:{' '}
-                              {displayValue(valueFor(record, ['citations', 'evidenceIds']))}
-                            </p>
-                          </article>
-                          <section className="trace-panel" aria-labelledby="trace-heading">
-                            <p className="eyebrow">Deterministic execution</p>
-                            <h2 id="trace-heading">Tool trace</h2>
-                            <pre>{displayValue(trace)}</pre>
-                          </section>
-                          <EnvelopeNotes envelope={data} />
-                        </>
-                      );
-                    }}
+                    {(data) => (
+                      <AgentAnswer envelope={data} modelProfileId={statusModelProfileId} />
+                    )}
                   </StatePanel>
                 )}
               </div>
             </section>
+          </>
+        )}
+      </ReleaseGate>
+    </>
+  );
+}
+
+type QueryConsoleOperation = Readonly<{
+  operation: ApplicationOperation;
+  toolName: NamedEvidenceTool;
+  title: string;
+  releaseBound: boolean;
+  fields: readonly Readonly<{
+    key: string;
+    label: string;
+    type: 'number' | 'checkbox';
+    value?: string;
+    checked?: boolean;
+    step?: string;
+  }>[];
+}>;
+
+const inquiryToolNames: Readonly<Record<Inquiry['slug'], NamedEvidenceTool>> = {
+  'roof-age': 'find_roof_age_candidates',
+  'water-candidates': 'find_water_view_candidates',
+  'ownership-age': 'find_ownership_age_candidates',
+  'regional-owner': 'find_regional_owner_properties',
+  'transit-walkability': 'find_transit_walkable_properties',
+  'starbucks-walkability': 'find_starbucks_walkable_properties',
+};
+
+const queryConsoleOperations: readonly QueryConsoleOperation[] = [
+  {
+    operation: 'dataset.getInfo',
+    toolName: 'get_dataset_info',
+    title: 'Dataset release summary',
+    releaseBound: false,
+    fields: [],
+  },
+  ...inquiries.map((inquiry) => ({
+    operation: inquiry.operation,
+    toolName: inquiryToolNames[inquiry.slug],
+    title: inquiry.shortTitle,
+    releaseBound: true,
+    fields: inquiry.fields,
+  })),
+];
+
+function consoleOperation(value: string | null): QueryConsoleOperation | null {
+  if (value === null) return queryConsoleOperations[0] ?? null;
+  return queryConsoleOperations.find(({ toolName }) => toolName === value) ?? null;
+}
+
+function consoleFieldMaximum(key: string): number {
+  if (key === 'minimumAgeYears' || key === 'minimumTenureYears') return 200;
+  if (key === 'maximumDistanceMeters') return 20_000;
+  if (key === 'maximumNetworkDistanceMeters') return 10_000;
+  if (key === 'maximumSnapDistanceMeters') return 200;
+  if (key === 'minimumTerrainConfidence' || key === 'minimumValidationConfidence') return 1;
+  return 100;
+}
+
+function consoleRequest(
+  selected: QueryConsoleOperation | null,
+  searchParams: URLSearchParams,
+  releaseId: string | null,
+): Readonly<{ input: Readonly<Record<string, unknown>>; error: string | null }> {
+  if (selected === null) {
+    return {
+      input: {},
+      error: 'Choose one of the fixed named operations. No request was sent.',
+    };
+  }
+  const allowedKeys = new Set(['operation']);
+  if (selected.releaseBound) {
+    allowedKeys.add('city');
+    allowedKeys.add('limit');
+    for (const field of selected.fields) allowedKeys.add(field.key);
+  }
+  if ([...searchParams.keys()].some((key) => !allowedKeys.has(key))) {
+    return {
+      input: {},
+      error:
+        'The console URL contains unsupported authority. Only the selected operation and its structured fields are accepted.',
+    };
+  }
+  if (!selected.releaseBound) return { input: {}, error: null };
+  if (releaseId === null) return { input: {}, error: null };
+
+  const limit = Number(searchParams.get('limit') ?? '25');
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return { input: {}, error: 'Maximum rows must be a whole number from 1 to 100.' };
+  }
+  const input: Record<string, unknown> = { releaseId, limit };
+  const city = searchParams.get('city')?.trim() ?? '';
+  let hasControlCharacter = false;
+  for (let index = 0; index < city.length; index += 1) {
+    const codeUnit = city.charCodeAt(index);
+    if (codeUnit <= 31 || codeUnit === 127) hasControlCharacter = true;
+  }
+  if (city.length > 100 || hasControlCharacter) {
+    return { input: {}, error: 'City must be a safe public label of at most 100 characters.' };
+  }
+  if (city !== '') input.city = city;
+  for (const field of selected.fields) {
+    if (field.type === 'checkbox') {
+      input[field.key] = searchParams.has(field.key)
+        ? searchParams.get(field.key) === 'true'
+        : field.checked === true;
+      continue;
+    }
+    const value = Number(searchParams.get(field.key) ?? field.value ?? '');
+    if (!Number.isFinite(value) || value <= 0 || value > consoleFieldMaximum(field.key)) {
+      return {
+        input: {},
+        error: `${field.label} must be within the fixed operation bound.`,
+      };
+    }
+    input[field.key] = value;
+  }
+  if (selected.operation === 'inquiry.regionalOwner') {
+    input.policyId = 'bay-area-nine-counties-v1';
+  }
+  return { input, error: null };
+}
+
+function evidenceCount(rows: readonly DataRow[]): number {
+  const identifiers = new Set<string>();
+  for (const row of rows) {
+    for (const key of ['evidenceIds', 'evidenceId'] as const) {
+      const value = row[key];
+      if (typeof value === 'string') identifiers.add(value);
+      if (Array.isArray(value)) {
+        for (const identifier of value)
+          if (typeof identifier === 'string') identifiers.add(identifier);
+      }
+    }
+    if (Array.isArray(row.evidence)) {
+      for (const evidence of row.evidence) {
+        if (!isRecord(evidence)) continue;
+        const identifier = valueFor(evidence, ['evidenceId', 'id']);
+        if (typeof identifier === 'string') identifiers.add(identifier);
+      }
+    }
+  }
+  return identifiers.size;
+}
+
+function QueryConsoleReceipt({
+  release,
+  result,
+  selected,
+}: Readonly<{
+  release: ApiEnvelope;
+  result: ApiEnvelope;
+  selected: QueryConsoleOperation;
+}>) {
+  const releaseData = isRecord(release.data) ? release.data : {};
+  const rows = rowsFromData(result.data);
+  const citations = evidenceCount(rows);
+  return (
+    <section
+      className="query-console-receipt"
+      aria-labelledby="query-console-receipt-heading"
+      aria-live="polite"
+    >
+      <div className="section-heading">
+        <div>
+          <p className="eyebrow">Terminal operation receipt</p>
+          <h2 id="query-console-receipt-heading">DuckDB named query complete</h2>
+        </div>
+        <TruthBadge state="direct" />
+      </div>
+      <dl className="fact-grid">
+        <div>
+          <dt>Immutable release</dt>
+          <dd>{result.releaseId}</dd>
+        </div>
+        <div>
+          <dt>Fixed named operation</dt>
+          <dd>{selected.toolName}</dd>
+        </div>
+        <div>
+          <dt>DuckDB version</dt>
+          <dd>{displayValue(releaseData.duckdbVersion)}</dd>
+        </div>
+        <div>
+          <dt>Elapsed time</dt>
+          <dd>{result.timing.elapsedMs.toLocaleString()} ms</dd>
+        </div>
+        <div>
+          <dt>Bytes scanned</dt>
+          <dd>
+            {result.timing.bytesScanned === null
+              ? 'Not reported'
+              : result.timing.bytesScanned.toLocaleString()}
+          </dd>
+        </div>
+        <div>
+          <dt>Row count</dt>
+          <dd>{rows.length.toLocaleString()}</dd>
+        </div>
+        <div>
+          <dt>Public evidence</dt>
+          <dd>
+            {selected.operation === 'dataset.getInfo'
+              ? 'None — release metadata operation'
+              : `${citations.toLocaleString()} public evidence identifiers`}
+          </dd>
+        </div>
+      </dl>
+    </section>
+  );
+}
+
+export function QueryConsolePage() {
+  const { client, releaseId } = useOracle();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const selected = consoleOperation(searchParams.get('operation'));
+  const [draftOperation, setDraftOperation] = useState<string>(
+    selected?.toolName ?? queryConsoleOperations[0]?.toolName ?? 'get_dataset_info',
+  );
+  const draft = consoleOperation(draftOperation) ?? queryConsoleOperations[0] ?? null;
+  const request = consoleRequest(selected, searchParams, releaseId);
+  const operation = selected?.operation ?? 'dataset.getInfo';
+  const query = useApiQuery(
+    client,
+    operation,
+    request.input,
+    selected !== null && request.error === null && (!selected.releaseBound || releaseId !== null),
+  );
+
+  function submit(event: FormSubmitEvent) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const submitted = consoleOperation(formString(form, 'operation'));
+    if (submitted === null) return;
+    const next = new URLSearchParams({ operation: submitted.toolName });
+    if (submitted.releaseBound) {
+      const limit = formString(form, 'limit');
+      const parsedLimit = Number(limit);
+      if (!Number.isInteger(parsedLimit) || parsedLimit < 1 || parsedLimit > 100) return;
+      next.set('limit', limit);
+      const city = formString(form, 'city').trim();
+      if (city !== '') next.set('city', city);
+      for (const field of submitted.fields) {
+        if (field.type === 'checkbox') {
+          next.set(field.key, form.get(field.key) === 'on' ? 'true' : 'false');
+        } else {
+          next.set(field.key, formString(form, field.key));
+        }
+      }
+    }
+    setSearchParams(next);
+  }
+
+  return (
+    <>
+      <PageHeader
+        eyebrow="DuckDB evaluator"
+        title="SQL-free DuckDB named query console"
+        description="Choose one allowlisted operation and bounded structured fields. The browser accepts no query text, relation, path, URL, host, object key, or caller-controlled data authority."
+      />
+      <div className="semantic-warning">
+        <ShieldCheck aria-hidden="true" />
+        <p>
+          <strong>Fixed execution boundary:</strong> every selection maps to one reviewed operation;
+          values are parameters and the immutable release remains server-owned.
+        </p>
+      </div>
+      <form
+        className="filter-panel query-console-form"
+        aria-label="Named query controls"
+        onSubmit={submit}
+      >
+        <label className="field field-grow">
+          <span>Fixed named operation</span>
+          <select
+            name="operation"
+            value={draftOperation}
+            onChange={(event) => setDraftOperation(event.currentTarget.value)}
+          >
+            {queryConsoleOperations.map((candidate) => (
+              <option key={candidate.toolName} value={candidate.toolName}>
+                {candidate.title} — {candidate.toolName}
+              </option>
+            ))}
+          </select>
+        </label>
+        {draft?.releaseBound === true ? (
+          <>
+            <label className="field">
+              <span>City</span>
+              <input
+                name="city"
+                maxLength={100}
+                defaultValue={searchParams.get('city') ?? ''}
+                placeholder="All cities"
+              />
+            </label>
+            <label className="field field-small">
+              <span>Maximum rows</span>
+              <input
+                name="limit"
+                type="number"
+                min="1"
+                max="100"
+                step="1"
+                defaultValue={searchParams.get('limit') ?? '25'}
+              />
+            </label>
+            {draft.fields.map((field) =>
+              field.type === 'checkbox' ? (
+                <label className="check-field" key={field.key}>
+                  <input
+                    name={field.key}
+                    type="checkbox"
+                    defaultChecked={
+                      searchParams.has(field.key)
+                        ? searchParams.get(field.key) === 'true'
+                        : field.checked === true
+                    }
+                  />
+                  <span>
+                    <Check aria-hidden="true" />
+                  </span>
+                  {field.label}
+                </label>
+              ) : (
+                <label className="field" key={field.key}>
+                  <span>{field.label}</span>
+                  <input
+                    name={field.key}
+                    type="number"
+                    min={field.step === '0.1' ? '0' : '1'}
+                    max={consoleFieldMaximum(field.key)}
+                    step={field.step ?? '1'}
+                    defaultValue={searchParams.get(field.key) ?? field.value}
+                  />
+                </label>
+              ),
+            )}
+          </>
+        ) : null}
+        <button className="button primary" type="submit">
+          <Play aria-hidden="true" /> Run fixed operation
+        </button>
+      </form>
+      {request.error === null ? null : (
+        <div className="form-alert" role="alert">
+          <AlertTriangle aria-hidden="true" /> {request.error}
+        </div>
+      )}
+      <ReleaseGate>
+        {(release) => (
+          <>
+            <ReleaseBar envelope={release} />
+            {query.status === 'success' && selected !== null ? (
+              query.data.releaseId === release.releaseId ? (
+                <QueryConsoleReceipt release={release} result={query.data} selected={selected} />
+              ) : (
+                <section className="state-panel error-state" role="alert">
+                  <AlertTriangle aria-hidden="true" />
+                  <div>
+                    <h2>Release mismatch</h2>
+                    <p>The operation response did not match the immutable evaluator release.</p>
+                  </div>
+                </section>
+              )
+            ) : null}
+            {request.error === null ? (
+              <StatePanel state={query} onRetry={query.retry}>
+                {(data) => {
+                  const rows = rowsFromData(data.data);
+                  return (
+                    <>
+                      {selected?.operation === 'dataset.getInfo' ? (
+                        <FactGrid record={rows[0] ?? {}} />
+                      ) : (
+                        <ResultViews
+                          rows={rows}
+                          caption={`${selected?.title ?? 'Named query'} results`}
+                        />
+                      )}
+                      <CapabilityDetails envelope={data} />
+                      <EnvelopeNotes envelope={data} />
+                    </>
+                  );
+                }}
+              </StatePanel>
+            ) : null}
           </>
         )}
       </ReleaseGate>
@@ -1030,25 +1628,6 @@ export function DictionaryPage() {
   );
 }
 
-const mcpTools = [
-  'get_dataset_info',
-  'get_dataset_coverage',
-  'list_pipeline_runs',
-  'get_pipeline_run',
-  'search_properties',
-  'get_property',
-  'get_property_evidence',
-  'find_roof_age_candidates',
-  'find_water_view_candidates',
-  'find_ownership_age_candidates',
-  'find_regional_owner_properties',
-  'find_transit_walkable_properties',
-  'find_starbucks_walkable_properties',
-  'rank_review_candidates',
-  'list_artifacts',
-  'get_data_dictionary',
-] as const;
-
 export function McpPage() {
   const endpoint = `${window.location.origin}/mcp`;
   return (
@@ -1106,7 +1685,7 @@ export function McpPage() {
               <p className="eyebrow">Frozen inventory</p>
               <h2 id="tool-heading">16 read-only tools</h2>
               <ul>
-                {mcpTools.map((tool) => (
+                {namedEvidenceTools.map((tool) => (
                   <li key={tool}>
                     <Wrench aria-hidden="true" /> <code>{tool}</code>
                   </li>

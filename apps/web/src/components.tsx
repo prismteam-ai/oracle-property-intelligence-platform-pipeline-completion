@@ -108,7 +108,7 @@ function returnedCapabilities(envelope: ApiEnvelope) {
     .map(([name, capability]) => ({ name, capability }));
 }
 
-function CapabilityDetails({ envelope }: Readonly<{ envelope: ApiEnvelope }>) {
+export function CapabilityDetails({ envelope }: Readonly<{ envelope: ApiEnvelope }>) {
   const capabilities = returnedCapabilities(envelope);
   if (capabilities.length === 0) return null;
   return (

@@ -37,6 +37,11 @@ export const evaluatorRoutes = Object.freeze([
   },
   { key: 'rankings', path: '/rankings', heading: /Combined review candidates/i },
   { key: 'agent', path: '/agent', heading: /Ask the release.*inspect every tool call/i },
+  {
+    key: 'query-console',
+    path: '/query-console',
+    heading: /SQL-free.*(?:DuckDB|named query)|DuckDB.*named query/i,
+  },
   { key: 'artifacts', path: '/artifacts', heading: /Release artifacts and content identifiers/i },
   {
     key: 'dictionary',

@@ -20,7 +20,10 @@ import * as sns from 'aws-cdk-lib/aws-sns';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import type { Construct } from 'constructs';
 
+import type { BedrockPromotion } from './bedrock-promotion.js';
 import { validatePublicReleaseBundle, type VerifiedPublicRelease } from './public-release.js';
+
+export type { BedrockPromotion } from './bedrock-promotion.js';
 
 const PROJECT = 'oracle-property-intelligence-platform';
 const REPOSITORY = 'oracle-property-intelligence-platform-pipeline-completion';
@@ -56,14 +59,6 @@ const SAME_ORIGIN_API_PATH_PATTERNS = [
   'trpc/*',
   ...SAME_ORIGIN_APPLICATION_OPERATIONS,
 ] as const;
-
-export type BedrockPromotion = Readonly<{
-  inferenceProfileArn: string;
-  invocationResourceArns: readonly string[];
-  modelId: string;
-  region: 'us-east-1' | 'us-east-2';
-  semanticPolicyHash: string;
-}>;
 
 export interface OracleFoundationStackProps extends cdk.StackProps {
   bedrockPromotion?: BedrockPromotion;
@@ -356,8 +351,12 @@ export class OracleFoundationStack extends cdk.Stack {
 
     this.grantBedrockInvoke(apiFunction, props.bedrockPromotion);
 
-    const apiIntegration = new integrations.HttpLambdaIntegration('ApiIntegration', apiFunction);
-    const mcpIntegration = new integrations.HttpLambdaIntegration('McpIntegration', mcpFunction);
+    const apiIntegration = new integrations.HttpLambdaIntegration('ApiIntegration', apiFunction, {
+      timeout: cdk.Duration.seconds(29),
+    });
+    const mcpIntegration = new integrations.HttpLambdaIntegration('McpIntegration', mcpFunction, {
+      timeout: cdk.Duration.seconds(29),
+    });
 
     httpApi.addRoutes({
       path: '/health',
@@ -536,10 +535,19 @@ export class OracleFoundationStack extends cdk.Stack {
     promotion: BedrockPromotion | undefined,
   ): void {
     if (promotion === undefined) return;
+    const foundationModelArns = promotion.invocationResourceArns.filter(
+      (resource) => resource !== promotion.inferenceProfileArn,
+    );
     apiFunction.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream'],
-        resources: [...promotion.invocationResourceArns],
+        actions: ['bedrock:InvokeModel'],
+        resources: [promotion.inferenceProfileArn],
+      }),
+    );
+    apiFunction.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['bedrock:InvokeModel'],
+        resources: foundationModelArns,
         conditions: {
           StringEquals: {
             'bedrock:InferenceProfileArn': promotion.inferenceProfileArn,
@@ -551,21 +559,48 @@ export class OracleFoundationStack extends cdk.Stack {
 
   private validateBedrockPromotion(promotion: BedrockPromotion | undefined): void {
     if (promotion === undefined) return;
-    if (
-      !/^arn:aws:bedrock:(us-east-1|us-east-2):\d{12}:inference-profile\/.+/u.test(
+    const profileMatch =
+      /^arn:aws:bedrock:(us-east-1|us-east-2):(\d{12}):inference-profile\/([A-Za-z0-9.:-]+)$/u.exec(
         promotion.inferenceProfileArn,
-      )
-    ) {
+      );
+    if (profileMatch === null) {
       throw new Error('Bedrock promotion requires an exact us-east-1/us-east-2 profile ARN.');
     }
-    if (
-      promotion.invocationResourceArns.length === 0 ||
-      promotion.invocationResourceArns.some((resource) => !resource.startsWith('arn:aws:bedrock:'))
-    ) {
-      throw new Error('Bedrock promotion requires explicit invocation resource ARNs.');
+    if (profileMatch[1] !== promotion.region) {
+      throw new Error('Bedrock promotion region must match the inference-profile ARN region.');
     }
-    if (promotion.invocationResourceArns.some((resource) => resource.includes('*'))) {
-      throw new Error('Bedrock invocation resources cannot contain wildcards.');
+    if (!cdk.Token.isUnresolved(this.account) && profileMatch[2] !== this.account) {
+      throw new Error('Bedrock inference-profile ARN must belong to the deployment account.');
+    }
+    if (
+      promotion.modelId !== profileMatch[3] &&
+      promotion.modelId !== promotion.inferenceProfileArn
+    ) {
+      throw new Error('Bedrock model ID must identify the promoted inference profile exactly.');
+    }
+    if (promotion.invocationResourceArns.length < 2) {
+      throw new Error(
+        'Bedrock promotion requires the exact profile and at least one foundation-model ARN.',
+      );
+    }
+    if (
+      new Set(promotion.invocationResourceArns).size !== promotion.invocationResourceArns.length
+    ) {
+      throw new Error('Bedrock invocation resources must be unique.');
+    }
+    if (!promotion.invocationResourceArns.includes(promotion.inferenceProfileArn)) {
+      throw new Error('Bedrock invocation resources must include the promoted profile ARN.');
+    }
+    const foundationModelArns = promotion.invocationResourceArns.filter(
+      (resource) => resource !== promotion.inferenceProfileArn,
+    );
+    if (
+      foundationModelArns.some(
+        (resource) =>
+          !/^arn:aws:bedrock:(?:[a-z0-9-]+)?::foundation-model\/[A-Za-z0-9.:-]+$/u.test(resource),
+      )
+    ) {
+      throw new Error('Bedrock promotion requires exact foundation-model ARNs.');
     }
     if (!/^sha256:[a-f0-9]{64}$/u.test(promotion.semanticPolicyHash)) {
       throw new Error('Bedrock promotion requires the exact sha256 semantic policy hash.');

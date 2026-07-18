@@ -201,10 +201,9 @@ compatibility surface. Its metadata truthfully remains:
 | Compatibility surface | Separate and uncertified |
 | ORA-069 certification | Not claimed by this MCP |
 
-## Lambda/CDK packaging requirements
+## Lambda/CDK packaging contract
 
-The infrastructure lane must still provide these deployment assets; this MCP
-lane does not edit CDK:
+The production CDK deployment provides these assets and boundaries:
 
 - package `ORACLE_RELEASE_ROOT` with `ORACLE_SERVING_CONFIG_RELATIVE_PATH`, the
   verified manifest, and every required public Parquet relation at its manifest
@@ -221,8 +220,9 @@ lane does not edit CDK:
 - give the function enough ephemeral memory/disk for the verified packaged
   release and native DuckDB while retaining the shared scan/timeout bounds.
 
-Until CDK copies the release assets and Linux native binding into the Lambda
-artifact/container, local package tests prove composition but not deployability.
+The opt-in Lambda bundle-import test is the deployability proof: it imports the
+Linux native binding, executes `SELECT 1`, imports both handlers, and checks
+query-free ready health against the packaged release.
 
 ## Verification
 
@@ -242,3 +242,23 @@ query/path/URL authority abuse, request/result/page/cursor limits, release and
 result metadata drift, redaction, base64 bodies, configured/unconfigured health,
 production fixture rejection, packaged-config parsing, shared allowlist drift,
 `pageSize` translation, all-operation delegation, and cursor validation parity.
+
+## Mandatory hosted protocol proof
+
+The parent supplies the exact `McpUrl` output; the suite never derives it. The
+hosted release gate performs this sequence against the deployed stateless
+endpoint:
+
+1. `initialize` using protocol `2025-11-25`;
+2. `tools/list`, requiring the exact 16-tool set and
+   `additionalProperties: false` on every input schema;
+3. `tools/call(get_dataset_info)`, requiring exact API release/run/CID/as-of
+   parity; and
+4. a second `tools/call` with an injected `sql` property, requiring a typed
+   strict-schema error and no data query.
+
+`GET /mcp/health` must simultaneously report `ready`, `fixture: null`, and
+`dataQueriesExecuted: 0`. The same hosted gate proves public artifact
+`HEAD`/range/hash behavior and UI deep-link continuity. See
+`apps/e2e/tests/hosted-release.spec.ts` and
+`docs/testing/hosted-evaluator-journeys.md`.

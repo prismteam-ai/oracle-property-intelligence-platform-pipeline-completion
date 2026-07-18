@@ -76,3 +76,68 @@ Complete the Oracle pipeline by loading all available county property, permit, o
 ## Reference
 - [Soofi XYZ Team Kit](https://github.com/soofi-xyz/soofi-xyz-team-kit)
 - [Elephant Oracle Skills](https://github.com/elephant-xyz/skills)
+
+## Implemented evaluator architecture
+
+The evaluator serves one verified immutable Santa Clara County release through
+four coordinated, scale-to-zero surfaces:
+
+- a static CloudFront React evaluator;
+- a Node 22 Lambda application API over fixed DuckDB operations;
+- a stateless Streamable HTTP MCP exposing the same 16 SQL-free operations; and
+- a bounded Amazon Bedrock ToolLoopAgent whose versioned adapter injects the
+  immutable release, translates only frozen operation fields, redacts to public
+  evidence, and returns exact citations plus a named-tool trace.
+
+The UI includes the six assignment inquiries, transparent deterministic
+ranking, `/agent`, and `/query-console`. The console accepts fixed named
+operations and structured filters only; it has no arbitrary SQL, relation,
+path, URL, host, or object-locator input. Restricted artifacts remain isolated
+from API, MCP, CloudFront, and the model.
+
+Production has no model fallback. Incomplete Bedrock configuration, semantic
+policy drift, adapter/release mismatch, provider failure, or budget exhaustion
+must report unavailable/failure and cannot produce a canned answer. The
+deterministic fallback used by local tests is explicit test injection and
+cannot be selected from production environment variables.
+
+## Deployment outputs and hosted proof
+
+Current endpoints are parent-supplied CDK outputs, not values committed to this
+repository: `WebUrl`, `ApiUrl`, `McpUrl`, and `PublicArtifactUrl`. Use all four
+from the same deployment; never infer an endpoint from an older stack or doc.
+
+With Node `v22.18.0` and pnpm `10.33.0`:
+
+```powershell
+$env:PATH = 'E:\nvm\v22.18.0;' + $env:PATH
+$env:ORACLE_E2E_TARGET = 'hosted'
+$env:ORACLE_E2E_BASE_URL = 'https://<WebUrl-host>'
+$env:ORACLE_E2E_API_BASE_URL = 'https://<ApiUrl-host>'
+$env:ORACLE_E2E_MCP_URL = 'https://<exact-McpUrl-output-ending-in-mcp>'
+$env:ORACLE_E2E_PUBLIC_ARTIFACT_BASE_URL = 'https://<PublicArtifactUrl-host>'
+pnpm --filter @oracle/e2e test
+```
+
+The hosted gate requires ready query-free API/MCP health, API/MCP/manifest
+release parity, `initialize -> tools/list -> tools/call`, strict schema
+rejection, public artifact `HEAD`/range/SHA-256, SPA deep links, and one
+successful bounded agent answer with the actual model/profile, named-tool trace,
+citations, and release continuity. Degraded agent status fails this gate.
+
+See [hosted evaluator checks](docs/testing/hosted-evaluator-journeys.md),
+[agent contract](docs/agent/README.md), [API contract](docs/api/application-api.md),
+[MCP contract](docs/mcp/README.md), and the
+[recording walkthrough](docs/demo/oracle-evaluator-walkthrough.md).
+
+## Current limitations
+
+- Capability states depend on the immutable release. Missing redistributable
+  ownership evidence remains blocked/unknown; absence never proves long tenure.
+- Water proximity is a review candidate and does not prove a view. Straight-line
+  walkability is a proxy unless network-route evidence is present.
+- Public regional-owner evidence is coarse and never exposes raw owner identity.
+- Bedrock availability and model access require a separately promoted exact
+  inference profile, least-privilege IAM, and the matching semantic-policy hash.
+- The repository does not claim a demo video exists. Record one only after the
+  parent deploys and the mandatory hosted suite passes.

@@ -7,7 +7,7 @@ export const API_LIMITS = Object.freeze({
   defaultPageSize: 25,
   maximumPageSize: 100,
   queryTimeoutMs: 5_000,
-  agentTimeoutMs: 30_000,
+  agentTimeoutMs: 25_000,
   maximumScanBytes: 512 * 1024 * 1024,
   maximumAgentPromptCharacters: 2_000,
 });

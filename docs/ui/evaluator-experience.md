@@ -4,18 +4,18 @@ Status: Wave 3B production UI contract.
 
 ## Runtime boundary
 
-The evaluator is a static React application backed by the committed Wave 3A
+The evaluator is a static React application backed by the production
 application API. It discovers an immutable release through
 `POST /dataset.getInfo`, then binds every other operation to the returned
 `releaseId`. The production client rejects any response containing the literal
 `TEST_ONLY_DETERMINISTIC_FIXTURE` label.
 
-The default Wave 3A API export still fails closed because no production composer
-injects the recovered `verified-immutable-release` six-inquiry service. The UI
-therefore renders a conspicuous degraded/error state and never substitutes
-synthetic property rows, fabricated coverage totals, or canned agent text. A
-production deployment must inject that service into the API/MCP/agent adapters
-and route the static application to that composed API origin.
+Production composes the verified immutable-release query service and the
+release-bound named-tool agent independently. Missing release configuration,
+policy drift, or a failed model probe produces a conspicuous degraded/error
+state; the UI never substitutes synthetic property rows, fabricated coverage
+totals, or canned agent text. The static deployment must route the application
+to that composed API origin.
 
 Tests inject a deterministic `ApiClient` directly into `<App>`. Those records:
 
@@ -41,7 +41,8 @@ Tests inject a deterministic `ApiClient` directly into `<App>`. Those records:
 | `/inquiries/transit-walkability`   | Pedestrian-network transit distance with proxy distinction                        |
 | `/inquiries/starbucks-walkability` | Qualified Overture place and pedestrian-route evidence                            |
 | `/rankings`                        | Transparent deterministic multi-signal ranking                                    |
-| `/agent`                           | No-fallback agent status, prompt presets, answer, citations, and named-tool trace |
+| `/agent`                           | No-fallback status, selected profile, terminal answer/error, citations, and trace |
+| `/query-console`                   | SQL-free DuckDB console over fixed operations and bounded structured fields       |
 | `/artifacts`                       | Public immutable CIDs, hashes, sizes, rows, and publication class                 |
 | `/dictionary`                      | Release-bound public data dictionary                                              |
 | `/mcp`                             | Streamable HTTP setup and exact sixteen-tool inventory                            |
@@ -59,6 +60,38 @@ Property filters and inquiry thresholds use `URLSearchParams`; applying a form
 updates the URL before the operation reruns. Agent submissions use `?q=`. This
 makes demo steps shareable and replayable without browser storage. Returned
 opaque cursors are not interpreted by the UI.
+
+## Agent terminal states
+
+`/agent` checks `agent.status` before enabling its question controls or sending
+`agent.ask`. Loading is explicit. An unavailable, policy-drifted, or failed
+profile produces a conspicuous terminal error and never displays a canned,
+rules-based, fixture, or prior answer.
+
+An available status names the actual selected model profile, policy hash,
+immutable release, and public limitations returned by the composed production
+service. A successful answer renders only the terminal synthesis, top-level
+release receipt, sorted exact citations, and the redacted trace fields
+`callIndex`, `toolName`, `releaseId`, and public `evidenceIds`. The UI never
+renders model reasoning, chain-of-thought, prompts, named-tool arguments, raw
+tool results, provider output, or private evidence.
+
+## SQL-free DuckDB console
+
+`/query-console` defaults to the fixed `get_dataset_info` operation and exposes
+only an allowlisted operation selector. Release-bound inquiry choices reuse the
+same fixed production operations and expose only their bounded structured
+fields. The console has no query-text field and accepts no relation, column,
+expression, path, URL, host, object key, extension, resource setting, or other
+caller-controlled data authority. Unknown URL parameters fail closed before a
+request is sent and are not echoed into the page.
+
+Every successful terminal receipt shows the immutable release ID, exact named
+operation, manifest-bound DuckDB version, elapsed milliseconds, bytes scanned,
+row count, public evidence count (or an explicit metadata-operation absence),
+returned capability, and public limitations. A response whose release ID does
+not equal the evaluator's current immutable release is displayed as a terminal
+release-mismatch error.
 
 ## Evidence language
 
@@ -110,5 +143,8 @@ pnpm --filter @oracle/web build
 ```
 
 Component tests cover production fixture rejection, stable API errors, route
-and query behavior, accessible table/spatial views, agent degradation/tool
-trace, explicit test-fixture labeling, and an automated axe smoke check.
+and query behavior, accessible table/spatial views, agent loading/success/error
+and no-fallback degradation, selected profile/release/limitations, exact
+citations and redacted named-tool traces, the SQL-free console's terminal
+metadata and strict authority rejection, explicit test-fixture labeling, direct
+route entry, responsive semantic structure, and automated axe smoke checks.

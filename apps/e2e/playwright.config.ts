@@ -9,7 +9,7 @@ export default defineConfig({
   outputDir: 'test-results',
   fullyParallel: false,
   forbidOnly: Boolean(process.env.CI),
-  retries: target.target === 'hosted' ? 1 : 0,
+  retries: 0,
   workers: target.target === 'hosted' ? 2 : 1,
   reporter: process.env.CI
     ? [['line'], ['html', { open: 'never', outputFolder: 'playwright-report' }]]

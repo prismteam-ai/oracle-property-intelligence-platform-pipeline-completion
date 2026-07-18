@@ -7,6 +7,7 @@ import {
   createNamedEvidenceTools,
   type InvocationLedger,
   type NamedEvidenceTools,
+  type NamedToolTraceRecord,
 } from './tools.js';
 import type { NamedEvidenceExecutor } from './contracts.js';
 
@@ -21,7 +22,7 @@ export const ORACLE_AGENT_LIMITS = Object.freeze({
   maximumSteps: 3,
   maximumToolCalls: 6,
   maximumOutputTokens: 2_048,
-  totalTimeoutMs: 30_000,
+  totalTimeoutMs: 25_000,
   stepTimeoutMs: 10_000,
   maximumPromptCharacters: 8_000,
 });
@@ -49,6 +50,7 @@ export type OracleAgentAnswer = Readonly<{
   invocationId: string;
   citedEvidenceIds: readonly string[];
   toolCalls: number;
+  trace: readonly NamedToolTraceRecord[];
 }>;
 
 export type OracleEvidenceAgent = Readonly<{
@@ -60,7 +62,13 @@ export type OracleEvidenceAgent = Readonly<{
 
 function citedEvidenceIds(text: string): readonly string[] {
   return Object.freeze(
-    [...text.matchAll(/\[evidence:(sc:evidence:[a-f0-9]{64})\]/gu)].map((match) => match[1] ?? ''),
+    [
+      ...new Set(
+        [...text.matchAll(/\[evidence:(sc:evidence:[a-f0-9]{64})\]/gu)].map(
+          (match) => match[1] ?? '',
+        ),
+      ),
+    ].sort(),
   );
 }
 
@@ -163,6 +171,7 @@ export function createOracleEvidenceAgent(
         failures: 0,
         evidenceIds: new Set(),
         supportStates: new Set(),
+        trace: [],
       };
       ledgers.set(invocationId, ledger);
       const startedAt = Date.now();
@@ -192,6 +201,7 @@ export function createOracleEvidenceAgent(
           invocationId,
           citedEvidenceIds: citations,
           toolCalls: ledger.calls,
+          trace: Object.freeze([...ledger.trace]),
         });
       } catch (error) {
         input.telemetry?.({

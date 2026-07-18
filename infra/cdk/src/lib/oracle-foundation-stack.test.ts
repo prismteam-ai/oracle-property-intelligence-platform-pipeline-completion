@@ -574,6 +574,11 @@ describe('Oracle product infrastructure', () => {
     expect(JSON.stringify(foundationTemplate.findResources('AWS::Lambda::Function'))).not.toContain(
       'ReservedConcurrentExecutions',
     );
+    foundationTemplate.resourcePropertiesCountIs(
+      'AWS::ApiGatewayV2::Integration',
+      { TimeoutInMillis: 29_000 },
+      2,
+    );
   });
 
   it('packages the local verified release contract and uses one secret dynamic reference', () => {
@@ -595,6 +600,17 @@ describe('Oracle product infrastructure', () => {
       expect(environment).not.toHaveProperty('ORACLE_CURSOR_SECRET_ARN');
       expect(environment).not.toHaveProperty('ORACLE_PUBLIC_RELEASE_BUCKET');
       expect(environment).not.toHaveProperty('ORACLE_PUBLIC_RELEASE_PREFIX');
+    }
+    const apiEnvironment = environments.find(
+      (environment) => environment.POWERTOOLS_SERVICE_NAME === 'oracle-application-api',
+    );
+    for (const key of [
+      'ORACLE_AGENT_POLICY_HASH',
+      'ORACLE_BEDROCK_MODEL_ID',
+      'ORACLE_BEDROCK_REGION',
+      'ORACLE_MODEL_PROVIDER',
+    ]) {
+      expect(apiEnvironment).not.toHaveProperty(key);
     }
     expect(environments[0]?.ORACLE_CURSOR_HMAC_SECRET_BASE64).toEqual(
       environments[1]?.ORACLE_CURSOR_HMAC_SECRET_BASE64,
@@ -625,12 +641,13 @@ describe('Oracle product infrastructure', () => {
   });
 
   it('adds exact-profile Bedrock permission only with complete promotion evidence', () => {
+    const foundationModelArn = 'arn:aws:bedrock:us-east-2::foundation-model/example.model-v1:0';
     const promotion: BedrockPromotion = {
       inferenceProfileArn:
         'arn:aws:bedrock:us-east-2:417242953053:inference-profile/us.oracle-profile-v1',
       invocationResourceArns: [
         'arn:aws:bedrock:us-east-2:417242953053:inference-profile/us.oracle-profile-v1',
-        'arn:aws:bedrock:us-east-2::foundation-model/example.model-v1:0',
+        foundationModelArn,
       ],
       modelId: 'us.oracle-profile-v1',
       region: 'us-east-2',
@@ -643,23 +660,184 @@ describe('Oracle product infrastructure', () => {
       testOnlyFunctionCodeOverride: templateTestCode,
     });
     const promotedTemplate = Template.fromStack(promotedStack);
-    const promotedPolicies = JSON.stringify(productRolePolicies(promotedTemplate));
+    const promotedPolicyResources = productRolePolicies(promotedTemplate);
+    const promotedPolicies = JSON.stringify(promotedPolicyResources);
 
     expect(promotedPolicies).toContain('bedrock:InvokeModel');
-    expect(promotedPolicies).toContain('bedrock:InvokeModelWithResponseStream');
+    expect(promotedPolicies).not.toContain('bedrock:InvokeModelWithResponseStream');
     expect(promotedPolicies).toContain('bedrock:InferenceProfileArn');
     expect(promotedPolicies).toContain(promotion.inferenceProfileArn);
     expect(promotedPolicies).not.toContain('arn:aws:bedrock:*');
 
+    const bedrockStatements = Object.values(
+      promotedPolicyResources as Record<
+        string,
+        { Properties?: { PolicyDocument?: { Statement?: unknown[] } } }
+      >,
+    ).flatMap((resource) => {
+      const document = resource.Properties?.PolicyDocument;
+      return (document?.Statement ?? []).filter((statement) =>
+        JSON.stringify(statement).includes('bedrock:InvokeModel'),
+      ) as {
+        Action?: unknown;
+        Condition?: unknown;
+        Effect?: unknown;
+        Resource?: unknown;
+      }[];
+    });
+    expect(bedrockStatements).toHaveLength(2);
+    expect(bedrockStatements).toContainEqual({
+      Action: 'bedrock:InvokeModel',
+      Effect: 'Allow',
+      Resource: promotion.inferenceProfileArn,
+    });
+    expect(bedrockStatements).toContainEqual({
+      Action: 'bedrock:InvokeModel',
+      Condition: {
+        StringEquals: { 'bedrock:InferenceProfileArn': promotion.inferenceProfileArn },
+      },
+      Effect: 'Allow',
+      Resource: foundationModelArn,
+    });
+
+    const promotedFunctions = Object.values(
+      promotedTemplate.findResources('AWS::Lambda::Function'),
+    );
+    const promotedApi = promotedFunctions.find((resource) => {
+      const variables = (resource.Properties as SynthesizedResource['Properties'])?.Environment
+        ?.Variables;
+      return variables?.POWERTOOLS_SERVICE_NAME === 'oracle-application-api';
+    });
+    const promotedMcp = promotedFunctions.find((resource) => {
+      const variables = (resource.Properties as SynthesizedResource['Properties'])?.Environment
+        ?.Variables;
+      return variables?.POWERTOOLS_SERVICE_NAME === 'oracle-named-evidence-mcp';
+    });
+    const apiEnvironment = (promotedApi?.Properties as SynthesizedResource['Properties'])
+      ?.Environment?.Variables;
+    expect(apiEnvironment).toMatchObject({
+      ORACLE_AGENT_POLICY_HASH: promotion.semanticPolicyHash,
+      ORACLE_BEDROCK_MODEL_ID: promotion.modelId,
+      ORACLE_BEDROCK_REGION: promotion.region,
+      ORACLE_MODEL_PROVIDER: 'amazon-bedrock',
+    });
+    const mcpEnvironment = (promotedMcp?.Properties as SynthesizedResource['Properties'])
+      ?.Environment?.Variables;
+    for (const key of [
+      'ORACLE_AGENT_POLICY_HASH',
+      'ORACLE_BEDROCK_MODEL_ID',
+      'ORACLE_BEDROCK_REGION',
+      'ORACLE_MODEL_PROVIDER',
+    ]) {
+      expect(mcpEnvironment).not.toHaveProperty(key);
+    }
+
+    const publicBoundary = (template: Template) => {
+      const routes = Object.values(template.findResources('AWS::ApiGatewayV2::Route'))
+        .map((resource) => (resource.Properties as { RouteKey: string }).RouteKey)
+        .sort();
+      const buckets = Object.values(template.findResources('AWS::S3::Bucket')).map((resource) => {
+        const properties = resource.Properties as {
+          ObjectLockEnabled?: boolean;
+          PublicAccessBlockConfiguration?: unknown;
+          VersioningConfiguration?: unknown;
+        };
+        return {
+          ObjectLockEnabled: properties.ObjectLockEnabled,
+          PublicAccessBlockConfiguration: properties.PublicAccessBlockConfiguration,
+          VersioningConfiguration: properties.VersioningConfiguration,
+        };
+      });
+      const distributions = Object.values(
+        template.findResources('AWS::CloudFront::Distribution'),
+      ).map((resource) => {
+        const configuration = (
+          resource.Properties as { DistributionConfig: CloudFrontDistributionConfig }
+        ).DistributionConfig;
+        return {
+          cachePaths: (configuration.CacheBehaviors ?? [])
+            .map((behavior) => String(behavior.PathPattern))
+            .sort(),
+          cacheBehaviorCount: configuration.CacheBehaviors?.length ?? 0,
+          defaultAllowedMethods: configuration.DefaultCacheBehavior?.AllowedMethods,
+          originCount: configuration.Origins?.length ?? 0,
+        };
+      });
+      return { buckets, distributions, routes };
+    };
+    expect(publicBoundary(promotedTemplate)).toEqual(publicBoundary(foundationTemplate));
+    const outputs = JSON.stringify((promotedTemplate.toJSON() as { Outputs?: unknown }).Outputs);
+    expect(outputs).not.toContain(promotion.modelId);
+    expect(outputs).not.toContain(promotion.inferenceProfileArn);
+    expect(outputs).not.toContain(promotion.semanticPolicyHash);
+
     const baseline = JSON.stringify(productRolePolicies(foundationTemplate));
     expect(baseline).not.toContain('bedrock:InvokeModel');
+    const invalidPromotion = (candidate: BedrockPromotion, message: string): void => {
+      expect(
+        () =>
+          new OracleFoundationStack(new cdk.App(), 'InvalidPromotionStack', {
+            bedrockPromotion: candidate,
+            env: { account: '417242953053', region: 'us-east-2' },
+            testOnlyFunctionCodeOverride: templateTestCode,
+          }),
+      ).toThrow(message);
+    };
+    invalidPromotion(
+      { ...promotion, region: 'us-east-1' },
+      'region must match the inference-profile ARN region',
+    );
+    invalidPromotion(
+      {
+        ...promotion,
+        inferenceProfileArn:
+          'arn:aws:bedrock:us-east-2:111122223333:inference-profile/us.oracle-profile-v1',
+      },
+      'must belong to the deployment account',
+    );
+    invalidPromotion(
+      { ...promotion, modelId: 'us.unrelated-profile-v1' },
+      'must identify the promoted inference profile exactly',
+    );
+    invalidPromotion(
+      {
+        ...promotion,
+        invocationResourceArns: [promotion.inferenceProfileArn, promotion.inferenceProfileArn],
+      },
+      'must be unique',
+    );
+    invalidPromotion(
+      {
+        ...promotion,
+        invocationResourceArns: [
+          foundationModelArn,
+          'arn:aws:bedrock:us-east-1::foundation-model/example.model-v1:0',
+        ],
+      },
+      'must include the promoted profile ARN',
+    );
+    invalidPromotion(
+      {
+        ...promotion,
+        invocationResourceArns: [promotion.inferenceProfileArn, 'arn:aws:bedrock:*'],
+      },
+      'requires exact foundation-model ARNs',
+    );
+    invalidPromotion(
+      { ...promotion, semanticPolicyHash: 'sha256:not-a-hash' },
+      'requires the exact sha256 semantic policy hash',
+    );
     expect(
       () =>
-        new OracleFoundationStack(new cdk.App(), 'InvalidPromotionStack', {
-          bedrockPromotion: { ...promotion, invocationResourceArns: ['arn:aws:bedrock:*'] },
+        new OracleFoundationStack(new cdk.App(), 'TooFewPromotionResourcesStack', {
+          bedrockPromotion: {
+            ...promotion,
+            invocationResourceArns: [promotion.inferenceProfileArn],
+          },
+          env: { account: '417242953053', region: 'us-east-2' },
           testOnlyFunctionCodeOverride: templateTestCode,
         }),
-    ).toThrow('cannot contain wildcards');
+    ).toThrow('requires the exact profile and at least one foundation-model ARN');
   }, 20_000);
 
   it('runs cheap health-only API destinations with bounded retry, one DLQ, and alarms', () => {
@@ -843,6 +1021,26 @@ describe('Oracle product infrastructure', () => {
           );
           expect(assetTree).toContain('release/serving-config.json');
           expect(assetTree).toContain('release/release-manifest.json');
+          expect(
+            assetTree.filter(
+              (path) =>
+                path.startsWith('node_modules/') && !path.startsWith('node_modules/@duckdb/'),
+            ),
+          ).toEqual([]);
+
+          if (serviceName === 'oracle-application-api') {
+            const applicationBundle = await readFile(join(assetDirectory, bundleFile), 'utf8');
+            for (const runtimeField of [
+              'ORACLE_AGENT_POLICY_HASH',
+              'ORACLE_BEDROCK_MODEL_ID',
+              'ORACLE_BEDROCK_REGION',
+              'ORACLE_MODEL_PROVIDER',
+            ]) {
+              expect(applicationBundle).toContain(runtimeField);
+            }
+            expect(applicationBundle).toContain('amazon-bedrock');
+            expect(applicationBundle).not.toContain('TEST_ONLY_DETERMINISTIC_FIXTURE');
+          }
 
           runLinuxLambdaVerification(assetDirectory, bundleFile, serviceName, healthPath);
         }

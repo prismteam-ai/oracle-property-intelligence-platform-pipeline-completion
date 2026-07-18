@@ -18,6 +18,7 @@ import {
   PanelLeftClose,
   Search,
   ServerCog,
+  TerminalSquare,
   Sun,
 } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
@@ -38,6 +39,7 @@ const navigation = [
   { to: '/inquiries/starbucks-walkability', label: 'Starbucks walkability', icon: Map },
   { to: '/rankings', label: 'Combined ranking', icon: Boxes },
   { to: '/agent', label: 'Agent trace', icon: Bot },
+  { to: '/query-console', label: 'Query console', icon: TerminalSquare },
   { to: '/artifacts', label: 'Artifacts', icon: Archive },
   { to: '/dictionary', label: 'Data dictionary', icon: BookOpen },
   { to: '/mcp', label: 'MCP setup', icon: ServerCog },
