@@ -2,8 +2,7 @@
 /* eslint-disable @typescript-eslint/dot-notation */
 import { createHash } from 'node:crypto';
 import { closeSync, createReadStream, openSync, writeSync } from 'node:fs';
-import { mkdir, mkdtemp, open, readFile, rm, stat } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, open, readFile, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 import { parse } from 'csv-parse/sync';
@@ -23,6 +22,7 @@ import {
 } from '../../spi/acquired-artifact.js';
 import type { GtfsDecodedFeed, GtfsRow, ValidatedGtfsFeed } from './types.js';
 import { GTFS_REQUIRED_MEMBERS } from './types.js';
+import { createGtfsWorkspace, removeGtfsWorkspaceBounded } from './workspace-cleanup.js';
 
 const decoder = new TextDecoder('utf-8', { fatal: true });
 const MAX_GTFS_MEMBER_BYTES = 64 * 1024 * 1024;
@@ -336,7 +336,8 @@ export async function decodeGtfsZipStream(
   expectedAgencyId: string,
   signal: AbortSignal,
 ): Promise<GtfsDecodedFeed> {
-  const workspace = await mkdtemp(join(tmpdir(), 'oracle-gtfs-'));
+  const workspaceHandle = await createGtfsWorkspace();
+  const workspace = workspaceHandle.root;
   const retained = new Map<string, string>();
   const retainedHashes = new Map<string, string>();
   const seen = new Set<string>();
@@ -344,6 +345,10 @@ export async function decodeGtfsZipStream(
   let entryCount = 0;
   let entryNameBytes = 0;
   let streamError: Error | undefined;
+  let decodeFailed = false;
+  let primaryFailure: unknown;
+  let decodedFeed: GtfsDecodedFeed | undefined;
+  let cleanupFailure: unknown;
   const openDescriptors = new Set<number>();
   try {
     const unzip = new Unzip((file) => {
@@ -552,7 +557,7 @@ export async function decodeGtfsZipStream(
         throw new Error('Streaming GTFS artifacts do not expose whole-byte copy()');
       },
     });
-    return Object.freeze({
+    decodedFeed = Object.freeze({
       artifactId: artifact.metadata.artifactId,
       ordinal: 0,
       visibility: artifact.metadata.visibility,
@@ -575,10 +580,39 @@ export async function decodeGtfsZipStream(
       }),
       streamingValidationIssues: validationIssues,
     });
+  } catch (error) {
+    decodeFailed = true;
+    primaryFailure = error;
+    throw error;
   } finally {
-    for (const descriptor of openDescriptors) closeSync(descriptor);
-    await rm(workspace, { recursive: true, force: true });
+    for (const descriptor of openDescriptors) {
+      try {
+        closeSync(descriptor);
+      } catch (error) {
+        cleanupFailure ??= error;
+      }
+    }
+    try {
+      await removeGtfsWorkspaceBounded(workspaceHandle);
+    } catch (error) {
+      cleanupFailure ??= error;
+    }
+    if (cleanupFailure !== undefined) {
+      if (decodeFailed && primaryFailure instanceof Error && Object.isExtensible(primaryFailure)) {
+        Object.defineProperty(primaryFailure, 'gtfsWorkspaceCleanupFailure', {
+          configurable: true,
+          value: cleanupFailure,
+        });
+      }
+    }
   }
+  if (cleanupFailure instanceof Error) throw cleanupFailure;
+  if (cleanupFailure !== undefined) {
+    throw new Error('GTFS workspace cleanup failed with a non-Error value', {
+      cause: cleanupFailure,
+    });
+  }
+  return decodedFeed;
 }
 
 function duplicateIssues(rows: readonly GtfsRow[], keys: readonly string[], table: string) {
