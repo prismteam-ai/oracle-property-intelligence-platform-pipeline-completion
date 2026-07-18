@@ -95,9 +95,29 @@ also checks public artifact `HEAD`, a four-byte Parquet range, bounded full-file
 SHA-256 for the smallest public artifact, and representative SPA deep links.
 Browser pages must not display `TEST_ONLY_DETERMINISTIC_FIXTURE`.
 
-The hosted agent journey performs exactly one read-only named-evidence prompt
-and requires a terminal successful answer, exact citations, a named-tool trace,
-and the actual selected model/profile. Once the agent is promoted, unavailable,
+The hosted agent journey performs exactly one read-only named-evidence prompt.
+Its explicit roof-age and ownership-age conjunction is classified into those
+two threshold-bearing inquiries. Runtime reads at most five roof candidates,
+then executes an exact `propertyId`-scoped ownership predicate for each returned
+candidate, intersects before synthesis, and passes only the final matching rows
+and evidence to exactly one provider request with tools disabled. A match
+requires supported/proxy evidence bound to that property from both inquiries,
+and the model's strict JSON output must name every proven property and attach
+each citation to its exact property and inquiry. Runtime rejects swapped,
+dumped, omitted, duplicate, free-prose, or scope-mismatched claims before a
+deterministic renderer creates the natural-language answer. The result is exact
+for that bounded primary page and the renderer always states that it is not
+county-exhaustive and whether the source page was truncated. Empty
+intersections render only bounded no-proven-match language. All primary and
+predicate work shares the same total request timer and the trace therefore
+contains one to six named-tool records.
+Raw evidence and model claims cross the same exact canonical property-ID
+boundary before prompting or rendering; unsafe controls, brackets, embedded
+citation syntax, normalization collisions, and conflicting aliases fail before
+the model can produce a hosted answer.
+The journey requires a terminal successful answer, both inquiry tool names in
+the trace when candidates exist, exact citations, and the actual selected
+model/profile. Once the agent is promoted, unavailable,
 degraded, policy-drifted, canned, or trace-free agent behavior fails the hosted
 release suite. Hosted Playwright retries are disabled so this proof cannot spend
 a second model request after a failure. Only this agent response observer has an

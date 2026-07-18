@@ -30,6 +30,30 @@ type CriterionQueryClass = Extract<
   | 'starbucks_walkability'
 >;
 
+type DeterministicInquiryQueryClass = CriterionQueryClass | 'combined_ranking';
+
+export type DeterministicInquiryEvidenceRoute = Readonly<{
+  queryClass: DeterministicInquiryQueryClass;
+  primaryCall: Readonly<{
+    toolName: NamedEvidenceToolName;
+    input: Readonly<Record<string, unknown>>;
+  }>;
+  candidateFilters: readonly Readonly<{
+    toolName: NamedEvidenceToolName;
+    input: Readonly<Record<string, unknown>>;
+  }>[];
+}>;
+
+const DETERMINISTIC_INQUIRY_TOOL_BY_QUERY_CLASS = Object.freeze({
+  roof_age: 'find_roof_age_candidates',
+  water_view: 'find_water_view_candidates',
+  ownership_age: 'find_ownership_age_candidates',
+  regional_owner: 'find_regional_owner_properties',
+  transit_walkability: 'find_transit_walkable_properties',
+  starbucks_walkability: 'find_starbucks_walkable_properties',
+  combined_ranking: 'rank_review_candidates',
+} as const satisfies Readonly<Record<DeterministicInquiryQueryClass, NamedEvidenceToolName>>);
+
 function orderedTools(
   ...names: readonly NamedEvidenceToolName[]
 ): readonly NamedEvidenceToolName[] {
@@ -89,6 +113,9 @@ const criterionPatterns: Readonly<Record<CriterionQueryClass, readonly RegExp[]>
     /\bownership[\s-]+(?:age|tenure|history)\b/iu,
     /\bowner[\s-]+tenure\b/iu,
     /\b(?:owned|ownership)[\s-]+for\b/iu,
+    /\b(?:exchanged|transferred)[\s-]+ownership\b/iu,
+    /\bownership[\s-]+(?:exchange|transfer)\b/iu,
+    /\bchanged[\s-]+hands\b/iu,
     /\blong[\s-]*term owner\b/iu,
   ],
   regional_owner: [
@@ -110,16 +137,21 @@ function matchesAny(question: string, patterns: readonly RegExp[]): boolean {
   return patterns.some((pattern) => pattern.test(question));
 }
 
-export function classifyOracleAgentQuestion(normalizedQuestion: string): OracleAgentQueryClass {
-  const matchingCriteria = (Object.keys(criterionPatterns) as CriterionQueryClass[]).filter(
-    (queryClass) => matchesAny(normalizedQuestion, criterionPatterns[queryClass]),
+function matchingCriterionClasses(normalizedQuestion: string): readonly CriterionQueryClass[] {
+  return (Object.keys(criterionPatterns) as CriterionQueryClass[]).filter((queryClass) =>
+    matchesAny(normalizedQuestion, criterionPatterns[queryClass]),
   );
-  if (
-    matchingCriteria.length > 1 ||
-    /\b(?:rank|ranking|ranked|combined|overall|weighted|review score|all six|multiple criteria)\b/iu.test(
-      normalizedQuestion,
-    )
-  ) {
+}
+
+function requestsCombinedRanking(normalizedQuestion: string): boolean {
+  return /\b(?:rank|ranking|ranked|combined|overall|weighted|review score|all six|multiple criteria)\b/iu.test(
+    normalizedQuestion,
+  );
+}
+
+export function classifyOracleAgentQuestion(normalizedQuestion: string): OracleAgentQueryClass {
+  const matchingCriteria = matchingCriterionClasses(normalizedQuestion);
+  if (matchingCriteria.length > 1 || requestsCombinedRanking(normalizedQuestion)) {
     return 'combined_ranking';
   }
   const criterion = matchingCriteria[0];
@@ -165,4 +197,83 @@ export function selectActiveNamedEvidenceTools(
   normalizedQuestion: string,
 ): readonly NamedEvidenceToolName[] {
   return ACTIVE_TOOL_NAMES_BY_QUERY_CLASS[classifyOracleAgentQuestion(normalizedQuestion)];
+}
+
+/**
+ * Selects the single release-bound inquiry that is already semantically complete
+ * for a graded property-intelligence question. The bounded page keeps the
+ * evidence context small enough for one synthesis request; defaults remain
+ * owned by the frozen inquiry contracts rather than duplicated in the agent.
+ */
+export function selectDeterministicInquiryEvidenceRoute(
+  normalizedQuestion: string,
+  releaseId: string,
+  limit: number,
+): DeterministicInquiryEvidenceRoute | null {
+  const queryClass = classifyOracleAgentQuestion(normalizedQuestion);
+  if (!(queryClass in DETERMINISTIC_INQUIRY_TOOL_BY_QUERY_CLASS)) return null;
+  const deterministicClass = queryClass as DeterministicInquiryQueryClass;
+  const roofYears = /\broof(?:s|ing)?\b[^.?!]{0,100}?\b(\d{1,3})\s*years?\b/iu.exec(
+    normalizedQuestion,
+  )?.[1];
+  const ownershipYears =
+    /\b(?:ownership|owner|owned|exchange(?:d)?)\b[^.?!]{0,120}?\b(\d{1,3})\s*years?\b/iu.exec(
+      normalizedQuestion,
+    )?.[1];
+  if (deterministicClass === 'roof_age' && roofYears === undefined) return null;
+  if (deterministicClass === 'ownership_age' && ownershipYears === undefined) return null;
+  const requestedCriteria = matchingCriterionClasses(normalizedQuestion);
+  const callClasses: readonly DeterministicInquiryQueryClass[] =
+    deterministicClass === 'combined_ranking' &&
+    requestedCriteria.length === 2 &&
+    !requestsCombinedRanking(normalizedQuestion)
+      ? requestedCriteria
+      : [deterministicClass];
+  if (
+    deterministicClass === 'combined_ranking' &&
+    requestedCriteria.length > 2 &&
+    !requestsCombinedRanking(normalizedQuestion)
+  ) {
+    return null;
+  }
+  const thresholdInputByClass: Readonly<
+    Partial<Record<DeterministicInquiryQueryClass, Readonly<Record<string, number>>>>
+  > = Object.freeze({
+    ...(roofYears === undefined
+      ? {}
+      : {
+          roof_age: Object.freeze({
+            minimumAgeYears: Number(roofYears),
+          }),
+        }),
+    ...(ownershipYears === undefined
+      ? {}
+      : {
+          ownership_age: Object.freeze({
+            minimumTenureYears: Number(ownershipYears),
+          }),
+        }),
+  });
+  return Object.freeze({
+    queryClass: deterministicClass,
+    primaryCall: Object.freeze({
+      toolName: DETERMINISTIC_INQUIRY_TOOL_BY_QUERY_CLASS[callClasses[0] ?? deterministicClass],
+      input: Object.freeze({
+        releaseId,
+        limit,
+        ...(thresholdInputByClass[callClasses[0] ?? deterministicClass] ?? {}),
+      }),
+    }),
+    candidateFilters: Object.freeze(
+      callClasses.slice(1).map((callClass) =>
+        Object.freeze({
+          toolName: DETERMINISTIC_INQUIRY_TOOL_BY_QUERY_CLASS[callClass],
+          input: Object.freeze({
+            releaseId,
+            ...(thresholdInputByClass[callClass] ?? {}),
+          }),
+        }),
+      ),
+    ),
+  });
 }

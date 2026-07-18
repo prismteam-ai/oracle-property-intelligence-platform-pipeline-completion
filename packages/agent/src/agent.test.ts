@@ -121,6 +121,23 @@ function executor(
   return { execute: vi.fn(() => Promise.resolve(result)) };
 }
 
+function structuredSingleInquiryAnswer(evidenceId = EVIDENCE_ID): string {
+  return JSON.stringify({
+    outcome: 'matches',
+    scope: {
+      kind: 'bounded_inquiry_page',
+      sourceTruncated: false,
+      countyExhaustive: false,
+    },
+    claims: [
+      {
+        propertyId: 'property-1',
+        predicates: [{ toolName: 'find_roof_age_candidates', evidenceIds: [evidenceId] }],
+      },
+    ],
+  });
+}
+
 function timeoutModel(onGenerate: () => void): LanguageModel {
   return {
     specificationVersion: 'v3',
@@ -152,9 +169,7 @@ describe('Oracle named-tool agent', () => {
     const providerCalls = vi.fn();
     const evidence = executor(envelope('supported'));
     const agent = createOracleEvidenceAgent({
-      gateway: gateway(
-        scriptedModel([TOOL, `Property 1 qualifies [evidence:${EVIDENCE_ID}].`], providerCalls),
-      ),
+      gateway: gateway(scriptedModel([structuredSingleInquiryAnswer()], providerCalls)),
       semanticPolicy: policy,
       executor: evidence,
     });
@@ -165,7 +180,9 @@ describe('Oracle named-tool agent', () => {
       expect.any(Object),
     );
     expect(answer.citedEvidenceIds).toEqual([EVIDENCE_ID]);
-    expect(providerCalls).toHaveBeenCalledTimes(2);
+    expect(answer.toolCalls).toBe(1);
+    expect(answer.trace).toMatchObject([{ toolName: 'find_roof_age_candidates' }]);
+    expect(providerCalls).toHaveBeenCalledTimes(1);
   });
 
   it('rejects omitted and fabricated citations', async () => {
@@ -244,10 +261,149 @@ describe('Oracle named-tool agent', () => {
 
   it('keeps the provider step inside the request and infrastructure timeout boundaries', () => {
     expect(ORACLE_AGENT_LIMITS.maximumProviderRetries).toBe(0);
+    expect(ORACLE_AGENT_LIMITS.maximumOutputTokens).toBe(768);
+    expect(ORACLE_AGENT_LIMITS.maximumSynthesisSteps).toBe(1);
+    expect(ORACLE_AGENT_LIMITS.maximumSynthesisRows).toBe(5);
+    expect(ORACLE_AGENT_LIMITS.maximumSynthesisEvidenceBytes).toBe(48 * 1024);
+    expect(ORACLE_AGENT_LIMITS.maximumSynthesisPromptBytes).toBe(64 * 1024);
     expect(ORACLE_AGENT_LIMITS.stepTimeoutMs).toBe(20_000);
     expect(ORACLE_AGENT_LIMITS.stepTimeoutMs).toBeLessThan(ORACLE_AGENT_LIMITS.totalTimeoutMs);
     expect(ORACLE_AGENT_LIMITS.totalTimeoutMs).toBe(24_000);
     expect(ORACLE_AGENT_LIMITS.totalTimeoutMs).toBeLessThan(25_000);
+  });
+
+  it('rejects an oversized total synthesis prompt before the provider request', async () => {
+    const providerCalls = vi.fn();
+    const largeEvidence = {
+      ...envelope('supported'),
+      data: {
+        properties: [{ propertyId: 'property-1', note: 'x'.repeat(43 * 1024) }],
+      },
+    } satisfies NamedEvidenceEnvelope;
+    expect(Buffer.byteLength(JSON.stringify(largeEvidence), 'utf8')).toBeLessThan(
+      ORACLE_AGENT_LIMITS.maximumSynthesisEvidenceBytes,
+    );
+    const agent = createOracleEvidenceAgent({
+      gateway: gateway(scriptedModel([], providerCalls)),
+      semanticPolicy: policy,
+      executor: executor(largeEvidence),
+    });
+    const question = `Which roofs are older than 15 years? ${'界'.repeat(7_000)}`;
+    expect(question.length).toBeLessThan(ORACLE_AGENT_LIMITS.maximumPromptCharacters);
+
+    const error = await agent.ask(question, RELEASE).catch((cause: unknown) => cause);
+    expect(error).toBeInstanceOf(OracleAgentError);
+    expect((error as OracleAgentError).message).toBe(
+      'Named evidence dependency failed; model-authored answers are disabled',
+    );
+    expect((error as OracleAgentError).cause).toMatchObject({
+      message: 'Total synthesis prompt exceeds its bounded byte limit',
+    });
+    expect(providerCalls).not.toHaveBeenCalled();
+  });
+
+  it('fails named-evidence prefetch before synthesis with zero provider requests', async () => {
+    const providerCalls = vi.fn();
+    const evidence: NamedEvidenceExecutor = {
+      execute: vi.fn(() => Promise.reject(new Error('query unavailable'))),
+    };
+    const agent = createOracleEvidenceAgent({
+      gateway: gateway(scriptedModel([], providerCalls)),
+      semanticPolicy: policy,
+      executor: evidence,
+    });
+
+    await expect(agent.ask('Which roofs are older than 15 years?', RELEASE)).rejects.toThrow(
+      'Named evidence dependency failed; model-authored answers are disabled',
+    );
+    expect(evidence.execute).toHaveBeenCalledTimes(1);
+    expect(providerCalls).not.toHaveBeenCalled();
+  });
+
+  it('aborts sibling property predicates when one fails before synthesis', async () => {
+    const providerCalls = vi.fn();
+    const signals: AbortSignal[] = [];
+    const primary = {
+      ...envelope('supported'),
+      data: { properties: [{ propertyId: 'property-1' }, { propertyId: 'property-2' }] },
+      evidence: [
+        ...envelope('supported').evidence,
+        {
+          evidenceId:
+            `sc:evidence:${'b'.repeat(64)}` as NamedEvidenceEnvelope['evidence'][number]['evidenceId'],
+          propertyId: 'property-2',
+          supportState: 'supported' as const,
+          sourceIds: ['source-2'],
+          limitations: [],
+        },
+      ],
+    } satisfies NamedEvidenceEnvelope;
+    const conjunctionExecute: NamedEvidenceExecutor['execute'] = (name, input, options) => {
+      if (options.signal !== undefined) signals.push(options.signal);
+      if (name === 'find_roof_age_candidates') return Promise.resolve(primary);
+      if (name === 'find_ownership_age_candidates' && input.propertyId === 'property-1') {
+        return Promise.reject(new Error('ownership query unavailable'));
+      }
+      return new Promise((_resolve, reject) => {
+        const rejectFromAbort = (): void => reject(new Error('sibling prefetch aborted'));
+        if (options.signal?.aborted === true) rejectFromAbort();
+        else options.signal?.addEventListener('abort', rejectFromAbort, { once: true });
+      });
+    };
+    const evidence: NamedEvidenceExecutor = {
+      execute: vi.fn(conjunctionExecute),
+    };
+    const agent = createOracleEvidenceAgent({
+      gateway: gateway(scriptedModel([], providerCalls)),
+      semanticPolicy: policy,
+      executor: evidence,
+    });
+
+    await expect(
+      agent.ask(
+        'Which properties have roofs older than 15 years and have not exchanged ownership in more than 10 years?',
+        RELEASE,
+      ),
+    ).rejects.toThrow('Named evidence dependency failed; model-authored answers are disabled');
+    expect(evidence.execute).toHaveBeenCalledTimes(3);
+    expect(signals).toHaveLength(3);
+    expect(new Set(signals).size).toBe(1);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(providerCalls).not.toHaveBeenCalled();
+  });
+
+  it('times out a non-cooperative prefetch and never reaches the provider', async () => {
+    vi.useFakeTimers();
+    try {
+      const providerCalls = vi.fn();
+      const hangingExecute: NamedEvidenceExecutor['execute'] = () =>
+        new Promise(() => {
+          // Deliberately ignores AbortSignal; the agent must enforce its own total timer.
+        });
+      const evidence: NamedEvidenceExecutor = {
+        execute: vi.fn(hangingExecute),
+      };
+      const agent = createOracleEvidenceAgent({
+        gateway: gateway(scriptedModel([], providerCalls)),
+        semanticPolicy: policy,
+        executor: evidence,
+      });
+      const rejection = agent
+        .ask('Which roofs are older than 15 years?', RELEASE)
+        .catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(ORACLE_AGENT_LIMITS.totalTimeoutMs - 1);
+      expect(providerCalls).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(2);
+      const error = await rejection;
+      expect(error).toBeInstanceOf(OracleAgentError);
+      expect((error as OracleAgentError).message).toBe(
+        'Named evidence dependency failed; model-authored answers are disabled',
+      );
+      expect(providerCalls).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('propagates the bounded step timeout after one provider request without fallback', async () => {
@@ -259,7 +415,9 @@ describe('Oracle named-tool agent', () => {
         semanticPolicy: policy,
         executor: executor(envelope('supported')),
       });
-      const rejection = timed.ask('Find candidates.', RELEASE).catch((error: unknown) => error);
+      const rejection = timed
+        .ask('Which roofs are older than 15 years?', RELEASE)
+        .catch((error: unknown) => error);
       await vi.advanceTimersByTimeAsync(ORACLE_AGENT_LIMITS.stepTimeoutMs - 1);
       expect(providerCalls).toHaveBeenCalledTimes(1);
       await vi.advanceTimersByTimeAsync(2);

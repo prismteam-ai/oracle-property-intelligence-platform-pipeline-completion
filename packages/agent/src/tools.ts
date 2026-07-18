@@ -108,7 +108,10 @@ function assertSafePayload(value: unknown, path = '$'): void {
   }
 }
 
-export function createNamedEvidenceTools(executor: NamedEvidenceExecutor): NamedEvidenceTools {
+export function createNamedEvidenceTools(
+  executor: NamedEvidenceExecutor,
+  validateRawResult?: (raw: unknown) => void,
+): NamedEvidenceTools {
   return Object.fromEntries(
     NAMED_EVIDENCE_TOOL_NAMES.map((name) => {
       const inputSchema = namedEvidenceInputSchemas[name];
@@ -119,6 +122,7 @@ export function createNamedEvidenceTools(executor: NamedEvidenceExecutor): Named
         execute: async (input, options) => {
           const ledger = invocationLedger(options.experimental_context);
           ledger.calls += 1;
+          const callIndex = ledger.calls;
           if (ledger.calls > 6) {
             ledger.failures += 1;
             throw new RangeError('Named evidence tool-call budget exceeded');
@@ -133,6 +137,7 @@ export function createNamedEvidenceTools(executor: NamedEvidenceExecutor): Named
               ...(options.abortSignal === undefined ? {} : { signal: options.abortSignal }),
             });
             assertSafePayload(raw);
+            validateRawResult?.(raw);
           } catch (error) {
             ledger.failures += 1;
             throw error;
@@ -147,7 +152,7 @@ export function createNamedEvidenceTools(executor: NamedEvidenceExecutor): Named
           }
           ledger.trace.push(
             Object.freeze({
-              callIndex: ledger.calls,
+              callIndex,
               toolName: name,
               releaseId: ledger.releaseId,
               evidenceIds: Object.freeze(
