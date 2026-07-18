@@ -10,6 +10,7 @@ import {
   type NamedToolTraceRecord,
 } from './tools.js';
 import type { NamedEvidenceExecutor } from './contracts.js';
+import { selectActiveNamedEvidenceTools } from './routing.js';
 
 const callOptionsSchema = z.strictObject({
   releaseId: z.string().trim().min(1).max(256),
@@ -25,6 +26,8 @@ export const ORACLE_AGENT_LIMITS = Object.freeze({
   totalTimeoutMs: 25_000,
   stepTimeoutMs: 10_000,
   maximumPromptCharacters: 8_000,
+  maximumActiveTools: 5,
+  maximumActiveOptionalParameters: 24,
 });
 
 export type AgentTelemetryEvent = Readonly<{
@@ -144,7 +147,14 @@ export function createOracleEvidenceAgent(
       if (ledger?.releaseId !== options.releaseId) {
         throw new OracleAgentError('Agent invocation ledger is missing or release-mismatched');
       }
-      return { ...call, experimental_context: { ledger } };
+      if (typeof call.prompt !== 'string') {
+        throw new OracleAgentError('Agent invocation is missing its normalized question');
+      }
+      const activeTools = selectActiveNamedEvidenceTools(call.prompt);
+      if (activeTools.length === 0 || activeTools.length > ORACLE_AGENT_LIMITS.maximumActiveTools) {
+        throw new OracleAgentError('Agent active-tool selection is empty or exceeds its bound');
+      }
+      return { ...call, activeTools: [...activeTools], experimental_context: { ledger } };
     },
   });
 
@@ -157,7 +167,7 @@ export function createOracleEvidenceAgent(
     }),
     tools,
     ask: async (question, releaseId, signal) => {
-      const normalizedQuestion = question.trim();
+      const normalizedQuestion = question.normalize('NFKC').trim();
       if (
         normalizedQuestion.length === 0 ||
         normalizedQuestion.length > ORACLE_AGENT_LIMITS.maximumPromptCharacters

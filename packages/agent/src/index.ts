@@ -19,6 +19,13 @@ export type { EvidenceCapability, SemanticPolicy, SemanticPolicyInput } from './
 export { createNamedEvidenceTools } from './tools.js';
 export type { InvocationLedger, NamedEvidenceTools, NamedToolTraceRecord } from './tools.js';
 export {
+  ACTIVE_TOOL_NAMES_BY_QUERY_CLASS,
+  ORACLE_AGENT_QUERY_CLASSES,
+  classifyOracleAgentQuestion,
+  selectActiveNamedEvidenceTools,
+} from './routing.js';
+export type { OracleAgentQueryClass } from './routing.js';
+export {
   ORACLE_AGENT_SERVING_ADAPTER_VERSION,
   ORACLE_AGENT_SERVING_LIMITS,
   ORACLE_AGENT_SERVING_SCHEMA_VERSION,
