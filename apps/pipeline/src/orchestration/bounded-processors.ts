@@ -305,16 +305,25 @@ async function processBoundedCounty(
       options.resourceIdentity,
     );
     try {
-      await verifyRootedMutationSequences(request, sharedBudget, options.budget.maxBufferedBytes);
-      const exactMutationLogicalSha256 = await computeExactMutationLogicalSha256(request);
       const trustedAcquisition = await materializeTrustedAcquisition(
         request,
         sharedBudget,
         options.budget.maxBufferedBytes,
       );
       assertReleaseableSourceInventory(request.sources, trustedAcquisition.manifest);
-      const processing = createProcessingInput(
+      const releaseContentRequest = withoutFailedLaneMutations(
         request,
+        trustedAcquisition.manifest,
+      );
+      await verifyRootedMutationSequences(
+        releaseContentRequest,
+        sharedBudget,
+        options.budget.maxBufferedBytes,
+      );
+      const exactMutationLogicalSha256 =
+        await computeExactMutationLogicalSha256(releaseContentRequest);
+      const processing = createProcessingInput(
+        releaseContentRequest,
         options,
         exactMutationLogicalSha256,
         trustedAcquisition.manifest.manifestSha256,
@@ -326,7 +335,7 @@ async function processBoundedCounty(
       try {
         await initializeDatabase(connection);
         await bindGeneration(connection, processing, runLease.token);
-        await ingestMutations(connection, request, processing);
+        await ingestMutations(connection, releaseContentRequest, processing);
         await materializeAllMutationPartitions(
           request,
           connection,
@@ -546,15 +555,6 @@ function assertReleaseableSourceInventory(
   trusted: BoundedTrustedAcquisitionManifest,
 ): void {
   const runStatus = sourceInventoryRunStatus(sources);
-  if (runStatus === 'failed') {
-    const failed = sources
-      .filter(({ terminalState }) => terminalState === 'failed')
-      .map(({ sourceId }) => sourceId)
-      .sort(compareUtf8);
-    throw new BoundedPipelineIntegrityError(
-      `Serving release rejects failed source inventory: ${failed.join(',')}`,
-    );
-  }
   if (runStatus !== trusted.runStatus) {
     throw new BoundedPipelineIntegrityError(
       `Serving runStatus differs from the complete source-state inventory`,
@@ -578,6 +578,24 @@ function assertReleaseableSourceInventory(
       `Trusted acquisition omits complete source state: ${unbound.join(',')}`,
     );
   }
+}
+
+function withoutFailedLaneMutations(
+  request: BoundedCountyProcessingRequest,
+  trusted: BoundedTrustedAcquisitionManifest,
+): BoundedCountyProcessingRequest {
+  const failedSourceIds = new Set(
+    trusted.sources
+      .filter(({ terminalState }) => terminalState === 'failed')
+      .map(({ sourceId }) => sourceId),
+  );
+  if (failedSourceIds.size === 0) return request;
+  return Object.freeze({
+    ...request,
+    mutationSources: Object.freeze(
+      request.mutationSources.filter(({ sourceId }) => !failedSourceIds.has(sourceId)),
+    ),
+  });
 }
 
 async function openDuckDatabase(
@@ -3479,14 +3497,43 @@ function countyFeatureBundle(
     if (transit !== null) actual.set('transit_walkability', transit);
     if (starbucks !== null) actual.set('starbucks_walkability', starbucks);
   }
+  const exactCapabilityStates = new Map<string, string>(
+    capabilityStates(sources).map(({ capability, state }): [string, string] => [capability, state]),
+  );
+  const dependencyUnavailableFeatures = new Set<CountyFeatureKind>();
+  for (const feature of FEATURE_KINDS) {
+    const dependencyUnavailable = FEATURE_CAPABILITIES[feature].some((capability) => {
+      const state = exactCapabilityStates.get(capability);
+      return state === 'failed' || state === 'blocked';
+    });
+    if (dependencyUnavailable) {
+      dependencyUnavailableFeatures.add(feature);
+      actual.delete(feature);
+    }
+  }
   for (const feature of FEATURE_KINDS) {
     if (actual.has(feature)) continue;
-    actual.set(feature, unavailableFeatureEvidence(work, feature, sources, 'restricted'));
+    actual.set(
+      feature,
+      unavailableFeatureEvidence(
+        work,
+        feature,
+        sources,
+        'restricted',
+        dependencyUnavailableFeatures.has(feature),
+      ),
+    );
   }
   const publicEvidence = FEATURE_KINDS.map((feature) => {
     const evidence = requiredFeature(actual, feature);
     if (evidence.visibility === 'public') return evidence;
-    return unavailableFeatureEvidence(work, feature, sources, 'public');
+    return unavailableFeatureEvidence(
+      work,
+      feature,
+      sources,
+      'public',
+      dependencyUnavailableFeatures.has(feature),
+    );
   });
   const restrictedEvidence = FEATURE_KINDS.map((feature) =>
     projectFeatureEvidence(requiredFeature(actual, feature), 'restricted'),
@@ -3513,6 +3560,7 @@ function unavailableFeatureEvidence(
   feature: CountyFeatureKind,
   sources: readonly SourceExecutionManifest[],
   projection: ServingVisibility,
+  mandatoryDependencyUnavailable = false,
 ): CountyFeatureEvidence {
   const capabilities = new Set(FEATURE_CAPABILITIES[feature]);
   const related = sources.filter(({ capability }) => capabilities.has(capability));
@@ -3524,7 +3572,8 @@ function unavailableFeatureEvidence(
       : related;
   const allBlocked =
     related.length > 0 && related.every(({ terminalState }) => terminalState === 'blocked');
-  const supportClass = allBlocked ? ('unsupported' as const) : ('unknown' as const);
+  const supportClass =
+    allBlocked && !mandatoryDependencyUnavailable ? ('unsupported' as const) : ('unknown' as const);
   const coverageState = allBlocked
     ? ('blocked' as const)
     : related.length === 0
@@ -3751,7 +3800,10 @@ async function buildMarts(
     bundleAppender.closeSync();
   }
 
-  const allLineage = servingLineage(sources, trustedAcquisition.manifest);
+  const allLineage = servingLineage(
+    sources.filter(({ terminalState }) => terminalState !== 'failed'),
+    trustedAcquisition.manifest,
+  );
   if (allLineage.length === 0)
     throw new BoundedPipelineIntegrityError('Serving release requires source lineage');
   const inputRoot = join(root, 'mart-input');
@@ -4316,7 +4368,10 @@ async function* martRows(
             ({ sourceId }) =>
               trustedSourceIds.has(sourceId) && publicSourceIds(sources).has(sourceId),
           )
-        : sources.filter(({ sourceId }) => trustedSourceIds.has(sourceId));
+        : sources.filter(
+            ({ sourceId, terminalState }) =>
+              terminalState !== 'failed' && trustedSourceIds.has(sourceId),
+          );
     for (const source of [...eligibleSources].sort((a, b) =>
       compareUtf8(`${a.sourceId}\0${a.scope}`, `${b.sourceId}\0${b.scope}`),
     )) {
@@ -4448,9 +4503,7 @@ async function* martRows(
     sharedBudget,
     Object.freeze({
       run_id: processing.runId,
-      status: sources.every(({ terminalState }) => terminalState === 'complete')
-        ? 'succeeded'
-        : 'partial',
+      status: sourceInventoryRunStatus(sources),
       started_at: processing.requestedAt,
       completed_at: processing.release.generatedAt,
       pipeline_version: processing.pipelineVersion,
@@ -4948,7 +5001,10 @@ function publicSourceIds(sources: readonly SourceExecutionManifest[]): ReadonlyS
   return new Set(
     sources
       .filter(
-        ({ license }) => license.redistribution === 'approved' && !license.containsPersonalData,
+        ({ license, terminalState }) =>
+          terminalState !== 'failed' &&
+          license.redistribution === 'approved' &&
+          !license.containsPersonalData,
       )
       .map(({ sourceId }) => sourceId),
   );
@@ -4961,7 +5017,10 @@ function visibilitySourceIds(
   const allowed = visibility === 'public' ? publicSourceIds(sources) : null;
   return exactSourceIds(
     sources
-      .filter(({ sourceId }) => allowed === null || allowed.has(sourceId))
+      .filter(
+        ({ sourceId, terminalState }) =>
+          terminalState !== 'failed' && (allowed === null || allowed.has(sourceId)),
+      )
       .map(({ sourceId }) => sourceId),
   );
 }

@@ -58,6 +58,7 @@ const BLOCKED_SOURCE_ID = sourceIdSchema.parse('sc:source:test-blocked-source');
 const BLOCKED_SNAPSHOT_ID = snapshotIdSchema.parse(
   `sc:snapshot:test-blocked-source:${'4'.repeat(64)}`,
 );
+const FAILED_APN = '999-99-999';
 
 describe('bounded_streaming_v2 pipeline composition', () => {
   it('freezes Unicode, whitespace, locale, and address-number index normalization', () => {
@@ -85,6 +86,25 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       }),
     );
     const sequence = chunkSequence(mutations);
+    const failedMutations = normalizePropertyRecord(
+      {
+        apn: FAILED_APN,
+        jurisdiction: 'Santa Clara',
+        address: null,
+        unit: null,
+        parcelGeometry: null,
+        landAreaSquareMeters: null,
+      },
+      testContext({
+        sourceId: FAILED_SOURCE_ID,
+        snapshotId: FAILED_SNAPSHOT_ID,
+        artifactId: acquiredArtifactId(FAILED_SOURCE_ID, FAILED_SNAPSHOT_ID),
+        runId: RUN_ID,
+      }),
+    );
+    const failedSequence = chunkSequence(failedMutations);
+    expect(failedSequence.recordCount).toBeGreaterThan(0);
+    expect(failedSequence.recordCount).toBe(failedMutations.length);
     const artifactStore = new LocalArtifactStore({
       rootDirectory: join(root, 'artifacts'),
       now: () => NOW,
@@ -92,18 +112,25 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     const checkpointStore = new LocalCheckpointStore({ rootDirectory: join(root, 'checkpoints') });
     const source = sourceManifest(mutations.length);
     const failedSource = Object.freeze({
-      ...sourceManifestFor(FAILED_SOURCE_ID, FAILED_SNAPSHOT_ID, 'county_clerk_transfers', 0),
+      ...sourceManifestFor(
+        FAILED_SOURCE_ID,
+        FAILED_SNAPSHOT_ID,
+        'ca_sos_businesses',
+        failedMutations.length,
+      ),
       supportState: 'blocked' as const,
       terminalState: 'failed' as const,
       coverage: Object.freeze({
         expectedRecords: 1,
-        observedRecords: 0,
-        acceptedRecords: 0,
+        observedRecords: failedMutations.length,
+        acceptedRecords: failedMutations.length,
         quarantinedRecords: 0,
         denominatorMethod: 'configured' as const,
-        ratio: 0,
+        ratio: 1,
       }),
-      limitations: Object.freeze(['Fixture transfer source failed before acquisition.']),
+      limitations: Object.freeze([
+        'Fixture source failed after normalization; its mutation lane must be omitted from release content.',
+      ]),
       errorCodes: Object.freeze(['FIXTURE_ACQUISITION_FAILED']),
     }) satisfies SourceExecutionManifest;
     const blockedSource = Object.freeze({
@@ -174,14 +201,21 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       });
     const request: BoundedCountyProcessingRequest = {
       configuration,
-      mutationSources: [{ sourceId: SOURCE_ID, snapshotId: SNAPSHOT_ID, sequence }],
+      mutationSources: [
+        { sourceId: SOURCE_ID, snapshotId: SNAPSHOT_ID, sequence },
+        {
+          sourceId: FAILED_SOURCE_ID,
+          snapshotId: FAILED_SNAPSHOT_ID,
+          sequence: failedSequence,
+        },
+      ],
       acquiredSources: [
         {
           sourceId: SOURCE_ID,
           artifacts: [trustedArtifact],
         },
       ],
-      sources: [source, blockedSource],
+      sources: [source, blockedSource, failedSource],
       existing: { reconcileArtifact: null, featureArtifact: null, martArtifact: null },
       artifactStore,
       checkpointStore,
@@ -198,13 +232,6 @@ describe('bounded_streaming_v2 pipeline composition', () => {
         configuration: incrementalConfiguration,
       }),
     ).rejects.toThrow('incremental processing is fail-closed');
-
-    await expect(
-      createProcessor().processBoundedCounty?.({
-        ...request,
-        sources: [source, blockedSource, failedSource],
-      }),
-    ).rejects.toThrow(FAILED_SOURCE_ID);
 
     const missingArtifact = acquiredArtifactSchema.parse({
       ...trustedArtifact,
@@ -391,15 +418,20 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       runStatus: string;
       releaseScope: string;
       countyCompletionClaim: boolean;
-      sourceStates: readonly Readonly<{ sourceId: string; terminalState: string }>[];
+      sourceStates: readonly Readonly<{
+        sourceId: string;
+        terminalState: string;
+        limitations: readonly string[];
+      }>[];
       capabilities: readonly Readonly<{
         capability: string;
         state: string;
         sourceIds: readonly string[];
+        limitations: readonly string[];
       }>[];
     }>;
     expect(releaseEvidence).toMatchObject({
-      runStatus: 'partial',
+      runStatus: 'failed',
       releaseScope: 'partial_county',
       countyCompletionClaim: false,
     });
@@ -407,11 +439,33 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       releaseEvidence.sourceStates.find(({ sourceId }) => sourceId === BLOCKED_SOURCE_ID),
     ).toMatchObject({ terminalState: 'blocked' });
     expect(
+      releaseEvidence.sourceStates.find(({ sourceId }) => sourceId === FAILED_SOURCE_ID),
+    ).toMatchObject({
+      terminalState: 'failed',
+      limitations: [
+        'Fixture source failed after normalization; its mutation lane must be omitted from release content.',
+      ],
+    });
+    expect(
       releaseEvidence.capabilities.find(({ capability }) => capability === 'ownership_transfers'),
     ).toMatchObject({
       state: 'blocked',
       sourceIds: [BLOCKED_SOURCE_ID],
     });
+    expect(
+      releaseEvidence.capabilities.find(({ capability }) => capability === 'ca_sos_businesses'),
+    ).toMatchObject({
+      state: 'failed',
+      sourceIds: [FAILED_SOURCE_ID],
+      limitations: [
+        'Fixture source failed after normalization; its mutation lane must be omitted from release content.',
+      ],
+    });
+    expect(
+      manifest.artifacts.every(({ sourceLineage }) =>
+        sourceLineage.every(({ sourceId }) => sourceId !== FAILED_SOURCE_ID),
+      ),
+    ).toBe(true);
     const rowCount = (visibility: string, relation: string): number =>
       manifest.artifacts.find(
         (artifact) => artifact.visibility === visibility && artifact.relation === relation,
@@ -432,7 +486,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       join(root, 'output', descriptor.releaseDirectory, publicPipelineRun.relativePath),
     );
     expect(pipelineRows).toHaveLength(1);
-    expect(pipelineRows[0]?.status).toBe('partial');
+    expect(pipelineRows[0]?.status).toBe('failed');
     expect(JSON.parse(String(pipelineRows[0]?.source_ids_json))).toEqual([
       BLOCKED_SOURCE_ID,
       SOURCE_ID,
@@ -451,6 +505,9 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       observed_count: 0n,
       quarantine_count: 0n,
     });
+    expect(
+      sourceCoverageRows.find(({ source_id: sourceId }) => sourceId === FAILED_SOURCE_ID),
+    ).toBeUndefined();
     const publicPropertyQuery = manifest.artifacts.find(
       ({ visibility, relation }) => visibility === 'public' && relation === 'property_query',
     );
@@ -458,7 +515,11 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     const propertyRows = await readParquetRows(
       join(root, 'output', descriptor.releaseDirectory, publicPropertyQuery.relativePath),
     );
+    expect(propertyRows).toHaveLength(1);
+    expect(propertyRows.some(({ parcel_identifier: apn }) => apn === FAILED_APN)).toBe(false);
     expect(JSON.parse(String(propertyRows[0]?.source_ids_json))).toEqual([SOURCE_ID]);
+    expect(['unknown', 'unsupported']).toContain(propertyRows[0]?.ownership_support_class);
+    expect(['unknown', 'unsupported']).toContain(propertyRows[0]?.regional_owner_support_class);
     expect(propertyRows[0]?.last_exchange_date).toBeNull();
     const fieldSources = JSON.parse(
       String(propertyRows[0]?.field_source_ids_json),
@@ -497,6 +558,33 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       fieldSources.find(({ field_name: fieldName }) => fieldName === 'property_id')
         ?.source_references,
     ).toHaveLength(1);
+    for (const visibility of ['public', 'restricted'] as const) {
+      for (const relation of ['property_query', 'property_evidence'] as const) {
+        const artifact = manifest.artifacts.find(
+          (candidate) => candidate.visibility === visibility && candidate.relation === relation,
+        );
+        if (artifact === undefined) throw new Error(`${visibility}/${relation} is missing`);
+        const rows = await readParquetRows(
+          join(root, 'output', descriptor.releaseDirectory, artifact.relativePath),
+        );
+        expect(
+          rows.every((row) => {
+            const sourceIds: unknown = JSON.parse(String(row.source_ids_json));
+            return (
+              Array.isArray(sourceIds) &&
+              sourceIds.every(
+                (sourceId) => typeof sourceId === 'string' && sourceId !== FAILED_SOURCE_ID,
+              )
+            );
+          }),
+          `${visibility}/${relation} failed-lane contributor`,
+        ).toBe(true);
+        if (relation === 'property_query') {
+          expect(rows).toHaveLength(1);
+          expect(rows.some(({ parcel_identifier: apn }) => apn === FAILED_APN)).toBe(false);
+        }
+      }
+    }
     const durable = await checkpointStore.load(`bounded-processing:${RUN_ID}`);
     const checkpoint = durable?.payload as
       | Readonly<{
@@ -637,22 +725,25 @@ describe('bounded_streaming_v2 pipeline composition', () => {
         rssSampleIntervalRecords: 1,
       },
     });
+    const mutationSources = lanes.map(({ sourceId, snapshotId, mutations }) => ({
+      sourceId,
+      snapshotId,
+      sequence: chunkSequence(mutations),
+    }));
+    const acquiredSources = await Promise.all(
+      lanes.map(async ({ sourceId, snapshotId }) => ({
+        sourceId,
+        artifacts: [await acquiredArtifact(artifactStore, sourceId, snapshotId)],
+      })),
+    );
+    const sourceManifests = lanes.map(({ sourceId, snapshotId, capability, mutations }) =>
+      sourceManifestFor(sourceId, snapshotId, capability, mutations.length),
+    );
     const request: BoundedCountyProcessingRequest = {
       configuration,
-      mutationSources: lanes.map(({ sourceId, snapshotId, mutations }) => ({
-        sourceId,
-        snapshotId,
-        sequence: chunkSequence(mutations),
-      })),
-      acquiredSources: await Promise.all(
-        lanes.map(async ({ sourceId, snapshotId }) => ({
-          sourceId,
-          artifacts: [await acquiredArtifact(artifactStore, sourceId, snapshotId)],
-        })),
-      ),
-      sources: lanes.map(({ sourceId, snapshotId, capability, mutations }) =>
-        sourceManifestFor(sourceId, snapshotId, capability, mutations.length),
-      ),
+      mutationSources,
+      acquiredSources,
+      sources: sourceManifests,
       existing: { reconcileArtifact: null, featureArtifact: null, martArtifact: null },
       artifactStore,
       checkpointStore,
@@ -697,6 +788,143 @@ describe('bounded_streaming_v2 pipeline composition', () => {
           true,
         );
       }
+    }
+
+    const unavailableDependencies = [
+      unavailableSourceManifest('noaa-failed', 'noaa_shoreline', 'failed'),
+      unavailableSourceManifest('caltrain-blocked', 'caltrain_gtfs', 'blocked'),
+      unavailableSourceManifest('osm-failed', 'osm_pedestrian_graph', 'failed'),
+    ] as const;
+    const unavailableProcessor = createBoundedPipelineProcessors({
+      outputDirectory: join(root, 'unavailable-output'),
+      scratchDirectory: join(root, 'unavailable-scratch'),
+      partitionCount: 16,
+      budget: {
+        policyVersion: 'bounded-process-budget-v1',
+        maxBufferedRecords: 32,
+        maxBufferedBytes: 1024 * 1024,
+        maxRssBytes: 512 * 1024 * 1024,
+        duckdbMemoryBytes: 64 * 1024 * 1024,
+        runtimeReserveBytes: 128 * 1024 * 1024,
+        maxOpenFiles: 16,
+        maxWorkers: 1,
+        maxRecordsPerOutputChunk: 8,
+        maxBytesPerOutputChunk: 1024 * 1024,
+        rssSampleIntervalRecords: 1,
+      },
+    });
+    const unavailableResult = await unavailableProcessor.processBoundedCounty?.({
+      ...request,
+      sources: [...sourceManifests, ...unavailableDependencies],
+      checkpointStore: new LocalCheckpointStore({
+        rootDirectory: join(root, 'unavailable-checkpoints'),
+      }),
+    });
+    expect(unavailableResult?.countyCompletionClaim).toBe(false);
+    const unavailableFeatureFiles = await filesBelow(join(root, 'unavailable-scratch'), '.ndjson');
+    const unavailableBundles = (
+      await Promise.all(
+        unavailableFeatureFiles
+          .filter((path) => path.includes('features'))
+          .map(async (path) =>
+            (await readFile(path, 'utf8')).trim().split('\n').filter(Boolean).map(parseJsonObject),
+          ),
+      )
+    ).flat();
+    const unavailableEvidence = unavailableBundles.find(
+      (bundle) => bundle.publicEvidence !== undefined,
+    )?.publicEvidence;
+    if (!Array.isArray(unavailableEvidence) || !unavailableEvidence.every(isJsonObject)) {
+      throw new Error('unavailable dependency feature bundle was not materialized');
+    }
+    const unavailableByFeature = new Map(
+      unavailableEvidence.map((row) => [row.feature, row] as const),
+    );
+    for (const feature of [
+      'water_view_candidate',
+      'transit_walkability',
+      'starbucks_walkability',
+    ] as const) {
+      expect(unavailableByFeature.get(feature)).toMatchObject({
+        supportClass: 'unknown',
+        value: null,
+      });
+    }
+
+    const allBlockedDependencies = [
+      'san_jose_permits',
+      'palo_alto_year_built',
+      'ownership_transfers',
+      'overture_starbucks',
+      'osm_pedestrian_graph',
+      'vta_gtfs',
+      'caltrain_gtfs',
+      'noaa_shoreline',
+      'usgs_hydrography',
+      'usgs_elevation',
+    ].map((capability) =>
+      unavailableSourceManifest(
+        `all-blocked-${capability.replaceAll('_', '-')}`,
+        capability,
+        'blocked',
+      ),
+    );
+    const allBlockedProcessor = createBoundedPipelineProcessors({
+      outputDirectory: join(root, 'all-blocked-output'),
+      scratchDirectory: join(root, 'all-blocked-scratch'),
+      partitionCount: 16,
+      budget: {
+        policyVersion: 'bounded-process-budget-v1',
+        maxBufferedRecords: 32,
+        maxBufferedBytes: 1024 * 1024,
+        maxRssBytes: 512 * 1024 * 1024,
+        duckdbMemoryBytes: 64 * 1024 * 1024,
+        runtimeReserveBytes: 128 * 1024 * 1024,
+        maxOpenFiles: 16,
+        maxWorkers: 1,
+        maxRecordsPerOutputChunk: 8,
+        maxBytesPerOutputChunk: 1024 * 1024,
+        rssSampleIntervalRecords: 1,
+      },
+    });
+    const parcelMutationSource = mutationSources[0];
+    const parcelAcquiredSource = acquiredSources[0];
+    const parcelManifest = sourceManifests[0];
+    if (
+      parcelMutationSource === undefined ||
+      parcelAcquiredSource === undefined ||
+      parcelManifest === undefined
+    ) {
+      throw new Error('parcel fixture lane is missing');
+    }
+    await allBlockedProcessor.processBoundedCounty?.({
+      ...request,
+      mutationSources: [parcelMutationSource],
+      acquiredSources: [parcelAcquiredSource],
+      sources: [parcelManifest, ...allBlockedDependencies],
+      checkpointStore: new LocalCheckpointStore({
+        rootDirectory: join(root, 'all-blocked-checkpoints'),
+      }),
+    });
+    const allBlockedFeatureFiles = await filesBelow(join(root, 'all-blocked-scratch'), '.ndjson');
+    const allBlockedBundles = (
+      await Promise.all(
+        allBlockedFeatureFiles
+          .filter((path) => path.includes('features'))
+          .map(async (path) =>
+            (await readFile(path, 'utf8')).trim().split('\n').filter(Boolean).map(parseJsonObject),
+          ),
+      )
+    ).flat();
+    const allBlockedEvidence = allBlockedBundles.find(
+      (bundle) => bundle.publicEvidence !== undefined,
+    )?.publicEvidence;
+    if (!Array.isArray(allBlockedEvidence) || !allBlockedEvidence.every(isJsonObject)) {
+      throw new Error('all-blocked feature bundle was not materialized');
+    }
+    expect(allBlockedEvidence).toHaveLength(6);
+    for (const row of allBlockedEvidence) {
+      expect(row).toMatchObject({ supportClass: 'unknown', value: null });
     }
   }, 120_000);
 });
@@ -936,4 +1164,30 @@ function sourceManifestFor(
     errorCodes: Object.freeze([]),
     summary: null,
   } satisfies SourceExecutionManifest);
+}
+
+function unavailableSourceManifest(
+  suffix: string,
+  capability: SourceExecutionManifest['capability'],
+  terminalState: 'failed' | 'blocked',
+): SourceExecutionManifest {
+  const sourceId = sourceIdSchema.parse(`sc:source:test-${suffix}`);
+  const snapshotId = snapshotIdSchema.parse(
+    `sc:snapshot:test-${suffix}:${createHash('sha256').update(suffix).digest('hex')}`,
+  );
+  return Object.freeze({
+    ...sourceManifestFor(sourceId, snapshotId, capability, 0),
+    supportState: 'blocked' as const,
+    terminalState,
+    coverage: Object.freeze({
+      expectedRecords: 1,
+      observedRecords: 0,
+      acceptedRecords: 0,
+      quarantinedRecords: 0,
+      denominatorMethod: 'configured' as const,
+      ratio: 0,
+    }),
+    limitations: Object.freeze([`Fixture ${capability} dependency is ${terminalState}.`]),
+    errorCodes: Object.freeze([`FIXTURE_DEPENDENCY_${terminalState.toUpperCase()}`]),
+  }) satisfies SourceExecutionManifest;
 }

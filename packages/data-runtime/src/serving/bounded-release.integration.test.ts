@@ -604,14 +604,46 @@ describe('bounded serving release v2', () => {
     });
   });
 
-  it('rejects a trusted failed run for pilot, partial, and full scopes before finalization', async () => {
-    const processing = processingWithTrustedRunStatus('failed');
-    const controls = releaseControls(processing);
+  it('omits a failed lane from partial-county content while preserving terminal evidence', async () => {
+    const processing = processingWithTrustedRunStatus('failed', 'ownership_transfers');
+    const controls = releaseControlsOmittingFailedLineage(processing);
     const finalizer = controls.finalization.coordinator;
     if (!(finalizer instanceof TestFinalizer)) throw new Error('fixture finalizer');
     const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-serving-failed-run-'));
-    const relations = await relationInputs(root, processing);
-    for (const requestedScope of ['pilot', 'partial_county', 'full_county'] as const) {
+    const ownershipDowngraded = await downgradePropertyQueryClaim(
+      await relationInputs(root, processing, false, true),
+      'ownership',
+    );
+    const relations = await downgradePropertyQueryClaim(ownershipDowngraded, 'regional_owner');
+    const release = await buildBoundedServingRelease({
+      processing,
+      relations,
+      ...controls,
+      outputDirectory: join(root, 'partial-release'),
+      scratchDirectory: join(root, 'partial-scratch'),
+      writeBatchRecords: 1,
+      maximumLineBytes: 64 * 1024,
+    });
+    const failedSource = release.evidence.sourceStates.find(
+      ({ terminalState }) => terminalState === 'failed',
+    );
+    expect(release.evidence).toMatchObject({
+      runStatus: 'failed',
+      releaseScope: 'partial_county',
+      countyCompletionClaim: false,
+    });
+    expect(failedSource?.limitations.length).toBeGreaterThan(0);
+    expect(
+      release.evidence.capabilities.find(({ capability }) => capability === 'ownership_transfers'),
+    ).toMatchObject({ state: 'failed', sourceIds: [failedSource?.sourceId] });
+    expect(
+      release.manifest.artifacts.every(({ sourceLineage }) =>
+        sourceLineage.every(({ sourceId }) => sourceId !== failedSource?.sourceId),
+      ),
+    ).toBe(true);
+    await expect(verifyBoundedServingRelease(release.outputDirectory)).resolves.toBeDefined();
+
+    for (const requestedScope of ['pilot', 'full_county'] as const) {
       await expect(
         buildBoundedServingRelease({
           processing,
@@ -625,7 +657,262 @@ describe('bounded serving release v2', () => {
         }),
       ).rejects.toBeInstanceOf(BoundedReleaseGateError);
     }
-    expect(finalizer.finalizeCalls).toBe(0);
+    expect(finalizer.finalizeCalls).toBe(1);
+  }, 120_000);
+
+  it('rejects failed lineage leaks and failed-capability claim upgrades', async () => {
+    const processing = processingWithTrustedRunStatus('failed', 'ownership_transfers');
+    const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-serving-failed-leak-'));
+    const ownershipDowngraded = await downgradePropertyQueryClaim(
+      await relationInputs(root, processing, false, true),
+      'ownership',
+    );
+    const downgraded = await downgradePropertyQueryClaim(ownershipDowngraded, 'regional_owner');
+    await expect(
+      buildBoundedServingRelease({
+        processing,
+        relations: downgraded,
+        ...releaseControls(processing),
+        outputDirectory: join(root, 'lineage-leak-release'),
+        scratchDirectory: join(root, 'lineage-leak-scratch'),
+        writeBatchRecords: 1,
+        maximumLineBytes: 64 * 1024,
+      }),
+    ).rejects.toBeInstanceOf(BoundedReleaseMetadataError);
+
+    const regionalSiblingUpgrade = await mutateRelationRow(
+      ownershipDowngraded,
+      'public',
+      'property_query',
+      (row) => {
+        row.regional_owner_support_class = 'supported';
+        rebindPropertyQueryFieldLineage(row, 'regional_owner_support_class');
+      },
+    );
+    await expect(
+      buildBoundedServingRelease({
+        processing,
+        relations: regionalSiblingUpgrade,
+        ...releaseControlsOmittingFailedLineage(processing),
+        outputDirectory: join(root, 'regional-claim-upgrade-release'),
+        scratchDirectory: join(root, 'regional-claim-upgrade-scratch'),
+        writeBatchRecords: 1,
+        maximumLineBytes: 64 * 1024,
+      }),
+    ).rejects.toThrow('regional_owner_support_class has a failed or blocked mandatory capability');
+
+    const roofProcessing = processingWithTrustedRunStatus('failed', 'san_jose_permits');
+    const roofControls = releaseControlsOmittingFailedLineage(roofProcessing);
+    expect(
+      roofControls.releaseGate.capabilities.find(
+        ({ capability }) => capability === 'palo_alto_year_built',
+      ),
+    ).toMatchObject({ state: 'succeeded' });
+    const roofRelations = await mutateRelationRow(
+      await relationInputs(join(root, 'roof'), roofProcessing, false, true),
+      'public',
+      'property_query',
+      (row) => {
+        row.roof_support_class = 'proxy';
+        rebindPropertyQueryFieldLineage(row, 'roof_support_class');
+      },
+    );
+    await expect(
+      buildBoundedServingRelease({
+        processing: roofProcessing,
+        relations: roofRelations,
+        ...roofControls,
+        outputDirectory: join(root, 'roof-claim-upgrade-release'),
+        scratchDirectory: join(root, 'roof-claim-upgrade-scratch'),
+        writeBatchRecords: 1,
+        maximumLineBytes: 64 * 1024,
+      }),
+    ).rejects.toThrow('roof_support_class has a failed or blocked mandatory capability');
+  });
+
+  it('rejects water, transit, and Starbucks sibling bypasses for exact failed or blocked dependencies', async () => {
+    const cases = [
+      {
+        prefix: 'water' as const,
+        runStatus: 'failed' as const,
+        unavailableCapability: 'usgs_elevation' as const,
+        succeededSibling: 'usgs_hydrography' as const,
+        affectedClaims: ['water'] as const,
+      },
+      {
+        prefix: 'transit' as const,
+        runStatus: 'failed' as const,
+        unavailableCapability: 'vta_gtfs' as const,
+        succeededSibling: 'caltrain_gtfs' as const,
+        affectedClaims: ['transit'] as const,
+      },
+      {
+        prefix: 'starbucks' as const,
+        runStatus: 'partial' as const,
+        unavailableCapability: 'osm_pedestrian_graph' as const,
+        succeededSibling: 'overture_starbucks' as const,
+        affectedClaims: ['transit', 'starbucks'] as const,
+      },
+    ];
+    const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-serving-exact-dependencies-'));
+    for (const testCase of cases) {
+      const processing = processingWithTrustedRunStatus(
+        testCase.runStatus,
+        testCase.unavailableCapability,
+      );
+      const controls = releaseControlsOmittingFailedLineage(processing);
+      const expectedState = testCase.runStatus === 'failed' ? 'failed' : 'blocked';
+      expect(
+        controls.releaseGate.capabilities.find(
+          ({ capability }) => capability === testCase.unavailableCapability,
+        ),
+      ).toMatchObject({ state: expectedState });
+      expect(
+        controls.releaseGate.capabilities.find(
+          ({ capability }) => capability === testCase.succeededSibling,
+        ),
+      ).toMatchObject({ state: 'succeeded' });
+
+      let downgraded = await relationInputs(
+        join(root, `${testCase.prefix}-relations`),
+        processing,
+        false,
+        true,
+      );
+      for (const affectedClaim of testCase.affectedClaims) {
+        downgraded = await downgradePropertyQueryClaim(downgraded, affectedClaim);
+      }
+      const siblingBypass = await mutateRelationRow(
+        downgraded,
+        'public',
+        'property_query',
+        (row) => {
+          const supportField = `${testCase.prefix}_support_class`;
+          row[supportField] = 'proxy';
+          rebindPropertyQueryFieldLineage(row, supportField);
+        },
+      );
+      await expect(
+        buildBoundedServingRelease({
+          processing,
+          relations: siblingBypass,
+          ...controls,
+          outputDirectory: join(root, `${testCase.prefix}-release`),
+          scratchDirectory: join(root, `${testCase.prefix}-scratch`),
+          writeBatchRecords: 1,
+          maximumLineBytes: 64 * 1024,
+        }),
+      ).rejects.toThrow(
+        `${testCase.prefix}_support_class has a failed or blocked mandatory capability`,
+      );
+    }
+  });
+
+  it('requires unknown/null for every all-blocked and mixed blocked claim dependency set', async () => {
+    const claimCases = [
+      {
+        prefix: 'roof' as const,
+        mandatoryCapabilities: ['san_jose_permits', 'palo_alto_year_built'] as const,
+        affectedClaims: ['roof'] as const,
+      },
+      {
+        prefix: 'ownership' as const,
+        mandatoryCapabilities: ['ownership_transfers'] as const,
+        affectedClaims: ['ownership', 'regional_owner'] as const,
+      },
+      {
+        prefix: 'regional_owner' as const,
+        mandatoryCapabilities: ['ownership_transfers'] as const,
+        affectedClaims: ['ownership', 'regional_owner'] as const,
+      },
+      {
+        prefix: 'water' as const,
+        mandatoryCapabilities: ['noaa_shoreline', 'usgs_hydrography', 'usgs_elevation'] as const,
+        affectedClaims: ['water'] as const,
+      },
+      {
+        prefix: 'transit' as const,
+        mandatoryCapabilities: ['vta_gtfs', 'caltrain_gtfs', 'osm_pedestrian_graph'] as const,
+        affectedClaims: ['transit', 'starbucks'] as const,
+      },
+      {
+        prefix: 'starbucks' as const,
+        mandatoryCapabilities: ['overture_starbucks', 'osm_pedestrian_graph'] as const,
+        affectedClaims: ['transit', 'starbucks'] as const,
+      },
+    ];
+    const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-serving-unknown-invariant-'));
+    for (const claimCase of claimCases) {
+      const scenarios = [
+        { name: 'all-blocked', capabilities: claimCase.mandatoryCapabilities },
+        ...(claimCase.mandatoryCapabilities.length > 1
+          ? [{ name: 'mixed', capabilities: claimCase.mandatoryCapabilities.slice(0, 1) }]
+          : []),
+      ];
+      for (const scenario of scenarios) {
+        const processing = processingWithTrustedRunStatus('partial', scenario.capabilities);
+        const controls = releaseControls(processing);
+        for (const capability of scenario.capabilities) {
+          expect(
+            controls.releaseGate.capabilities.find(
+              (candidate) => candidate.capability === capability,
+            ),
+          ).toMatchObject({ state: 'blocked' });
+        }
+        if (scenario.name === 'mixed') {
+          const unavailableCapabilitySet = new Set<string>(scenario.capabilities);
+          const availableSibling = claimCase.mandatoryCapabilities.find(
+            (capability) => !unavailableCapabilitySet.has(capability),
+          );
+          expect(
+            controls.releaseGate.capabilities.find(
+              ({ capability }) => capability === availableSibling,
+            ),
+          ).toMatchObject({ state: 'succeeded' });
+        }
+
+        let downgraded = await relationInputs(
+          join(root, claimCase.prefix, scenario.name),
+          processing,
+          false,
+          true,
+        );
+        for (const affectedClaim of claimCase.affectedClaims) {
+          downgraded = await downgradePropertyQueryClaim(downgraded, affectedClaim);
+        }
+        for (const rejectedSupportClass of ['unsupported', 'supported', 'proxy'] as const) {
+          const invalidClaim = await mutateRelationRow(
+            downgraded,
+            'public',
+            'property_query',
+            (row) => {
+              const supportField = `${claimCase.prefix}_support_class`;
+              row[supportField] = rejectedSupportClass;
+              rebindPropertyQueryFieldLineage(row, supportField);
+            },
+          );
+          await expect(
+            buildBoundedServingRelease({
+              processing,
+              relations: invalidClaim,
+              ...controls,
+              outputDirectory: join(
+                root,
+                `${claimCase.prefix}-${scenario.name}-${rejectedSupportClass}-release`,
+              ),
+              scratchDirectory: join(
+                root,
+                `${claimCase.prefix}-${scenario.name}-${rejectedSupportClass}-scratch`,
+              ),
+              writeBatchRecords: 1,
+              maximumLineBytes: 64 * 1024,
+            }),
+          ).rejects.toThrow(
+            `${claimCase.prefix}_support_class has a failed or blocked mandatory capability`,
+          );
+        }
+      }
+    }
   });
 
   it('rejects failed acquisition and capability states for every release scope', async () => {
@@ -843,12 +1130,12 @@ describe('bounded serving release v2', () => {
       (await readFile(new URL(queryArtifact.uri), 'utf8')).trim(),
     ) as Record<string, null | boolean | number | string>;
     const fieldName = 'roof_age_years';
-    type FieldBinding = {
+    interface FieldBinding {
       field_name: string;
       source_ids: readonly string[];
       source_references: readonly Readonly<Record<string, unknown>>[];
       field_lineage_sha256: string;
-    };
+    }
     const fieldsA = JSON.parse(String(propertyA.field_source_ids_json)) as FieldBinding[];
     const fieldA = fieldsA.find(({ field_name: candidate }) => candidate === fieldName);
     const referenceA = fieldA?.source_references[0];
@@ -1926,6 +2213,79 @@ function releaseControls(
   };
 }
 
+function releaseControlsOmittingFailedLineage(
+  processing: BoundedProcessingInput,
+): ReturnType<typeof releaseControls> {
+  const controls = releaseControls(processing);
+  const manifest = trustedByProcessing.get(processing);
+  if (manifest === undefined) throw new Error('fixture trusted acquisition');
+  const failedSourceIds = new Set<string>(
+    manifest.sources
+      .filter(({ terminalState }) => terminalState === 'failed')
+      .map(({ sourceId }) => sourceId),
+  );
+  const omitFailed = (metadata: BoundedServingReleaseMetadata): BoundedServingReleaseMetadata =>
+    Object.freeze({
+      ...metadata,
+      sourceLineage: Object.freeze(
+        metadata.sourceLineage.filter(({ sourceId }) => !failedSourceIds.has(sourceId)),
+      ),
+    });
+  return Object.freeze({
+    ...controls,
+    dictionaryReleaseMetadata: Object.freeze({
+      public: omitFailed(controls.dictionaryReleaseMetadata.public),
+      restricted: omitFailed(controls.dictionaryReleaseMetadata.restricted),
+    }),
+  });
+}
+
+async function downgradePropertyQueryClaim(
+  relations: readonly BoundedServingRelationInput[],
+  prefix: 'ownership' | 'regional_owner' | 'roof' | 'water' | 'transit' | 'starbucks',
+): Promise<readonly BoundedServingRelationInput[]> {
+  let current = relations;
+  const supportField = `${prefix}_support_class`;
+  const valueFields = {
+    ownership: ['years_since_exchange', 'last_exchange_date'],
+    regional_owner: ['is_regional_owner'],
+    roof: ['roof_age_years', 'roof_reference_date'],
+    water: ['water_distance_meters', 'water_visibility_state'],
+    transit: ['transit_distance_meters', 'transit_walk_minutes'],
+    starbucks: ['starbucks_distance_meters', 'starbucks_walk_minutes'],
+  }[prefix];
+  const claimFields = new Set([supportField, ...valueFields]);
+  for (const visibility of ['public', 'restricted'] as const) {
+    current = await mutateRelationRow(current, visibility, 'property_query', (row) => {
+      row[supportField] = 'unknown';
+      for (const fieldName of valueFields) row[fieldName] = null;
+      const fields = JSON.parse(String(row.field_source_ids_json)) as {
+        field_name: string;
+        source_ids: readonly string[];
+        source_references: readonly Readonly<Record<string, unknown>>[];
+        field_lineage_sha256: string;
+      }[];
+      row.field_source_ids_json = canonicalJson(
+        fields.map((field) =>
+          claimFields.has(field.field_name)
+            ? {
+                ...field,
+                source_ids: [],
+                source_references: [],
+                field_lineage_sha256: propertyQueryFieldLineageSha256(
+                  field.field_name,
+                  row[field.field_name],
+                  [],
+                ),
+              }
+            : field,
+        ),
+      );
+    });
+  }
+  return current;
+}
+
 function dictionaryMetadata(
   visibility: ServingVisibility,
   processing: BoundedProcessingInput,
@@ -2056,14 +2416,34 @@ function processingInput(
 
 function processingWithTrustedRunStatus(
   runStatus: BoundedTrustedAcquisitionManifest['runStatus'],
+  failedCapability?:
+    | (typeof REAL_COUNTY_CAPABILITIES)[number]
+    | readonly (typeof REAL_COUNTY_CAPABILITIES)[number][],
 ): BoundedProcessingInput {
   const baseline = processingInput();
   const trusted = trustedByProcessing.get(baseline);
   if (trusted === undefined) throw new Error('fixture trusted acquisition');
   const { manifestSha256: ignoredManifestSha256, ...trustedPayload } = trusted;
   void ignoredManifestSha256;
-  const sources = trusted.sources.map((source, index) =>
-    index === 0 && runStatus !== 'succeeded'
+  const unavailableCapabilities =
+    failedCapability === undefined
+      ? null
+      : new Set(Array.isArray(failedCapability) ? failedCapability : [failedCapability]);
+  const selectedSources =
+    unavailableCapabilities === null
+      ? trusted.sources.slice(0, 1)
+      : trusted.sources.filter(({ capabilities }) =>
+          capabilities.some((capability) => unavailableCapabilities.has(capability)),
+        );
+  if (
+    selectedSources.length === 0 ||
+    (unavailableCapabilities !== null && selectedSources.length !== unavailableCapabilities.size)
+  ) {
+    throw new Error('fixture failed capability source');
+  }
+  const selectedSourceIds = new Set(selectedSources.map(({ sourceId }) => sourceId));
+  const sources = trusted.sources.map((source) =>
+    selectedSourceIds.has(source.sourceId) && runStatus !== 'succeeded'
       ? {
           ...source,
           terminalState: runStatus === 'failed' ? ('failed' as const) : ('blocked' as const),

@@ -136,6 +136,43 @@ export const BOUNDED_COUNTY_OUTPUT_RELATIONS = Object.freeze([
   'data_dictionary',
 ] as const satisfies readonly ServingRelationName[]);
 
+const PROPERTY_QUERY_CLAIM_GROUPS = Object.freeze([
+  Object.freeze({
+    supportField: 'roof_support_class',
+    valueFields: Object.freeze(['roof_age_years', 'roof_reference_date']),
+    mandatoryCapabilities: ['san_jose_permits', 'palo_alto_year_built'] as const,
+  }),
+  Object.freeze({
+    supportField: 'water_support_class',
+    valueFields: Object.freeze(['water_distance_meters', 'water_visibility_state']),
+    mandatoryCapabilities: ['noaa_shoreline', 'usgs_hydrography', 'usgs_elevation'] as const,
+  }),
+  Object.freeze({
+    supportField: 'ownership_support_class',
+    valueFields: Object.freeze(['years_since_exchange', 'last_exchange_date']),
+    mandatoryCapabilities: ['ownership_transfers'] as const,
+  }),
+  Object.freeze({
+    supportField: 'regional_owner_support_class',
+    valueFields: Object.freeze(['is_regional_owner']),
+    mandatoryCapabilities: ['ownership_transfers'] as const,
+  }),
+  Object.freeze({
+    supportField: 'transit_support_class',
+    valueFields: Object.freeze(['transit_distance_meters', 'transit_walk_minutes']),
+    mandatoryCapabilities: ['vta_gtfs', 'caltrain_gtfs', 'osm_pedestrian_graph'] as const,
+  }),
+  Object.freeze({
+    supportField: 'starbucks_support_class',
+    valueFields: Object.freeze(['starbucks_distance_meters', 'starbucks_walk_minutes']),
+    mandatoryCapabilities: ['overture_starbucks', 'osm_pedestrian_graph'] as const,
+  }),
+] as const satisfies readonly Readonly<{
+  supportField: string;
+  valueFields: readonly string[];
+  mandatoryCapabilities: readonly RealCountyCapability[];
+}>[]);
+
 type InputRelationName = (typeof BOUNDED_COUNTY_SERVING_RELATIONS)[number];
 
 export type BoundedPropertyQuerySourceReference = Readonly<
@@ -1943,7 +1980,10 @@ function validateBuildInput(
   validateReleaseGate(input.releaseGate, input.processing, trusted);
   const allowedSources = new Set(
     input.releaseGate.sourceStates
-      .filter(({ permissionState }) => permissionState === 'allowed')
+      .filter(
+        ({ permissionState, terminalState }) =>
+          permissionState === 'allowed' && terminalState !== 'failed',
+      )
       .map(({ sourceId, snapshotId }) => `${sourceId}\0${snapshotId}`),
   );
   if ([...publicLineage].some((identity) => !allowedSources.has(identity))) {
@@ -1951,14 +1991,18 @@ function validateBuildInput(
       'Public lineage contains a source without allowed permission',
     );
   }
-  const capabilitySourceIds = new Set(
-    input.releaseGate.capabilities.flatMap(({ sourceIds }) => sourceIds),
+  const releasableSourceIds = new Set(
+    input.releaseGate.sourceStates
+      .filter(({ terminalState }) => terminalState !== 'failed')
+      .map(({ sourceId }) => sourceId),
   );
   if (
-    capabilitySourceIds.size !== manifestSourceIds.size ||
-    [...manifestSourceIds].some((sourceId) => !capabilitySourceIds.has(sourceId))
+    releasableSourceIds.size !== manifestSourceIds.size ||
+    [...manifestSourceIds].some((sourceId) => !releasableSourceIds.has(sourceId))
   ) {
-    throw new BoundedReleaseGateError('Capability source IDs must exactly cover manifest lineage');
+    throw new BoundedReleaseGateError(
+      'Non-failed source inventory must exactly cover release lineage',
+    );
   }
 }
 
@@ -2137,6 +2181,7 @@ class RelationContributorVerifier {
     string,
     BoundedTrustedAcquisitionManifest['sources'][number]
   >();
+  private readonly capabilityStates = new Map<string, CapabilityState>();
   private readonly exactRowLineage: boolean;
 
   public constructor(
@@ -2146,6 +2191,9 @@ class RelationContributorVerifier {
   ) {
     this.allowed = new Set(source.releaseMetadata.sourceLineage.map(({ sourceId }) => sourceId));
     for (const value of trusted.sources) this.trusted.set(value.sourceId, value);
+    for (const value of trusted.capabilities) {
+      this.capabilityStates.set(value.capability, value.state);
+    }
     const columns = new Set(
       BOUNDED_SERVING_RELATIONS[source.relation].columns.map(({ name }) => name),
     );
@@ -2355,10 +2403,62 @@ class RelationContributorVerifier {
       }
       union.push(...sources);
     }
+    assertPropertyQueryClaimClosure(row, fieldSources, this.capabilityStates);
     if (canonicalJson(sortedUnique(union)) !== canonicalJson(rowSourceIds)) {
       throw new BoundedReleaseMetadataError(
         'property_query row contributors differ from exact field provenance',
       );
+    }
+  }
+}
+
+function assertPropertyQueryClaimClosure(
+  row: ServingRow,
+  fieldSources: Readonly<Record<string, PropertyQueryFieldProvenance>>,
+  capabilityStates: ReadonlyMap<string, CapabilityState>,
+): void {
+  for (const { supportField, valueFields, mandatoryCapabilities } of PROPERTY_QUERY_CLAIM_GROUPS) {
+    const supportClass = row[supportField];
+    if (
+      supportClass !== 'supported' &&
+      supportClass !== 'proxy' &&
+      supportClass !== 'unknown' &&
+      supportClass !== 'unsupported'
+    ) {
+      throw new BoundedReleaseMetadataError(
+        `property_query ${supportField} has an invalid support class`,
+      );
+    }
+    const known = supportClass === 'supported' || supportClass === 'proxy';
+    const mandatoryDependencyUnavailable = mandatoryCapabilities.some((capability) => {
+      const state = capabilityStates.get(capability);
+      return state === 'failed' || state === 'blocked';
+    });
+    if (mandatoryDependencyUnavailable && supportClass !== 'unknown') {
+      throw new BoundedReleaseMetadataError(
+        `property_query ${supportField} has a failed or blocked mandatory capability`,
+      );
+    }
+    const supportProvenance = fieldSources[supportField];
+    if (known && (supportProvenance?.sourceReferences.length ?? 0) === 0) {
+      throw new BoundedReleaseMetadataError(
+        `property_query ${supportField} cannot become known without exact provenance`,
+      );
+    }
+    for (const valueField of valueFields) {
+      if (!known && row[valueField] !== null) {
+        throw new BoundedReleaseMetadataError(
+          `property_query ${valueField} must be null when ${supportField} is not known`,
+        );
+      }
+      if (
+        row[valueField] !== null &&
+        (fieldSources[valueField]?.sourceReferences.length ?? 0) === 0
+      ) {
+        throw new BoundedReleaseMetadataError(
+          `property_query ${valueField} cannot become known without exact provenance`,
+        );
+      }
     }
   }
 }
@@ -2459,9 +2559,14 @@ function assertManifestShape(
           !(capability === 'transit_511_fallback' && state === 'not_configured'),
       ));
   const failedGate =
-    (evidenceRecord.runStatus !== 'succeeded' && evidenceRecord.runStatus !== 'partial') ||
-    evidence.sourceStates.some(({ terminalState }) => terminalState === 'failed') ||
-    evidence.capabilities.some(({ state }) => state === 'failed');
+    (evidenceRecord.runStatus !== 'succeeded' &&
+      evidenceRecord.runStatus !== 'partial' &&
+      evidenceRecord.runStatus !== 'failed') ||
+    failedReleaseEvidenceIsInvalid(evidence) ||
+    evidence.sourceStates.some(
+      ({ sourceId, terminalState }) =>
+        terminalState === 'failed' && manifestSourceIds.has(sourceId),
+    );
   if (
     manifestRecord.contractVersion !== '1.0.0' ||
     manifest.manifestSha256 !== portableManifestSha256(withoutKey(manifest, 'manifestSha256')) ||
@@ -2708,6 +2813,7 @@ function validateReleaseMetadata(
     identities.add(identity);
     const acquired = trustedSources.get(source.sourceId);
     if (
+      acquired?.terminalState === 'failed' ||
       acquired?.snapshotId !== source.snapshotId ||
       acquired.sourceSha256 !== source.sourceSha256 ||
       acquired.schemaSha256 !== source.schemaSha256 ||
@@ -2845,15 +2951,60 @@ function releaseGateScope(
 }
 
 function assertNoFailedReleaseState(gate: BoundedServingReleaseGateInput): void {
+  const failedSourceIds = new Set(
+    gate.sourceStates
+      .filter(({ terminalState }) => terminalState === 'failed')
+      .map(({ sourceId }) => sourceId),
+  );
+  const failedCapabilities = gate.capabilities.filter(({ state }) => state === 'failed');
+  const hasFailure = failedSourceIds.size > 0 || failedCapabilities.length > 0;
+  if (!hasFailure) {
+    if (gate.runStatus === 'failed') {
+      throw new BoundedReleaseGateError('Failed run status lacks terminal failure evidence');
+    }
+    return;
+  }
   if (
-    gate.runStatus === 'failed' ||
-    gate.sourceStates.some(({ terminalState }) => terminalState === 'failed') ||
-    gate.capabilities.some(({ state }) => state === 'failed')
+    gate.requestedScope !== 'partial_county' ||
+    gate.runStatus !== 'failed' ||
+    gate.sourceStates.some(
+      ({ terminalState, limitations }) => terminalState === 'failed' && limitations.length === 0,
+    ) ||
+    failedCapabilities.some(
+      ({ sourceIds, limitations }) =>
+        limitations.length === 0 ||
+        sourceIds.length === 0 ||
+        sourceIds.some((sourceId) => !failedSourceIds.has(sourceId)),
+    )
   ) {
     throw new BoundedReleaseGateError(
-      'No release scope may finalize a failed run, acquisition, or capability',
+      'Failed lanes may be omitted only from partial_county with exact terminal limitations',
     );
   }
+}
+
+function failedReleaseEvidenceIsInvalid(evidence: BoundedServingReleaseEvidence): boolean {
+  const failedSourceIds = new Set(
+    evidence.sourceStates
+      .filter(({ terminalState }) => terminalState === 'failed')
+      .map(({ sourceId }) => sourceId),
+  );
+  const failedCapabilities = evidence.capabilities.filter(({ state }) => state === 'failed');
+  const hasFailure = failedSourceIds.size > 0 || failedCapabilities.length > 0;
+  if (!hasFailure) return evidence.runStatus === 'failed';
+  return (
+    evidence.releaseScope !== 'partial_county' ||
+    evidence.runStatus !== 'failed' ||
+    evidence.sourceStates.some(
+      ({ terminalState, limitations }) => terminalState === 'failed' && limitations.length === 0,
+    ) ||
+    failedCapabilities.some(
+      ({ sourceIds, limitations }) =>
+        limitations.length === 0 ||
+        sourceIds.length === 0 ||
+        sourceIds.some((sourceId) => !failedSourceIds.has(sourceId)),
+    )
+  );
 }
 
 function canonicalJson(value: unknown): string {
@@ -2954,7 +3105,7 @@ function parseCanonicalFieldSourceIds(
     const sourceReferences = record.source_references.map((reference) =>
       parsePropertyQuerySourceReference(
         reference,
-        `field_source_ids_json.${record.field_name}.source_references`,
+        `field_source_ids_json.${String(record.field_name)}.source_references`,
       ),
     );
     const canonicalReferences = [...sourceReferences].sort((left, right) =>
