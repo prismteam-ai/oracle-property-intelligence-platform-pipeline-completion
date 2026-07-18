@@ -2,7 +2,7 @@ import type { OracleModelGateway } from '@oracle/model-gateway';
 import type { LanguageModel } from 'ai';
 import { describe, expect, it, vi } from 'vitest';
 
-import { createOracleEvidenceAgent } from './agent.js';
+import { ORACLE_AGENT_LIMITS, OracleAgentError, createOracleEvidenceAgent } from './agent.js';
 import type { NamedEvidenceEnvelope, NamedEvidenceExecutor } from './contracts.js';
 import { NAMED_EVIDENCE_TOOL_NAMES, namedEvidenceInputSchemas } from './contracts.js';
 import { createSemanticPolicy, type EvidenceCapability } from './policy.js';
@@ -56,6 +56,7 @@ function envelope(
 
 function scriptedModel(
   script: readonly (typeof TOOL | typeof MANY_TOOLS | string | Error)[],
+  onGenerate: () => void = () => undefined,
 ): LanguageModel {
   let index = 0;
   return {
@@ -64,6 +65,7 @@ function scriptedModel(
     modelId: 'test-profile',
     supportedUrls: {},
     doGenerate: () => {
+      onGenerate();
       const next = script[index++];
       if (next instanceof Error) return Promise.reject(next);
       const content =
@@ -119,29 +121,40 @@ function executor(
   return { execute: vi.fn(() => Promise.resolve(result)) };
 }
 
-function timeoutModel(): LanguageModel {
+function timeoutModel(onGenerate: () => void): LanguageModel {
   return {
     specificationVersion: 'v3',
     provider: 'amazon-bedrock',
     modelId: 'timeout-profile',
     supportedUrls: {},
-    doGenerate: (options) =>
-      new Promise((_resolve, reject) => {
-        options.abortSignal?.addEventListener(
-          'abort',
-          () => reject(new Error('aborted by configured agent timeout')),
-          { once: true },
-        );
-      }),
+    doGenerate: (options) => {
+      onGenerate();
+      return new Promise((_resolve, reject) => {
+        const rejectWithAbortReason = () =>
+          reject(
+            options.abortSignal?.reason instanceof Error
+              ? options.abortSignal.reason
+              : new Error('aborted by configured agent timeout'),
+          );
+        if (options.abortSignal?.aborted === true) {
+          rejectWithAbortReason();
+          return;
+        }
+        options.abortSignal?.addEventListener('abort', rejectWithAbortReason, { once: true });
+      });
+    },
     doStream: () => Promise.resolve({ stream: new ReadableStream() }),
   } satisfies LanguageModelV3;
 }
 
 describe('Oracle named-tool agent', () => {
   it('selects the frozen tool and accepts only returned evidence citations', async () => {
+    const providerCalls = vi.fn();
     const evidence = executor(envelope('supported'));
     const agent = createOracleEvidenceAgent({
-      gateway: gateway(scriptedModel([TOOL, `Property 1 qualifies [evidence:${EVIDENCE_ID}].`])),
+      gateway: gateway(
+        scriptedModel([TOOL, `Property 1 qualifies [evidence:${EVIDENCE_ID}].`], providerCalls),
+      ),
       semanticPolicy: policy,
       executor: evidence,
     });
@@ -152,6 +165,7 @@ describe('Oracle named-tool agent', () => {
       expect.any(Object),
     );
     expect(answer.citedEvidenceIds).toEqual([EVIDENCE_ID]);
+    expect(providerCalls).toHaveBeenCalledTimes(2);
   });
 
   it('rejects omitted and fabricated citations', async () => {
@@ -216,29 +230,50 @@ describe('Oracle named-tool agent', () => {
         executor: executor(envelope('supported')),
       }),
     ).toThrow('drift');
+    const providerCalls = vi.fn();
     const outage = createOracleEvidenceAgent({
-      gateway: gateway(scriptedModel([new Error('provider unavailable')])),
+      gateway: gateway(scriptedModel([new Error('provider unavailable')], providerCalls)),
       semanticPolicy: policy,
       executor: executor(envelope('supported')),
     });
     await expect(outage.ask('Find candidates.', RELEASE)).rejects.toThrow(
       'failed without fallback',
     );
+    expect(providerCalls).toHaveBeenCalledTimes(1);
   });
 
-  it('honors the hard request timeout without producing a fallback answer', async () => {
+  it('keeps the provider step inside the request and infrastructure timeout boundaries', () => {
+    expect(ORACLE_AGENT_LIMITS.maximumProviderRetries).toBe(0);
+    expect(ORACLE_AGENT_LIMITS.stepTimeoutMs).toBe(20_000);
+    expect(ORACLE_AGENT_LIMITS.stepTimeoutMs).toBeLessThan(ORACLE_AGENT_LIMITS.totalTimeoutMs);
+    expect(ORACLE_AGENT_LIMITS.totalTimeoutMs).toBe(24_000);
+    expect(ORACLE_AGENT_LIMITS.totalTimeoutMs).toBeLessThan(25_000);
+  });
+
+  it('propagates the bounded step timeout after one provider request without fallback', async () => {
     vi.useFakeTimers();
     try {
+      const providerCalls = vi.fn();
       const timed = createOracleEvidenceAgent({
-        gateway: gateway(timeoutModel()),
+        gateway: gateway(timeoutModel(providerCalls)),
         semanticPolicy: policy,
         executor: executor(envelope('supported')),
       });
-      const assertion = expect(timed.ask('Find candidates.', RELEASE)).rejects.toThrow(
-        'failed without fallback',
+      const rejection = timed.ask('Find candidates.', RELEASE).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(ORACLE_AGENT_LIMITS.stepTimeoutMs - 1);
+      expect(providerCalls).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(2);
+      const error = await rejection;
+      expect(error).toBeInstanceOf(OracleAgentError);
+      expect((error as OracleAgentError).message).toBe(
+        'Oracle Bedrock agent request failed without fallback',
       );
-      await vi.advanceTimersByTimeAsync(25_001);
-      await assertion;
+      expect((error as OracleAgentError).cause).toMatchObject({
+        name: 'TimeoutError',
+        message: `Step timeout of ${ORACLE_AGENT_LIMITS.stepTimeoutMs}ms exceeded`,
+      });
+      await vi.advanceTimersByTimeAsync(ORACLE_AGENT_LIMITS.totalTimeoutMs);
+      expect(providerCalls).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
     }

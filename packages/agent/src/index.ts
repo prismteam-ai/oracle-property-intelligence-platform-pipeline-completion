@@ -1,5 +1,10 @@
 export { ORACLE_AGENT_LIMITS, OracleAgentError, createOracleEvidenceAgent } from './agent.js';
-export type { AgentTelemetryEvent, OracleAgentAnswer, OracleEvidenceAgent } from './agent.js';
+export type {
+  AgentTelemetryEvent,
+  OracleAgentAnswer,
+  OracleAgentLimits,
+  OracleEvidenceAgent,
+} from './agent.js';
 export {
   NAMED_EVIDENCE_TOOL_NAMES,
   SUPPORT_STATES,

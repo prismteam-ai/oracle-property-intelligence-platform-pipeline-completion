@@ -19,12 +19,28 @@ const callOptionsSchema = z.strictObject({
 
 type OracleAgentCallOptions = z.infer<typeof callOptionsSchema>;
 
-export const ORACLE_AGENT_LIMITS = Object.freeze({
+export type OracleAgentLimits = Readonly<{
+  maximumSteps: number;
+  maximumToolCalls: number;
+  maximumOutputTokens: number;
+  maximumProviderRetries: 0;
+  totalTimeoutMs: number;
+  stepTimeoutMs: number;
+  maximumPromptCharacters: number;
+  maximumActiveTools: number;
+  maximumActiveOptionalParameters: number;
+}>;
+
+export const ORACLE_AGENT_LIMITS: OracleAgentLimits = Object.freeze({
   maximumSteps: 3,
   maximumToolCalls: 6,
   maximumOutputTokens: 2_048,
-  totalTimeoutMs: 25_000,
-  stepTimeoutMs: 10_000,
+  maximumProviderRetries: 0,
+  // Finish before the API's 25-second request budget and the 29-second
+  // API Gateway integration boundary. A Bedrock step gets most of that
+  // budget, while the total bound remains authoritative across the tool loop.
+  totalTimeoutMs: 24_000,
+  stepTimeoutMs: 20_000,
   maximumPromptCharacters: 8_000,
   maximumActiveTools: 5,
   maximumActiveOptionalParameters: 24,
@@ -133,6 +149,7 @@ export function createOracleEvidenceAgent(
     instructions: ORACLE_AGENT_PROMPT_POLICY,
     tools,
     toolChoice: 'auto',
+    maxRetries: ORACLE_AGENT_LIMITS.maximumProviderRetries,
     maxOutputTokens: ORACLE_AGENT_LIMITS.maximumOutputTokens,
     temperature: 0,
     stopWhen: [

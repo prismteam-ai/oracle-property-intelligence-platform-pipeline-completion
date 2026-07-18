@@ -49,7 +49,11 @@ to the exact Bedrock profile.
 
 - at most 3 model steps and 6 tool calls;
 - at most 2,048 output tokens;
-- 25-second total and 10-second step timeouts, inside the 30-second Lambda/HTTP boundary;
+- a 24-second total timeout and 20-second per-step timeout, nested inside the
+  25-second API request budget, 29-second API Gateway integration, and 30-second
+  Lambda boundary;
+- zero provider retries: each model step issues exactly one request, with no
+  model/profile fallback;
 - prompts at most 8,000 characters;
 - tool envelopes at most 900 KiB, 100 returned rows, and 1,000 evidence references;
 - each analytical call at most 5 seconds and 512 MiB scanned;

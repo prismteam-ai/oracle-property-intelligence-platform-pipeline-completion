@@ -100,9 +100,11 @@ and requires a terminal successful answer, exact citations, a named-tool trace,
 and the actual selected model/profile. Once the agent is promoted, unavailable,
 degraded, policy-drifted, canned, or trace-free agent behavior fails the hosted
 release suite. Hosted Playwright retries are disabled so this proof cannot spend
-a second model request after a failure. The journey never dispatches provider effects, publishes
-artifacts, mutates IPNS/public data, changes cloud configuration, or writes a
-dataset.
+a second model request after a failure. Only this agent response observer has an
+explicit 27-second browser bound, allowing the production 25-second request SLA
+without weakening response waits for other operations. The journey never
+dispatches provider effects, publishes artifacts, mutates IPNS/public data,
+changes cloud configuration, or writes a dataset.
 
 ## Targeted commands
 

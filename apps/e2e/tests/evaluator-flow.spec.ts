@@ -25,6 +25,7 @@ const inquiryOperationByPath: Readonly<Record<string, string>> = Object.freeze({
 });
 
 type JsonRecord = Readonly<Record<string, unknown>>;
+const HOSTED_AGENT_RESPONSE_TIMEOUT_MS = 27_000;
 
 function asRecord(value: unknown): JsonRecord | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -32,11 +33,14 @@ function asRecord(value: unknown): JsonRecord | null {
     : null;
 }
 
-function operationResponse(page: Page, operation: string): Promise<Response> {
-  return page.waitForResponse((response) => {
-    const pathname = decodeURIComponent(new URL(response.url()).pathname).replace(/\/+$/u, '');
-    return response.request().method() === 'POST' && pathname.endsWith(`/${operation}`);
-  });
+function operationResponse(page: Page, operation: string, timeoutMs?: number): Promise<Response> {
+  return page.waitForResponse(
+    (response) => {
+      const pathname = decodeURIComponent(new URL(response.url()).pathname).replace(/\/+$/u, '');
+      return response.request().method() === 'POST' && pathname.endsWith(`/${operation}`);
+    },
+    timeoutMs === undefined ? {} : { timeout: timeoutMs },
+  );
 }
 
 function responseRows(body: unknown): readonly unknown[] {
@@ -291,7 +295,11 @@ test('agent shows named-tool trace and exact citations when available', async ({
   await prompt.fill(
     'Which properties have roofs older than 15 years and have not exchanged ownership in more than 10 years?',
   );
-  const responsePromise = operationResponse(page, 'agent.ask');
+  const responsePromise = operationResponse(
+    page,
+    'agent.ask',
+    isHostedTarget() ? HOSTED_AGENT_RESPONSE_TIMEOUT_MS : undefined,
+  );
   await page.getByRole('button', { name: /ask|run/i }).click();
   const response = await responsePromise;
   const body: unknown = await response.json();
