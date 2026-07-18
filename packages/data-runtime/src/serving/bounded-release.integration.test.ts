@@ -61,12 +61,14 @@ import {
   verifyBoundedServingArtifactInventory,
   type BoundedServingRelationInput,
   type BoundedServingReleaseBuildInput,
+  type BoundedTrustedCanonicalLineageResolver,
   type BoundedReleaseFinalizationCoordinator,
   type BoundedReleaseFinalizationWinner,
   type BoundedServingReleaseMetadata,
 } from './bounded-release.js';
 import { REAL_COUNTY_CAPABILITIES } from './real-county-release.js';
-import { SERVING_RELATIONS, type ServingRow, type ServingVisibility } from './schema.js';
+import { BOUNDED_SERVING_RELATIONS, type ServingRow, type ServingVisibility } from './schema.js';
+import { verifyServingArtifacts } from './verifier.js';
 
 const HASH_A = 'a'.repeat(64);
 const HASH_B = 'b'.repeat(64);
@@ -337,11 +339,18 @@ describe('bounded serving release v2', () => {
     const evidenceArtifact = first.manifest.artifacts.find(
       ({ relation }) => relation === 'property_evidence',
     );
+    expect(queryArtifact?.columns.slice(-2).map(({ name }) => name)).toEqual([
+      'source_ids_json',
+      'field_source_ids_json',
+    ]);
     expect(queryArtifact?.limitations).not.toEqual(evidenceArtifact?.limitations);
     expect(queryArtifact?.sourceLineage[0]?.sourceSha256).not.toBe(
       evidenceArtifact?.sourceLineage[0]?.sourceSha256,
     );
     await expect(verifyBoundedServingRelease(first.outputDirectory)).resolves.toBeDefined();
+    await expect(
+      verifyServingArtifacts(first.outputDirectory, first.manifest.artifacts),
+    ).resolves.toHaveLength(14);
 
     const adopted = await buildBoundedServingRelease({
       processing,
@@ -540,6 +549,7 @@ describe('bounded serving release v2', () => {
     const relations = await relationInputs(root, processing);
     const publicScalar = await mutateRelationRow(relations, 'public', 'property_query', (row) => {
       row.property_id = 'Cross Scope Owner';
+      rebindPropertyQueryFieldLineage(row, 'property_id');
     });
     const restrictedOwner = await mutateRelationRow(
       publicScalar,
@@ -569,6 +579,7 @@ describe('bounded serving release v2', () => {
     const relations = await relationInputs(root, processing);
     const publicString = await mutateRelationRow(relations, 'public', 'property_query', (row) => {
       row.property_id = '42';
+      rebindPropertyQueryFieldLineage(row, 'property_id');
     });
     const restrictedNumber = await mutateRelationRow(
       publicString,
@@ -713,6 +724,251 @@ describe('bounded serving release v2', () => {
       ).rejects.toBeInstanceOf(BoundedReleaseMetadataError);
     }
     expect(finalizer.finalizeCalls).toBe(0);
+  });
+
+  it('rejects property-query row or base-field provenance that is not exact', async () => {
+    const processing = processingInput();
+    const controls = releaseControls(processing);
+    const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-serving-property-lineage-'));
+    const relations = await relationInputs(root, processing);
+    const missingBaseField = await mutateRelationRow(
+      relations,
+      'public',
+      'property_query',
+      (row) => {
+        const fields = JSON.parse(String(row.field_source_ids_json)) as {
+          field_name: string;
+          source_ids: readonly string[];
+        }[];
+        row.field_source_ids_json = canonicalJson(
+          fields.map((field) =>
+            field.field_name === 'parcel_identifier' ? { ...field, source_ids: [] } : field,
+          ),
+        );
+      },
+    );
+
+    await expect(
+      buildBoundedServingRelease({
+        processing,
+        relations: missingBaseField,
+        ...controls,
+        outputDirectory: join(root, 'release'),
+        scratchDirectory: join(root, 'scratch'),
+        writeBatchRecords: 1,
+        maximumLineBytes: 64 * 1024,
+      }),
+    ).rejects.toBeInstanceOf(BoundedReleaseMetadataError);
+  });
+
+  it('rejects valid property-query contributors reassigned with recomputed public hashes', async () => {
+    const processing = processingInput();
+    const controls = releaseControls(processing);
+    const fieldNames = ['roof_age_years', 'transit_distance_meters'] as const;
+
+    for (const mutation of ['swap_references', 'move_entire_binding'] as const) {
+      const root = await mkdtemp(
+        join(tmpdir(), `oracle-bounded-serving-property-record-${mutation}-`),
+      );
+      const relations = await relationInputs(root, processing);
+      const reassigned = await mutateRelationRow(relations, 'public', 'property_query', (row) => {
+        const fields = JSON.parse(String(row.field_source_ids_json)) as {
+          field_name: string;
+          source_ids: readonly string[];
+          source_references: readonly Readonly<Record<string, unknown>>[];
+          field_lineage_sha256: string;
+        }[];
+        const left = fields.find(({ field_name: fieldName }) => fieldName === fieldNames[0]);
+        const right = fields.find(({ field_name: fieldName }) => fieldName === fieldNames[1]);
+        if (left === undefined || right === undefined) throw new Error('fixture field lineage');
+        const mutated = fields.map((field) => {
+          if (field.field_name === fieldNames[0]) {
+            const sourceReferences = right.source_references;
+            return {
+              ...field,
+              ...(mutation === 'move_entire_binding' ? { source_ids: right.source_ids } : {}),
+              source_references: sourceReferences,
+              field_lineage_sha256: propertyQueryFieldLineageSha256(
+                field.field_name,
+                row[field.field_name],
+                sourceReferences,
+              ),
+            };
+          }
+          if (field.field_name === fieldNames[1]) {
+            const sourceReferences = left.source_references;
+            return {
+              ...field,
+              ...(mutation === 'move_entire_binding' ? { source_ids: left.source_ids } : {}),
+              source_references: sourceReferences,
+              field_lineage_sha256: propertyQueryFieldLineageSha256(
+                field.field_name,
+                row[field.field_name],
+                sourceReferences,
+              ),
+            };
+          }
+          return field;
+        });
+        row.field_source_ids_json = canonicalJson(mutated);
+      });
+
+      await expect(
+        buildBoundedServingRelease({
+          processing,
+          relations: reassigned,
+          ...controls,
+          finalization: {
+            attemptId: `property-record-${mutation}`,
+            coordinator: controls.finalization.coordinator,
+          },
+          outputDirectory: join(root, 'release'),
+          scratchDirectory: join(root, 'scratch'),
+          writeBatchRecords: 1,
+          maximumLineBytes: 64 * 1024,
+        }),
+      ).rejects.toBeInstanceOf(BoundedReleaseMetadataError);
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-serving-property-cross-property-'));
+    const relations = await relationInputs(root, processing);
+    const queryRelation = relations.find(
+      ({ relation, visibility }) => relation === 'property_query' && visibility === 'public',
+    );
+    const queryArtifact = queryRelation?.artifacts?.[0];
+    if (queryRelation === undefined || queryArtifact === undefined) {
+      throw new Error('fixture property_query relation');
+    }
+    const propertyA = JSON.parse(
+      (await readFile(new URL(queryArtifact.uri), 'utf8')).trim(),
+    ) as Record<string, null | boolean | number | string>;
+    const fieldName = 'roof_age_years';
+    type FieldBinding = {
+      field_name: string;
+      source_ids: readonly string[];
+      source_references: readonly Readonly<Record<string, unknown>>[];
+      field_lineage_sha256: string;
+    };
+    const fieldsA = JSON.parse(String(propertyA.field_source_ids_json)) as FieldBinding[];
+    const fieldA = fieldsA.find(({ field_name: candidate }) => candidate === fieldName);
+    const referenceA = fieldA?.source_references[0];
+    if (fieldA === undefined || referenceA === undefined) throw new Error('fixture roof lineage');
+    const referenceB = Object.freeze({
+      ...referenceA,
+      recordKey: `${String(referenceA.recordKey)}:property-b`,
+      recordSha256: digest(`fixture-record:${String(referenceA.recordKey)}:property-b`),
+      lineageSha256: digest(`fixture-lineage:${fieldName}:property-b`),
+    });
+    const propertyB: Record<string, null | boolean | number | string> = {
+      ...propertyA,
+      property_id: `${String(propertyA.property_id)}:property-b`,
+    };
+    const fieldsB = fieldsA.map((field) => {
+      const sourceReferences =
+        field.field_name === fieldName ? Object.freeze([referenceB]) : field.source_references;
+      return {
+        ...field,
+        source_references: sourceReferences,
+        field_lineage_sha256: propertyQueryFieldLineageSha256(
+          field.field_name,
+          propertyB[field.field_name],
+          sourceReferences,
+        ),
+      };
+    });
+    propertyB.field_source_ids_json = canonicalJson(fieldsB);
+
+    const expectedBindings = new Map<string, string>();
+    for (const row of [propertyA, propertyB]) {
+      const propertyId = String(row.property_id);
+      const fields = JSON.parse(String(row.field_source_ids_json)) as FieldBinding[];
+      for (const field of fields) {
+        expectedBindings.set(
+          `${propertyId}\0${field.field_name}`,
+          canonicalJson({
+            fieldValue: row[field.field_name],
+            reference: field.source_references[0],
+          }),
+        );
+      }
+    }
+    const propertyScopedControls = {
+      ...controls,
+      trustedCanonicalLineage: Object.freeze({
+        verifyPropertyQueryFieldReference: ({
+          propertyId,
+          fieldName: candidateField,
+          fieldValue,
+          reference,
+        }: Parameters<
+          BoundedTrustedCanonicalLineageResolver['verifyPropertyQueryFieldReference']
+        >[0]) => {
+          const expected = expectedBindings.get(`${propertyId}\0${candidateField}`);
+          return expected === undefined
+            ? controls.trustedCanonicalLineage.verifyPropertyQueryFieldReference({
+                propertyId,
+                fieldName: candidateField,
+                fieldValue,
+                reference,
+              })
+            : Promise.resolve(expected === canonicalJson({ fieldValue, reference }));
+        },
+      }),
+    };
+    const correct = await replaceRelationRows(relations, 'public', 'property_query', [
+      propertyA,
+      propertyB,
+    ]);
+    await expect(
+      buildBoundedServingRelease({
+        processing,
+        relations: correct,
+        ...propertyScopedControls,
+        finalization: {
+          attemptId: 'property-record-cross-property-correct',
+          coordinator: controls.finalization.coordinator,
+        },
+        outputDirectory: join(root, 'correct-release'),
+        scratchDirectory: join(root, 'correct-scratch'),
+        writeBatchRecords: 1,
+        maximumLineBytes: 64 * 1024,
+      }),
+    ).resolves.toBeDefined();
+
+    const swappedFieldsA = fieldsA.map((field) =>
+      field.field_name === fieldName
+        ? {
+            ...field,
+            source_references: [referenceB],
+            field_lineage_sha256: propertyQueryFieldLineageSha256(fieldName, propertyA[fieldName], [
+              referenceB,
+            ]),
+          }
+        : field,
+    );
+    const swappedPropertyA = {
+      ...propertyA,
+      field_source_ids_json: canonicalJson(swappedFieldsA),
+    };
+    const swapped = await replaceRelationRows(correct, 'public', 'property_query', [
+      swappedPropertyA,
+      propertyB,
+    ]);
+    await expect(
+      buildBoundedServingRelease({
+        processing,
+        relations: swapped,
+        ...propertyScopedControls,
+        finalization: {
+          attemptId: 'property-record-cross-property-swapped',
+          coordinator: controls.finalization.coordinator,
+        },
+        outputDirectory: join(root, 'swapped-release'),
+        scratchDirectory: join(root, 'swapped-scratch'),
+        writeBatchRecords: 1,
+        maximumLineBytes: 64 * 1024,
+      }),
+    ).rejects.toBeInstanceOf(BoundedReleaseMetadataError);
   });
 
   it('contains no whole-corpus production collection escape hatch', async () => {
@@ -1373,11 +1629,48 @@ async function mutateRelationRow(
   return relations.map((candidate) => (candidate === target ? next : candidate));
 }
 
+async function replaceRelationRows(
+  relations: readonly BoundedServingRelationInput[],
+  visibility: ServingVisibility,
+  relation: (typeof BOUNDED_COUNTY_SERVING_RELATIONS)[number],
+  rows: readonly Record<string, null | boolean | number | string>[],
+): Promise<readonly BoundedServingRelationInput[]> {
+  const target = relations.find(
+    (candidate) => candidate.visibility === visibility && candidate.relation === relation,
+  );
+  const artifact = target?.artifacts?.[0];
+  if (target === undefined || artifact === undefined) throw new Error('fixture relation');
+  const ordered = [...rows].sort((left, right) => {
+    const leftKey = boundedServingRowSortKey(relation, left);
+    const rightKey = boundedServingRowSortKey(relation, right);
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+  const body = ordered.map((row) => `${canonicalJson(row)}\n`).join('');
+  await writeFile(new URL(artifact.uri), body, { encoding: 'utf8', flag: 'w' });
+  const sha256 = digest(body);
+  const next = {
+    ...target,
+    logicalSha256: sha256,
+    recordCount: ordered.length,
+    artifacts: [
+      {
+        ...artifact,
+        sha256,
+        byteSize: Buffer.byteLength(body),
+        recordCount: ordered.length,
+        firstSortKey: boundedServingRowSortKey(relation, ordered[0] ?? {}),
+        lastSortKey: boundedServingRowSortKey(relation, ordered.at(-1) ?? {}),
+      },
+    ],
+  };
+  return relations.map((candidate) => (candidate === target ? next : candidate));
+}
+
 function rowLineageRule(
   relation: (typeof BOUNDED_COUNTY_SERVING_RELATIONS)[number],
   metadata: BoundedServingReleaseMetadata,
 ): BoundedServingRelationInput['rowLineageRule'] {
-  const columns = new Set(SERVING_RELATIONS[relation].columns.map(({ name }) => name));
+  const columns = new Set(BOUNDED_SERVING_RELATIONS[relation].columns.map(({ name }) => name));
   if (columns.has('source_references_json')) {
     return Object.freeze({ kind: 'source_ids_and_references_exact' as const });
   }
@@ -1402,13 +1695,36 @@ function fixtureRow(
   sensitivePublic: false | 'string' | 'number' | 'boolean',
   noObservation: boolean,
 ): ServingRow {
-  const definition = SERVING_RELATIONS[relation];
+  const definition = BOUNDED_SERVING_RELATIONS[relation];
   const row: Record<string, null | boolean | number | string> = {};
   for (const column of definition.columns) {
     if (column.name === 'visibility') row[column.name] = visibility;
     else if (column.name === 'source_id') row[column.name] = contributor ?? '';
     else if (column.name === 'source_ids_json') {
       row[column.name] = canonicalJson(contributor === undefined ? [] : [contributor]);
+    } else if (column.name === 'field_source_ids_json') {
+      row[column.name] = canonicalJson(
+        definition.columns
+          .map(({ name }) => name)
+          .filter((name) => name !== 'source_ids_json' && name !== 'field_source_ids_json')
+          .sort()
+          .map((fieldName) => {
+            const sourceReferences =
+              sourceReference === undefined
+                ? []
+                : [fixturePropertyQuerySourceReference(fieldName, sourceReference)];
+            return {
+              field_name: fieldName,
+              source_ids: contributor === undefined ? [] : [contributor],
+              source_references: sourceReferences,
+              field_lineage_sha256: propertyQueryFieldLineageSha256(
+                fieldName,
+                row[fieldName],
+                sourceReferences,
+              ),
+            };
+          }),
+      );
     } else if (column.name === 'source_references_json') {
       row[column.name] = canonicalJson(sourceReference === undefined ? [] : [sourceReference]);
     } else if (column.name.endsWith('_json')) {
@@ -1439,6 +1755,62 @@ function fixtureRow(
     else row[column.name] = 1;
   }
   return Object.freeze(row);
+}
+
+function fixturePropertyQuerySourceReference(
+  fieldName: string,
+  sourceReference: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  const recordKey = `${String(sourceReference.recordKey)}:${fieldName}`;
+  return Object.freeze({
+    ...sourceReference,
+    recordKey,
+    recordSha256: digest(`fixture-record:${recordKey}`),
+    lineageSha256: digest(`fixture-lineage:${fieldName}`),
+    fieldPaths: Object.freeze([`/fixture/${fieldName}`]),
+  });
+}
+
+function propertyQueryFieldLineageSha256(
+  fieldName: string,
+  value: ServingRow[string] | undefined,
+  sourceReferences: readonly Readonly<Record<string, unknown>>[],
+): string {
+  if (value === undefined) throw new Error(`fixture field ${fieldName}`);
+  return digest(
+    `${canonicalJson({
+      contract: 'oracle-property-query-field-lineage-v1',
+      fieldName,
+      value,
+      sourceReferences,
+    })}\n`,
+  );
+}
+
+function rebindPropertyQueryFieldLineage(
+  row: Record<string, null | boolean | number | string>,
+  fieldName: string,
+): void {
+  const fields = JSON.parse(String(row.field_source_ids_json)) as {
+    field_name: string;
+    source_ids: readonly string[];
+    source_references: readonly Readonly<Record<string, unknown>>[];
+    field_lineage_sha256: string;
+  }[];
+  row.field_source_ids_json = canonicalJson(
+    fields.map((field) =>
+      field.field_name === fieldName
+        ? {
+            ...field,
+            field_lineage_sha256: propertyQueryFieldLineageSha256(
+              fieldName,
+              row[fieldName],
+              field.source_references,
+            ),
+          }
+        : field,
+    ),
+  );
 }
 
 function metadataFor(
@@ -1477,7 +1849,12 @@ function releaseControls(
   processing: BoundedProcessingInput,
 ): Pick<
   BoundedServingReleaseBuildInput,
-  'dictionaryReleaseMetadata' | 'checkpoint' | 'trustedAcquisition' | 'finalization' | 'releaseGate'
+  | 'dictionaryReleaseMetadata'
+  | 'checkpoint'
+  | 'trustedAcquisition'
+  | 'trustedCanonicalLineage'
+  | 'finalization'
+  | 'releaseGate'
 > {
   const manifest = trustedByProcessing.get(processing);
   if (manifest === undefined) throw new Error('fixture trusted acquisition');
@@ -1486,6 +1863,22 @@ function releaseControls(
     finalizer = new TestFinalizer();
     finalizerByProcessing.set(processing, finalizer);
   }
+  const trustedCanonicalLineage: BoundedTrustedCanonicalLineageResolver = Object.freeze({
+    verifyPropertyQueryFieldReference: ({
+      fieldName,
+      reference,
+    }: Parameters<
+      BoundedTrustedCanonicalLineageResolver['verifyPropertyQueryFieldReference']
+    >[0]) => {
+      const recordKey = `fixture-record:${fieldName}`;
+      return Promise.resolve(
+        reference.recordKey === recordKey &&
+          reference.recordSha256 === digest(`fixture-record:${recordKey}`) &&
+          reference.lineageSha256 === digest(`fixture-lineage:${fieldName}`) &&
+          canonicalJson(reference.fieldPaths) === canonicalJson([`/fixture/${fieldName}`]),
+      );
+    },
+  });
   return {
     dictionaryReleaseMetadata: Object.freeze({
       public: dictionaryMetadata('public', processing),
@@ -1501,6 +1894,7 @@ function releaseControls(
         loadVerified: () => Promise.resolve(manifest),
       }),
     }),
+    trustedCanonicalLineage,
     finalization: Object.freeze({ attemptId: 'fixture-attempt-a', coordinator: finalizer }),
     releaseGate: Object.freeze({
       sourceManifestSha256: processing.sourceManifestSha256,
@@ -1668,7 +2062,39 @@ function processingWithTrustedRunStatus(
   if (trusted === undefined) throw new Error('fixture trusted acquisition');
   const { manifestSha256: ignoredManifestSha256, ...trustedPayload } = trusted;
   void ignoredManifestSha256;
-  const changedPayload = { ...trustedPayload, runStatus };
+  const sources = trusted.sources.map((source, index) =>
+    index === 0 && runStatus !== 'succeeded'
+      ? {
+          ...source,
+          terminalState: runStatus === 'failed' ? ('failed' as const) : ('blocked' as const),
+          limitations: [`Fixture source makes the trusted run ${runStatus}.`],
+        }
+      : source,
+  );
+  const sourceMap = new Map<string, BoundedTrustedAcquiredSource>(
+    sources.map((source) => [source.sourceId, source]),
+  );
+  const capabilities = trusted.capabilities.map((capability) => {
+    const terminalStates = new Set(
+      capability.sourceIds.map((sourceId) => sourceMap.get(sourceId)?.terminalState),
+    );
+    const state = terminalStates.has('failed')
+      ? ('failed' as const)
+      : terminalStates.has('blocked')
+        ? ('blocked' as const)
+        : capability.state;
+    const value = {
+      ...capability,
+      state,
+      limitations:
+        state === 'succeeded' ? capability.limitations : [`Fixture capability is ${state}.`],
+    };
+    return {
+      ...value,
+      evidenceSha256: boundedTrustedCapabilityEvidenceSha256(value, sourceMap),
+    };
+  });
+  const changedPayload = { ...trustedPayload, runStatus, sources, capabilities };
   const changedTrusted = boundedTrustedAcquisitionManifestSchema.parse({
     ...changedPayload,
     manifestSha256: boundedTrustedAcquisitionManifestSha256(changedPayload),
@@ -1676,6 +2102,7 @@ function processingWithTrustedRunStatus(
   const sourceBound = {
     ...baseline,
     sourceManifestSha256: changedTrusted.manifestSha256,
+    capabilityStateSha256: boundedTrustedCapabilityStateSha256(changedTrusted),
   };
   const withLogicalIdentity = {
     ...sourceBound,

@@ -157,6 +157,70 @@ function trustedManifest(): BoundedTrustedAcquisitionManifest {
   });
 }
 
+describe('trusted source-state closure', () => {
+  it('preserves an artifact-less blocked lane but rejects artifact-less successful states', () => {
+    const baseline = trustedSource('source-blocked', 'cap-blocked');
+    const artifactless = {
+      ...baseline,
+      acquiredArtifacts: [],
+      sourceSha256: boundedTrustedSourceSha256([]),
+      schemaSha256: boundedTrustedSchemaSha256([]),
+      terminalState: 'blocked' as const,
+      limitations: ['Acquisition was blocked before any source bytes were received.'],
+    };
+
+    expect(boundedTrustedAcquiredSourceSchema.parse(artifactless)).toMatchObject({
+      terminalState: 'blocked',
+      acquiredArtifacts: [],
+    });
+    expect(() =>
+      boundedTrustedAcquiredSourceSchema.parse({
+        ...artifactless,
+        terminalState: 'succeeded',
+        limitations: [],
+      }),
+    ).toThrow('require acquired artifact evidence');
+    expect(() =>
+      boundedTrustedAcquiredSourceSchema.parse({ ...artifactless, terminalState: 'partial' }),
+    ).toThrow('require acquired artifact evidence');
+  });
+
+  it('derives run and capability state instead of accepting caller assertions', () => {
+    const manifest = trustedManifest();
+    const { manifestSha256: ignored, ...payload } = manifest;
+    void ignored;
+    const callerPartial = { ...payload, runStatus: 'partial' as const };
+    expect(() =>
+      boundedTrustedAcquisitionManifestSchema.parse({
+        ...callerPartial,
+        manifestSha256: boundedTrustedAcquisitionManifestSha256(callerPartial),
+      }),
+    ).toThrow('must be derived');
+
+    const sourceMap = new Map(manifest.sources.map((source) => [source.sourceId, source]));
+    const first = required(manifest.capabilities[0]);
+    const assertedBlocked = {
+      ...first,
+      state: 'blocked' as const,
+      limitations: ['Caller asserted.'],
+    };
+    const capabilities = [
+      {
+        ...assertedBlocked,
+        evidenceSha256: boundedTrustedCapabilityEvidenceSha256(assertedBlocked, sourceMap),
+      },
+      ...manifest.capabilities.slice(1),
+    ];
+    const callerCapability = { ...payload, capabilities };
+    expect(() =>
+      boundedTrustedAcquisitionManifestSchema.parse({
+        ...callerCapability,
+        manifestSha256: boundedTrustedAcquisitionManifestSha256(callerCapability),
+      }),
+    ).toThrow('must be derived');
+  });
+});
+
 function digest(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }

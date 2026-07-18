@@ -696,7 +696,6 @@ export const boundedTrustedAcquiredSourceSchema = z
     snapshotId: snapshotIdSchema,
     acquiredArtifacts: z
       .array(acquiredArtifactSchema)
-      .min(1)
       .max(BOUNDED_MAX_ACQUIRED_ARTIFACTS_PER_SOURCE),
     sourceSha256: sha256Schema,
     schemaSha256: sha256Schema,
@@ -712,6 +711,17 @@ export const boundedTrustedAcquiredSourceSchema = z
     permitAuthorityIds: canonicalUniqueStringsSchema(16),
   })
   .superRefine((source, context) => {
+    if (
+      source.acquiredArtifacts.length === 0 &&
+      source.terminalState !== 'blocked' &&
+      source.terminalState !== 'failed'
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['acquiredArtifacts'],
+        message: 'Succeeded or partial trusted sources require acquired artifact evidence',
+      });
+    }
     if (!snapshotBelongsToSource(source.snapshotId, source.sourceId)) {
       context.addIssue({
         code: 'custom',
@@ -903,6 +913,20 @@ export const boundedTrustedAcquisitionManifestSchema = z
     const sources = new Map<string, BoundedTrustedAcquiredSource>(
       manifest.sources.map((source) => [source.sourceId, source]),
     );
+    const derivedRunStatus = manifest.sources.some(
+      ({ terminalState }) => terminalState === 'failed',
+    )
+      ? 'failed'
+      : manifest.sources.every(({ terminalState }) => terminalState === 'succeeded')
+        ? 'succeeded'
+        : 'partial';
+    if (manifest.runStatus !== derivedRunStatus) {
+      context.addIssue({
+        code: 'custom',
+        path: ['runStatus'],
+        message: 'Trusted run status must be derived from every trusted source state',
+      });
+    }
     manifest.capabilities.forEach((capability, index) => {
       const declaredSourceIds = manifest.sources
         .filter((source) => source.capabilities.includes(capability.capability))
@@ -936,6 +960,28 @@ export const boundedTrustedAcquisitionManifestSchema = z
           code: 'custom',
           path: ['capabilities', index, 'state'],
           message: 'Succeeded capability requires a succeeded trusted source',
+        });
+      }
+      const terminalStates = new Set(
+        capability.sourceIds.map((sourceId) => sources.get(sourceId)?.terminalState),
+      );
+      const derivedCapabilityState =
+        capability.sourceIds.length === 0
+          ? 'not_configured'
+          : terminalStates.size > 1
+            ? 'partial'
+            : terminalStates.has('succeeded')
+              ? 'succeeded'
+              : terminalStates.has('partial')
+                ? 'partial'
+                : terminalStates.has('blocked')
+                  ? 'blocked'
+                  : 'failed';
+      if (capability.state !== derivedCapabilityState) {
+        context.addIssue({
+          code: 'custom',
+          path: ['capabilities', index, 'state'],
+          message: 'Trusted capability state must be derived from its complete source inventory',
         });
       }
       if (

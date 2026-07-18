@@ -48,6 +48,10 @@ const FAILED_SOURCE_ID = sourceIdSchema.parse('sc:source:test-failed-source');
 const FAILED_SNAPSHOT_ID = snapshotIdSchema.parse(
   `sc:snapshot:test-failed-source:${'2'.repeat(64)}`,
 );
+const BLOCKED_SOURCE_ID = sourceIdSchema.parse('sc:source:test-blocked-source');
+const BLOCKED_SNAPSHOT_ID = snapshotIdSchema.parse(
+  `sc:snapshot:test-blocked-source:${'4'.repeat(64)}`,
+);
 
 describe('bounded_streaming_v2 pipeline composition', () => {
   it('freezes Unicode, whitespace, locale, and address-number index normalization', () => {
@@ -95,6 +99,23 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       }),
       limitations: Object.freeze(['Fixture transfer source failed before acquisition.']),
       errorCodes: Object.freeze(['FIXTURE_ACQUISITION_FAILED']),
+    }) satisfies SourceExecutionManifest;
+    const blockedSource = Object.freeze({
+      ...sourceManifestFor(BLOCKED_SOURCE_ID, BLOCKED_SNAPSHOT_ID, 'ownership_transfers', 0),
+      supportState: 'blocked' as const,
+      terminalState: 'blocked' as const,
+      coverage: Object.freeze({
+        expectedRecords: 1,
+        observedRecords: 0,
+        acceptedRecords: 0,
+        quarantinedRecords: 0,
+        denominatorMethod: 'configured' as const,
+        ratio: 0,
+      }),
+      limitations: Object.freeze([
+        'Fixture transfer acquisition was blocked before bytes arrived.',
+      ]),
+      errorCodes: Object.freeze(['FIXTURE_ACQUISITION_BLOCKED']),
     }) satisfies SourceExecutionManifest;
     const trustedArtifact = await acquiredArtifact(artifactStore, SOURCE_ID, SNAPSHOT_ID);
     const configuration = {
@@ -154,7 +175,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
           artifacts: [trustedArtifact],
         },
       ],
-      sources: [source],
+      sources: [source, blockedSource],
       existing: { reconcileArtifact: null, featureArtifact: null, martArtifact: null },
       artifactStore,
       checkpointStore,
@@ -175,7 +196,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     await expect(
       createProcessor().processBoundedCounty?.({
         ...request,
-        sources: [source, failedSource],
+        sources: [source, blockedSource, failedSource],
       }),
     ).rejects.toThrow(FAILED_SOURCE_ID);
 
@@ -204,29 +225,50 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       createProcessor().processBoundedCounty?.({ ...request, artifactStore: corruptingStore }),
     ).rejects.toThrow('Acquired object bytes changed');
 
-    const runRoot = join(root, 'scratch', createHash('sha256').update(RUN_ID).digest('hex'));
-    await mkdir(runRoot, { recursive: true });
-    const leasePath = join(runRoot, 'bounded-run-lease.json');
+    await mkdir(join(root, 'output'), { recursive: true });
+    const leasePath = join(root, 'output', '.oracle-bounded-resource-lease.json');
+    const competingRunId = `sc:run:${'9'.repeat(64)}`;
     const leaseHolder = spawn(
       process.execPath,
       [
         '-e',
-        "const fs=require('node:fs');const path=process.argv[1];const record={format:'oracle-bounded-run-fence-v1',runId:process.argv[2],token:'a'.repeat(64),pid:process.pid};fs.writeFileSync(path,JSON.stringify(record)+'\\n');process.stdout.write('ready\\n');setInterval(()=>{},1000);",
+        "const fs=require('node:fs');const path=process.argv[1];const record={format:'oracle-bounded-resource-fence-v1',resourceIdentity:'b'.repeat(64),runId:process.argv[2],token:'a'.repeat(64),pid:process.pid};fs.writeFileSync(path,JSON.stringify(record)+'\\n');process.stdout.write('ready\\n');setInterval(()=>{},1000);",
         leasePath,
-        RUN_ID,
+        competingRunId,
       ],
       { stdio: ['ignore', 'pipe', 'pipe'] },
     );
     await once(leaseHolder.stdout, 'data');
     try {
       await expect(createProcessor().processBoundedCounty?.(request)).rejects.toThrow(
-        'already leased by process',
+        'Bounded resource is already leased by process',
       );
     } finally {
       leaseHolder.kill();
       await once(leaseHolder, 'exit');
     }
-    for (const point of crashPoints) {
+    const separateRoot = await mkdtemp(join(tmpdir(), 'oracle-bounded-separate-resource-'));
+    const separateLeasePath = join(separateRoot, '.oracle-bounded-resource-lease.json');
+    const separateLeaseHolder = spawn(
+      process.execPath,
+      [
+        '-e',
+        "const fs=require('node:fs');const path=process.argv[1];const record={format:'oracle-bounded-resource-fence-v1',resourceIdentity:'c'.repeat(64),runId:process.argv[2],token:'d'.repeat(64),pid:process.pid};fs.writeFileSync(path,JSON.stringify(record)+'\\n');process.stdout.write('ready\\n');setInterval(()=>{},1000);",
+        separateLeasePath,
+        competingRunId,
+      ],
+      { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
+    await once(separateLeaseHolder.stdout, 'data');
+    try {
+      await expect(createProcessor().processBoundedCounty?.(request)).rejects.toThrow(
+        `injected ${crashPoints[0]} crash`,
+      );
+    } finally {
+      separateLeaseHolder.kill();
+      await once(separateLeaseHolder, 'exit');
+    }
+    for (const point of crashPoints.slice(1)) {
       await expect(createProcessor().processBoundedCounty?.(request)).rejects.toThrow(
         `injected ${point} crash`,
       );
@@ -263,11 +305,26 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       runStatus: string;
       releaseScope: string;
       countyCompletionClaim: boolean;
+      sourceStates: readonly Readonly<{ sourceId: string; terminalState: string }>[];
+      capabilities: readonly Readonly<{
+        capability: string;
+        state: string;
+        sourceIds: readonly string[];
+      }>[];
     }>;
     expect(releaseEvidence).toMatchObject({
-      runStatus: 'succeeded',
+      runStatus: 'partial',
       releaseScope: 'partial_county',
       countyCompletionClaim: false,
+    });
+    expect(
+      releaseEvidence.sourceStates.find(({ sourceId }) => sourceId === BLOCKED_SOURCE_ID),
+    ).toMatchObject({ terminalState: 'blocked' });
+    expect(
+      releaseEvidence.capabilities.find(({ capability }) => capability === 'ownership_transfers'),
+    ).toMatchObject({
+      state: 'blocked',
+      sourceIds: [BLOCKED_SOURCE_ID],
     });
     const rowCount = (visibility: string, relation: string): number =>
       manifest.artifacts.find(
@@ -281,13 +338,79 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       ({ visibility, relation }) => visibility === 'public' && relation === 'pipeline_runs',
     );
     if (publicPipelineRun === undefined) throw new Error('public pipeline_runs is missing');
-    expect(publicPipelineRun.sourceLineage.map(({ sourceId }) => sourceId)).toEqual([SOURCE_ID]);
+    expect(publicPipelineRun.sourceLineage.map(({ sourceId }) => sourceId)).toEqual([
+      BLOCKED_SOURCE_ID,
+      SOURCE_ID,
+    ]);
     const pipelineRows = await readParquetRows(
       join(root, 'output', descriptor.releaseDirectory, publicPipelineRun.relativePath),
     );
     expect(pipelineRows).toHaveLength(1);
-    expect(pipelineRows[0]?.status).toBe('succeeded');
-    expect(JSON.parse(String(pipelineRows[0]?.source_ids_json))).toEqual([SOURCE_ID]);
+    expect(pipelineRows[0]?.status).toBe('partial');
+    expect(JSON.parse(String(pipelineRows[0]?.source_ids_json))).toEqual([
+      BLOCKED_SOURCE_ID,
+      SOURCE_ID,
+    ]);
+    const publicSourceCoverage = manifest.artifacts.find(
+      ({ visibility, relation }) => visibility === 'public' && relation === 'source_coverage',
+    );
+    if (publicSourceCoverage === undefined) throw new Error('public source_coverage is missing');
+    const sourceCoverageRows = await readParquetRows(
+      join(root, 'output', descriptor.releaseDirectory, publicSourceCoverage.relativePath),
+    );
+    expect(
+      sourceCoverageRows.find(({ source_id: sourceId }) => sourceId === BLOCKED_SOURCE_ID),
+    ).toMatchObject({
+      support_class: 'unsupported',
+      observed_count: 0n,
+      quarantine_count: 0n,
+    });
+    const publicPropertyQuery = manifest.artifacts.find(
+      ({ visibility, relation }) => visibility === 'public' && relation === 'property_query',
+    );
+    if (publicPropertyQuery === undefined) throw new Error('public property_query is missing');
+    const propertyRows = await readParquetRows(
+      join(root, 'output', descriptor.releaseDirectory, publicPropertyQuery.relativePath),
+    );
+    expect(JSON.parse(String(propertyRows[0]?.source_ids_json))).toEqual([SOURCE_ID]);
+    expect(propertyRows[0]?.last_exchange_date).toBeNull();
+    const fieldSources = JSON.parse(
+      String(propertyRows[0]?.field_source_ids_json),
+    ) as readonly Readonly<{
+      field_name: string;
+      source_ids: readonly string[];
+      source_references: readonly Readonly<{
+        recordSha256: string;
+        lineageSha256: string;
+      }>[];
+    }>[];
+    const fieldSourceIds = Object.fromEntries(
+      fieldSources.map(({ field_name: fieldName, source_ids: sourceIds }) => [
+        fieldName,
+        sourceIds,
+      ]),
+    );
+    expect(fieldSourceIds).toMatchObject({
+      property_id: [SOURCE_ID],
+      parcel_identifier: [SOURCE_ID],
+      address_street: [],
+      address_zip: [],
+      latitude: [],
+      longitude: [],
+      last_exchange_date: [],
+    });
+    expect(
+      fieldSources
+        .flatMap(({ source_references: sourceReferences }) => sourceReferences)
+        .every(
+          ({ recordSha256, lineageSha256 }) =>
+            /^[a-f0-9]{64}$/u.test(recordSha256) && /^[a-f0-9]{64}$/u.test(lineageSha256),
+        ),
+    ).toBe(true);
+    expect(
+      fieldSources.find(({ field_name: fieldName }) => fieldName === 'property_id')
+        ?.source_references,
+    ).toHaveLength(1);
     const durable = await checkpointStore.load(`bounded-processing:${RUN_ID}`);
     const checkpoint = durable?.payload as
       | Readonly<{

@@ -6,8 +6,10 @@ import { DuckDBInstance, type DuckDBConnection } from '@duckdb/node-api';
 
 import { readArtifactRange, type BuiltServingArtifact } from './builder.js';
 import {
+  BOUNDED_SERVING_RELATIONS,
   PUBLIC_PROHIBITED_COLUMN_PATTERN,
   SERVING_RELATIONS,
+  type ServingRelationDefinition,
   type ServingVisibility,
 } from './schema.js';
 
@@ -125,7 +127,7 @@ async function assertDuckDbSchema(
 }
 
 function assertArtifactContract(artifact: BuiltServingArtifact): void {
-  const definition = SERVING_RELATIONS[artifact.relation];
+  const definition = artifactDefinition(artifact);
   const expectedPath = `${artifact.visibility}/${definition.fileName}`;
   if (artifact.relativePath !== expectedPath) {
     throw new ArtifactVisibilityError(
@@ -202,7 +204,7 @@ async function assertDuckDbGrain(
   path: string,
   artifact: BuiltServingArtifact,
 ): Promise<void> {
-  const definition = SERVING_RELATIONS[artifact.relation];
+  const definition = artifactDefinition(artifact);
   const keys = definition.uniqueColumns.map(quoteIdentifier).join(', ');
   const nullPredicate = definition.uniqueColumns
     .map((column) => `${quoteIdentifier(column)} IS NULL`)
@@ -229,6 +231,22 @@ async function assertDuckDbGrain(
       `${artifact.relativePath} has ${nullKeys} null and ${duplicateKeys} duplicate grain keys`,
     );
   }
+}
+
+/**
+ * Portable releases remain readable under the frozen legacy schema, while the
+ * bounded county processor emits an additive property-query provenance schema.
+ * Select only one of those two exact contracts from manifest metadata; never
+ * accept an arbitrary additive or reordered schema.
+ */
+function artifactDefinition(artifact: BuiltServingArtifact): ServingRelationDefinition {
+  const legacy = SERVING_RELATIONS[artifact.relation];
+  if (stableJson(artifact.columns) === stableJson(legacy.columns)) return legacy;
+  const bounded = BOUNDED_SERVING_RELATIONS[artifact.relation];
+  if (stableJson(artifact.columns) === stableJson(bounded.columns)) return bounded;
+  throw new ArtifactSchemaDriftError(
+    `${artifact.relativePath} metadata drifted from every supported serving contract`,
+  );
 }
 
 function resolveInside(root: string, relativePath: string): string {

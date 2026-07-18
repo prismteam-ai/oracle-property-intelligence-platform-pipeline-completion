@@ -35,8 +35,8 @@ import {
 import { evidenceSourceReferenceSchema } from '@oracle/contracts/evidence';
 
 import {
+  BOUNDED_SERVING_RELATIONS,
   PUBLIC_PROHIBITED_COLUMN_PATTERN,
-  SERVING_RELATIONS,
   type ServingColumn,
   type ServingRelationDefinition,
   type ServingRelationName,
@@ -138,6 +138,22 @@ export const BOUNDED_COUNTY_OUTPUT_RELATIONS = Object.freeze([
 
 type InputRelationName = (typeof BOUNDED_COUNTY_SERVING_RELATIONS)[number];
 
+export type BoundedPropertyQuerySourceReference = Readonly<
+  ReturnType<typeof evidenceSourceReferenceSchema.parse> & {
+    recordSha256: string;
+    lineageSha256: string;
+  }
+>;
+
+export interface BoundedTrustedCanonicalLineageResolver {
+  verifyPropertyQueryFieldReference(input: {
+    readonly propertyId: string;
+    readonly fieldName: string;
+    readonly fieldValue: ServingRow[string];
+    readonly reference: BoundedPropertyQuerySourceReference;
+  }): Promise<boolean>;
+}
+
 export type BoundedServingRelationInput = Readonly<{
   visibility: ServingVisibility;
   relation: InputRelationName;
@@ -179,6 +195,7 @@ export type BoundedServingReleaseBuildInput = Readonly<{
     reference: BoundedTrustedAcquisitionReference;
     resolver: BoundedTrustedAcquisitionResolver;
   }>;
+  trustedCanonicalLineage: BoundedTrustedCanonicalLineageResolver;
   finalization: Readonly<{
     attemptId: string;
     coordinator: BoundedReleaseFinalizationCoordinator;
@@ -551,6 +568,7 @@ export async function buildBoundedServingRelease(
             source,
             completedBuildMarts: input.completedBuildMarts,
             trusted,
+            trustedCanonicalLineage: input.trustedCanonicalLineage,
             processing: input.processing,
             maximumLineBytes: input.maximumLineBytes,
             writeBatchRecords: input.writeBatchRecords,
@@ -609,7 +627,7 @@ export async function buildBoundedServingRelease(
   }
   const portableArtifacts = Object.freeze(
     artifacts.map((artifact): BoundedPortableReleaseArtifact => {
-      const definition = SERVING_RELATIONS[artifact.relation];
+      const definition = BOUNDED_SERVING_RELATIONS[artifact.relation];
       const metadata =
         artifact.relation === 'data_dictionary'
           ? input.dictionaryReleaseMetadata[artifact.visibility]
@@ -858,6 +876,7 @@ async function buildOrAdoptRelation(
     source: BoundedServingRelationInput;
     completedBuildMarts: BoundedServingReleaseBuildInput['completedBuildMarts'];
     trusted: BoundedTrustedAcquisitionManifest;
+    trustedCanonicalLineage: BoundedTrustedCanonicalLineageResolver;
     processing: BoundedProcessingInput;
     maximumLineBytes: number;
     writeBatchRecords: number;
@@ -866,7 +885,7 @@ async function buildOrAdoptRelation(
     telemetry: ServingBudgetTelemetry;
   }>,
 ): Promise<BuildCheckpointArtifact> {
-  const definition = SERVING_RELATIONS[input.source.relation];
+  const definition = BOUNDED_SERVING_RELATIONS[input.source.relation];
   const relativePath = `${input.source.visibility}/${definition.fileName}`;
   const output = confinedPath(input.staging, relativePath);
   if (await pathExists(output)) {
@@ -893,7 +912,11 @@ async function buildOrAdoptRelation(
   let previousSortKey: string | undefined;
   const logicalHash = createHash('sha256');
   const inventory = new ArtifactInventoryVerifier(input.source);
-  const contributors = new RelationContributorVerifier(input.source, input.trusted);
+  const contributors = new RelationContributorVerifier(
+    input.source,
+    input.trusted,
+    input.trustedCanonicalLineage,
+  );
   const batchReleases: (() => void)[] = [];
   const releaseBatch = (): void => {
     appender.flushSync();
@@ -927,7 +950,7 @@ async function buildOrAdoptRelation(
           input.publicHashes,
           input.restrictedHashes,
         );
-        contributors.observe(row);
+        await contributors.observe(row);
         records += 1;
         sinceFlush += 1;
         if (sinceFlush >= input.writeBatchRecords) releaseBatch();
@@ -963,6 +986,7 @@ async function verifyInputRelation(
     source: BoundedServingRelationInput;
     completedBuildMarts: BoundedServingReleaseBuildInput['completedBuildMarts'];
     trusted: BoundedTrustedAcquisitionManifest;
+    trustedCanonicalLineage: BoundedTrustedCanonicalLineageResolver;
     processing: BoundedProcessingInput;
     maximumLineBytes: number;
     publicHashes: DuckDBAppender;
@@ -973,7 +997,11 @@ async function verifyInputRelation(
 ): Promise<void> {
   const logicalHash = createHash('sha256');
   const inventory = new ArtifactInventoryVerifier(input.source);
-  const contributors = new RelationContributorVerifier(input.source, input.trusted);
+  const contributors = new RelationContributorVerifier(
+    input.source,
+    input.trusted,
+    input.trustedCanonicalLineage,
+  );
   let records = 0;
   let previousSortKey: string | undefined;
   for await (const artifact of exactRelationArtifacts(input.source, input.completedBuildMarts)) {
@@ -993,7 +1021,7 @@ async function verifyInputRelation(
       previousSortKey = sortKey;
       logicalHash.update(`${canonicalJson(row)}\n`);
       appendPrivacyHashes(row, input.source.visibility, input.publicHashes, input.restrictedHashes);
-      contributors.observe(row);
+      await contributors.observe(row);
       input.publicHashes.flushSync();
       input.restrictedHashes.flushSync();
       records += 1;
@@ -1019,7 +1047,7 @@ async function buildOrAdoptDictionary(
     releaseMetadata: BoundedServingReleaseMetadata;
   }>,
 ): Promise<BuildCheckpointArtifact> {
-  const definition = SERVING_RELATIONS.data_dictionary;
+  const definition = BOUNDED_SERVING_RELATIONS.data_dictionary;
   const relativePath = `${input.visibility}/${definition.fileName}`;
   const output = confinedPath(input.staging, relativePath);
   const rows = dictionaryRowCount();
@@ -1043,7 +1071,7 @@ async function buildOrAdoptDictionary(
   const appender = await input.connection.createAppender(table);
   try {
     for (const relation of BOUNDED_COUNTY_OUTPUT_RELATIONS) {
-      const relationDefinition = SERVING_RELATIONS[relation];
+      const relationDefinition = BOUNDED_SERVING_RELATIONS[relation];
       for (const [index, column] of relationDefinition.columns.entries()) {
         const row = {
           relation_name: relation,
@@ -1129,7 +1157,7 @@ async function buildCatalog(
       if (artifact === undefined) throw new BoundedRelationInventoryError();
       const path = confinedPath(staging, artifact.relativePath);
       await connection.run(
-        `CREATE TABLE ${quoteIdentifier(relation)} AS SELECT * FROM read_parquet(${sqlLiteral(path)}) ORDER BY ${sortSql(SERVING_RELATIONS[relation])}`,
+        `CREATE TABLE ${quoteIdentifier(relation)} AS SELECT * FROM read_parquet(${sqlLiteral(path)}) ORDER BY ${sortSql(BOUNDED_SERVING_RELATIONS[relation])}`,
       );
     }
     await connection.run('CHECKPOINT');
@@ -1169,7 +1197,7 @@ async function verifyCatalog(
         (candidate) => candidate.visibility === visibility && candidate.relation === relation,
       );
       if (artifact === undefined) throw new BoundedRelationInventoryError();
-      await verifySchemaStream(connection, relation, SERVING_RELATIONS[relation]);
+      await verifySchemaStream(connection, relation, BOUNDED_SERVING_RELATIONS[relation]);
       const count = await scalarBigInt(
         connection,
         `SELECT count(*)::BIGINT AS value FROM ${quoteIdentifier(relation)}`,
@@ -1264,7 +1292,7 @@ async function verifyParquetArtifact(
   path: string,
   artifact: BoundedPortableReleaseArtifact,
 ): Promise<void> {
-  const definition = SERVING_RELATIONS[artifact.relation];
+  const definition = BOUNDED_SERVING_RELATIONS[artifact.relation];
   if (schemaSha256(definition) !== artifact.schemaSha256) {
     throw new BoundedReleaseCorruptionError(artifact.relativePath);
   }
@@ -1649,7 +1677,7 @@ function assertInputArtifact(
     artifact.generationId !== processing.generationId ||
     artifact.stage !== 'build_marts' ||
     artifact.dataset !== `${source.visibility}/${source.relation}` ||
-    artifact.schemaSha256 !== schemaSha256(SERVING_RELATIONS[source.relation]) ||
+    artifact.schemaSha256 !== schemaSha256(BOUNDED_SERVING_RELATIONS[source.relation]) ||
     (expectedVisibility === 'public'
       ? artifact.visibility !== 'public'
       : artifact.visibility !== 'restricted' && artifact.visibility !== 'prohibited_public')
@@ -1667,18 +1695,22 @@ async function loadTrustedAcquisition(
   const manifest = boundedTrustedAcquisitionManifestSchema.parse(
     await input.trustedAcquisition.resolver.loadVerified(reference),
   );
-  const processingSnapshots = input.processing.mutationLog.sources.map(
-    ({ sourceId, snapshotId }) => `${sourceId}\0${snapshotId}`,
+  const processingSnapshots = new Set(
+    input.processing.mutationLog.sources.map(
+      ({ sourceId, snapshotId }) => `${sourceId}\0${snapshotId}`,
+    ),
   );
-  const trustedSnapshots = manifest.sources.map(
-    ({ sourceId, snapshotId }) => `${sourceId}\0${snapshotId}`,
+  const trustedSnapshots = new Set(
+    manifest.sources.map(({ sourceId, snapshotId }) => `${sourceId}\0${snapshotId}`),
   );
   if (
     reference.manifestSha256 !== manifest.manifestSha256 ||
     manifest.manifestSha256 !== input.processing.sourceManifestSha256 ||
     boundedTrustedCapabilityStateSha256(manifest) !== input.processing.capabilityStateSha256 ||
     manifest.runId !== input.processing.runId ||
-    canonicalJson(processingSnapshots) !== canonicalJson(trustedSnapshots)
+    processingSnapshots.size !== input.processing.mutationLog.sources.length ||
+    trustedSnapshots.size !== manifest.sources.length ||
+    [...processingSnapshots].some((identity) => !trustedSnapshots.has(identity))
   ) {
     throw new BoundedReleaseGateError(
       'Processing input is not bound to the verified acquisition manifest',
@@ -1689,6 +1721,7 @@ async function loadTrustedAcquisition(
 
 function assertReleaseInputBounds(input: BoundedServingReleaseBuildInput): void {
   const sharedBudget = input.sharedBudget as unknown;
+  const trustedCanonicalLineage = input.trustedCanonicalLineage as unknown;
   if (
     sharedBudget === null ||
     typeof sharedBudget !== 'object' ||
@@ -1697,6 +1730,14 @@ function assertReleaseInputBounds(input: BoundedServingReleaseBuildInput): void 
     typeof (sharedBudget as ProcessWideServingBudgetCoordinator).snapshot !== 'function'
   ) {
     throw new BoundedBuildConfigurationError('explicit shared process budget coordinator');
+  }
+  if (
+    trustedCanonicalLineage === null ||
+    typeof trustedCanonicalLineage !== 'object' ||
+    typeof (trustedCanonicalLineage as BoundedTrustedCanonicalLineageResolver)
+      .verifyPropertyQueryFieldReference !== 'function'
+  ) {
+    throw new BoundedBuildConfigurationError('trusted canonical lineage resolver');
   }
   if (input.relations.length !== 12) throw new BoundedRelationInventoryError();
   const assertMetadata = (metadata: BoundedServingReleaseMetadata): void => {
@@ -1886,18 +1927,13 @@ function validateBuildInput(
           `${visibility}/${relation} build_marts membership root`,
         );
       }
-      validateReleaseMetadata(metadata, visibility, input.processing, trusted);
+      validateReleaseMetadata(metadata, visibility, trusted);
       for (const { sourceId, snapshotId } of metadata.sourceLineage) {
         manifestSourceIds.add(sourceId);
         if (visibility === 'public') publicLineage.add(`${sourceId}\0${snapshotId}`);
       }
     }
-    validateReleaseMetadata(
-      input.dictionaryReleaseMetadata[visibility],
-      visibility,
-      input.processing,
-      trusted,
-    );
+    validateReleaseMetadata(input.dictionaryReleaseMetadata[visibility], visibility, trusted);
     for (const { sourceId, snapshotId } of input.dictionaryReleaseMetadata[visibility]
       .sourceLineage) {
       manifestSourceIds.add(sourceId);
@@ -2106,10 +2142,13 @@ class RelationContributorVerifier {
   public constructor(
     private readonly source: BoundedServingRelationInput,
     trusted: BoundedTrustedAcquisitionManifest,
+    private readonly trustedCanonicalLineage: BoundedTrustedCanonicalLineageResolver,
   ) {
     this.allowed = new Set(source.releaseMetadata.sourceLineage.map(({ sourceId }) => sourceId));
     for (const value of trusted.sources) this.trusted.set(value.sourceId, value);
-    const columns = new Set(SERVING_RELATIONS[source.relation].columns.map(({ name }) => name));
+    const columns = new Set(
+      BOUNDED_SERVING_RELATIONS[source.relation].columns.map(({ name }) => name),
+    );
     const expectedRule = columns.has('source_references_json')
       ? 'source_ids_and_references_exact'
       : columns.has('source_ids_json')
@@ -2136,7 +2175,7 @@ class RelationContributorVerifier {
     this.exactRowLineage = expectedRule !== 'trusted_relation_metadata';
   }
 
-  public observe(row: ServingRow): void {
+  public async observe(row: ServingRow): Promise<void> {
     const sourceIds = row.source_ids_json;
     let parsedSourceIds: readonly string[] | null = null;
     if (typeof sourceIds === 'string') {
@@ -2145,6 +2184,9 @@ class RelationContributorVerifier {
         throw new BoundedReleaseMetadataError('source_ids_json exceeds the source bound');
       }
       parsedSourceIds = parsed;
+      if (this.source.relation === 'property_query') {
+        await this.observePropertyQueryFields(row, parsed);
+      }
       const references = row.source_references_json;
       if (this.source.rowLineageRule.kind === 'source_ids_and_references_exact') {
         if (typeof references !== 'string') {
@@ -2156,18 +2198,8 @@ class RelationContributorVerifier {
         }
         const referenceSourceIds: string[] = [];
         for (const rawReference of rawReferences) {
-          const reference = evidenceSourceReferenceSchema.parse(rawReference);
-          const acquired = this.trusted.get(reference.sourceId);
-          if (
-            acquired?.snapshotId !== reference.snapshotId ||
-            !acquired.acquiredArtifacts.some(
-              ({ artifactId }) => artifactId === reference.artifactId,
-            )
-          ) {
-            throw new BoundedReleaseMetadataError(
-              `Row reference ${reference.sourceId} is not trusted acquired evidence`,
-            );
-          }
+          const reference = parseEvidenceSourceReference(rawReference, 'source_references_json');
+          this.observeTrustedReference(reference);
           referenceSourceIds.push(reference.sourceId);
         }
         if (
@@ -2212,6 +2244,122 @@ class RelationContributorVerifier {
       );
     }
     this.observed.add(sourceId);
+  }
+
+  private observeTrustedReference(
+    reference: ReturnType<typeof evidenceSourceReferenceSchema.parse>,
+  ): void {
+    const acquired = this.trusted.get(reference.sourceId);
+    if (
+      acquired?.snapshotId !== reference.snapshotId ||
+      !acquired.acquiredArtifacts.some(({ artifactId }) => artifactId === reference.artifactId)
+    ) {
+      throw new BoundedReleaseMetadataError(
+        `Row reference ${reference.sourceId} is not trusted acquired evidence`,
+      );
+    }
+    this.observeSourceId(reference.sourceId);
+  }
+
+  private async observePropertyQueryFields(
+    row: ServingRow,
+    rowSourceIds: readonly string[],
+  ): Promise<void> {
+    const encoded = row.field_source_ids_json;
+    if (typeof encoded !== 'string') {
+      throw new BoundedReleaseMetadataError(
+        'property_query requires exact field_source_ids_json provenance',
+      );
+    }
+    const fieldSources = parseCanonicalFieldSourceIds(encoded);
+    const expectedFields = BOUNDED_SERVING_RELATIONS.property_query.columns
+      .map(({ name }) => name)
+      .filter((name) => name !== 'source_ids_json' && name !== 'field_source_ids_json');
+    const actualFields = Object.keys(fieldSources).sort(compareUtf8);
+    const canonicalExpected = [...expectedFields].sort(compareUtf8);
+    if (
+      actualFields.length !== canonicalExpected.length ||
+      actualFields.some((name, index) => name !== canonicalExpected[index])
+    ) {
+      throw new BoundedReleaseMetadataError(
+        'property_query field provenance does not cover the exact serving schema',
+      );
+    }
+    const baseFields = new Set([
+      'property_id',
+      'parcel_identifier',
+      'address_street',
+      'address_city',
+      'address_zip',
+      'latitude',
+      'longitude',
+    ]);
+    const propertyId = row.property_id;
+    if (typeof propertyId !== 'string' || propertyId.trim().length === 0) {
+      throw new BoundedReleaseMetadataError('property_query property_id is required');
+    }
+    const union: string[] = [];
+    for (const fieldName of expectedFields) {
+      const provenance = fieldSources[fieldName];
+      if (provenance === undefined) {
+        throw new BoundedReleaseMetadataError(
+          `property_query field ${fieldName} is missing exact provenance`,
+        );
+      }
+      const sources = provenance.sourceIds;
+      const references = provenance.sourceReferences;
+      if (
+        baseFields.has(fieldName) &&
+        ((row[fieldName] === null && sources.length !== 0) ||
+          (row[fieldName] !== null && sources.length === 0))
+      ) {
+        throw new BoundedReleaseMetadataError(
+          `property_query base field ${fieldName} has inexact provenance`,
+        );
+      }
+      const fieldValue = row[fieldName];
+      if (fieldValue === undefined) {
+        throw new BoundedReleaseMetadataError(`property_query field ${fieldName} is absent`);
+      }
+      const referenceSourceIds: string[] = [];
+      for (const reference of references) {
+        this.observeTrustedReference(reference);
+        if (
+          !(await this.trustedCanonicalLineage.verifyPropertyQueryFieldReference({
+            propertyId,
+            fieldName,
+            fieldValue,
+            reference,
+          }))
+        ) {
+          throw new BoundedReleaseMetadataError(
+            `property_query field ${fieldName} reference is not trusted canonical lineage`,
+          );
+        }
+        referenceSourceIds.push(reference.sourceId);
+      }
+      if (canonicalJson(sortedUnique(referenceSourceIds)) !== canonicalJson(sources)) {
+        throw new BoundedReleaseMetadataError(
+          `property_query field ${fieldName} source IDs differ from exact references`,
+        );
+      }
+      const expectedLineageSha256 = propertyQueryFieldLineageSha256(
+        fieldName,
+        fieldValue,
+        references,
+      );
+      if (provenance.fieldLineageSha256 !== expectedLineageSha256) {
+        throw new BoundedReleaseMetadataError(
+          `property_query field ${fieldName} lineage is not bound to its value and references`,
+        );
+      }
+      union.push(...sources);
+    }
+    if (canonicalJson(sortedUnique(union)) !== canonicalJson(rowSourceIds)) {
+      throw new BoundedReleaseMetadataError(
+        'property_query row contributors differ from exact field provenance',
+      );
+    }
   }
 }
 
@@ -2331,7 +2479,7 @@ function assertManifestShape(
     manifestSourceIds.size !== manifest.sourceIds.length ||
     manifest.sourceIds.some((sourceId) => !manifestSourceIds.has(sourceId)) ||
     manifest.artifacts.some((artifact) => {
-      const definition = SERVING_RELATIONS[artifact.relation];
+      const definition = BOUNDED_SERVING_RELATIONS[artifact.relation];
       return (
         artifact.grain !== definition.grain ||
         canonicalJson(artifact.columns) !== canonicalJson(definition.columns) ||
@@ -2467,11 +2615,11 @@ function artifactPath(artifact: ImmutableBoundedArtifact): string {
 }
 
 export function boundedServingSchemaSha256(relation: InputRelationName): string {
-  return schemaSha256(SERVING_RELATIONS[relation]);
+  return schemaSha256(BOUNDED_SERVING_RELATIONS[relation]);
 }
 
 export function boundedServingRowSortKey(relation: InputRelationName, row: ServingRow): string {
-  return rowSortKey(SERVING_RELATIONS[relation], row);
+  return rowSortKey(BOUNDED_SERVING_RELATIONS[relation], row);
 }
 
 function schemaSha256(definition: ServingRelationDefinition): string {
@@ -2488,7 +2636,7 @@ function valueHash(value: string): string {
 
 function dictionaryRowCount(): number {
   return BOUNDED_COUNTY_OUTPUT_RELATIONS.reduce(
-    (total, relation) => total + SERVING_RELATIONS[relation].columns.length,
+    (total, relation) => total + BOUNDED_SERVING_RELATIONS[relation].columns.length,
     0,
   );
 }
@@ -2546,19 +2694,15 @@ export function boundedServingLicenseDecisionSha256(
 function validateReleaseMetadata(
   metadata: BoundedServingReleaseMetadata,
   visibility: ServingVisibility,
-  processing: BoundedProcessingInput,
   trusted: BoundedTrustedAcquisitionManifest,
 ): void {
-  const processingSnapshots = new Set(
-    processing.mutationLog.sources.map(({ sourceId, snapshotId }) => `${sourceId}\0${snapshotId}`),
-  );
   const identities = new Set<string>();
   const trustedSources = new Map<string, BoundedTrustedAcquisitionManifest['sources'][number]>(
     trusted.sources.map((source) => [source.sourceId, source]),
   );
   for (const source of metadata.sourceLineage) {
     const identity = `${source.sourceId}\0${source.snapshotId}`;
-    if (identities.has(identity) || !processingSnapshots.has(identity)) {
+    if (identities.has(identity) || !trustedSources.has(source.sourceId)) {
       throw new BoundedReleaseMetadataError('lineage source/snapshot mismatch');
     }
     identities.add(identity);
@@ -2655,13 +2799,12 @@ function validateReleaseGate(
     gate.sourceStates.map(({ sourceId, snapshotId }) => `${sourceId}\0${snapshotId}`),
   );
   if (
-    gate.sourceStates.length !== processingSnapshots.size ||
     gateSnapshots.size !== gate.sourceStates.length ||
+    [...processingSnapshots].some((identity) => !gateSnapshots.has(identity)) ||
     gate.sourceStates.some(
-      ({ sourceId, snapshotId, terminalState, permissionState, limitations }) =>
-        !processingSnapshots.has(`${sourceId}\0${snapshotId}`) ||
-        ((terminalState !== 'succeeded' || permissionState !== 'allowed') &&
-          limitations.length === 0),
+      ({ terminalState, permissionState, limitations }) =>
+        (terminalState !== 'succeeded' || permissionState !== 'allowed') &&
+        limitations.length === 0,
     ) ||
     gate.capabilities.some(
       ({ state, limitations, sourceIds }) =>
@@ -2761,6 +2904,161 @@ function parseCanonicalStringArray(value: string, label: string): readonly strin
     throw new BoundedReleaseMetadataError(`${label} must be a canonical string set`);
   }
   return parsed as string[];
+}
+
+type PropertyQueryFieldProvenance = Readonly<{
+  sourceIds: readonly string[];
+  sourceReferences: readonly BoundedPropertyQuerySourceReference[];
+  fieldLineageSha256: string;
+}>;
+
+function parseCanonicalFieldSourceIds(
+  value: string,
+): Readonly<Record<string, PropertyQueryFieldProvenance>> {
+  const parsed = parseCanonicalJsonArray(value, 'field_source_ids_json');
+  const entries: [string, PropertyQueryFieldProvenance][] = [];
+  let previous: string | null = null;
+  for (const item of parsed) {
+    if (item === null || typeof item !== 'object' || Array.isArray(item)) {
+      throw new BoundedReleaseMetadataError('field_source_ids_json entry is not an object');
+    }
+    const record = item as Readonly<Record<string, unknown>>;
+    const keys = Object.keys(record).sort(compareUtf8);
+    const expectedKeys = [
+      'field_lineage_sha256',
+      'field_name',
+      'source_ids',
+      'source_references',
+    ].sort(compareUtf8);
+    if (
+      canonicalJson(keys) !== canonicalJson(expectedKeys) ||
+      typeof record.field_name !== 'string' ||
+      record.field_name.trim().length === 0 ||
+      typeof record.field_lineage_sha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/u.test(record.field_lineage_sha256) ||
+      (previous !== null && compareUtf8(previous, record.field_name) >= 0)
+    ) {
+      throw new BoundedReleaseMetadataError(
+        'field_source_ids_json entries must be exact, ordered, and unique',
+      );
+    }
+    const sourceIds = parseCanonicalStringArray(
+      canonicalJson(record.source_ids),
+      `field_source_ids_json.${record.field_name}`,
+    );
+    if (!Array.isArray(record.source_references) || record.source_references.length > 64) {
+      throw new BoundedReleaseMetadataError(
+        `field_source_ids_json.${record.field_name} references exceed the exact bound`,
+      );
+    }
+    const sourceReferences = record.source_references.map((reference) =>
+      parsePropertyQuerySourceReference(
+        reference,
+        `field_source_ids_json.${record.field_name}.source_references`,
+      ),
+    );
+    const canonicalReferences = [...sourceReferences].sort((left, right) =>
+      compareUtf8(canonicalJson(left), canonicalJson(right)),
+    );
+    if (
+      canonicalJson(canonicalReferences) !== canonicalJson(record.source_references) ||
+      new Set(canonicalReferences.map((reference) => canonicalJson(reference))).size !==
+        canonicalReferences.length
+    ) {
+      throw new BoundedReleaseMetadataError(
+        `field_source_ids_json.${record.field_name} references must be canonical and unique`,
+      );
+    }
+    previous = record.field_name;
+    entries.push([
+      record.field_name,
+      Object.freeze({
+        sourceIds,
+        sourceReferences: Object.freeze(sourceReferences),
+        fieldLineageSha256: record.field_lineage_sha256,
+      }),
+    ]);
+  }
+  return Object.freeze(Object.fromEntries(entries));
+}
+
+function parseEvidenceSourceReference(
+  value: unknown,
+  label: string,
+): ReturnType<typeof evidenceSourceReferenceSchema.parse> {
+  let reference: ReturnType<typeof evidenceSourceReferenceSchema.parse>;
+  try {
+    reference = evidenceSourceReferenceSchema.parse(value);
+  } catch {
+    throw new BoundedReleaseMetadataError(`${label} contains an invalid source reference`);
+  }
+  if (canonicalJson(reference.fieldPaths) !== canonicalJson(sortedUnique(reference.fieldPaths))) {
+    throw new BoundedReleaseMetadataError(`${label} field paths must be canonical and unique`);
+  }
+  return reference;
+}
+
+function parsePropertyQuerySourceReference(
+  value: unknown,
+  label: string,
+): BoundedPropertyQuerySourceReference {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new BoundedReleaseMetadataError(`${label} contains an invalid source reference`);
+  }
+  const record = value as Readonly<Record<string, unknown>>;
+  const expectedKeys = [
+    'artifactId',
+    'fieldPaths',
+    'lineageSha256',
+    'recordKey',
+    'recordSha256',
+    'snapshotId',
+    'sourceId',
+  ].sort(compareUtf8);
+  if (
+    canonicalJson(Object.keys(record).sort(compareUtf8)) !== canonicalJson(expectedKeys) ||
+    typeof record.recordSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/u.test(record.recordSha256) ||
+    typeof record.lineageSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/u.test(record.lineageSha256)
+  ) {
+    throw new BoundedReleaseMetadataError(`${label} omits trusted canonical lineage identity`);
+  }
+  const reference = parseEvidenceSourceReference(
+    {
+      sourceId: record.sourceId,
+      snapshotId: record.snapshotId,
+      artifactId: record.artifactId,
+      recordKey: record.recordKey,
+      fieldPaths: record.fieldPaths,
+    },
+    label,
+  );
+  return Object.freeze({
+    ...reference,
+    recordSha256: record.recordSha256,
+    lineageSha256: record.lineageSha256,
+  });
+}
+
+function propertyQueryFieldLineageSha256(
+  fieldName: string,
+  value: ServingRow[string] | undefined,
+  sourceReferences: readonly BoundedPropertyQuerySourceReference[],
+): string {
+  if (value === undefined) {
+    throw new BoundedReleaseMetadataError(`property_query field ${fieldName} is absent`);
+  }
+  return createHash('sha256')
+    .update(
+      `${canonicalJson({
+        contract: 'oracle-property-query-field-lineage-v1',
+        fieldName,
+        value,
+        sourceReferences,
+      })}\n`,
+    )
+    .digest('hex');
 }
 
 function assertExactFinalizationResult(

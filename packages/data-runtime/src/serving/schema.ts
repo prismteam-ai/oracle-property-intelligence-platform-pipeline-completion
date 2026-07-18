@@ -303,6 +303,35 @@ export const SERVING_RELATIONS: Readonly<Record<ServingRelationName, ServingRela
     }),
   });
 
+export const BOUNDED_PROPERTY_QUERY_PROVENANCE_COLUMNS: readonly ServingColumn[] = Object.freeze([
+  column(
+    'source_ids_json',
+    'VARCHAR',
+    false,
+    'Canonical exact union of source identifiers contributing to this serving row.',
+  ),
+  column(
+    'field_source_ids_json',
+    'VARCHAR',
+    false,
+    'Canonical field-to-source map with exact snapshot, artifact, record, and value-bound lineage.',
+  ),
+]);
+
+/** Additive bounded-release schema; the legacy portable relation remains wire-compatible. */
+export const BOUNDED_SERVING_RELATIONS: Readonly<
+  Record<ServingRelationName, ServingRelationDefinition>
+> = Object.freeze({
+  ...SERVING_RELATIONS,
+  property_query: Object.freeze({
+    ...SERVING_RELATIONS.property_query,
+    columns: Object.freeze([
+      ...SERVING_RELATIONS.property_query.columns,
+      ...BOUNDED_PROPERTY_QUERY_PROVENANCE_COLUMNS,
+    ]),
+  }),
+});
+
 export const PUBLIC_PROHIBITED_COLUMN_PATTERN =
   /(^|_)(owner_name|owners_text|mailing_address|grantor|grantee|email|phone|contact)(_|$)/iu;
 

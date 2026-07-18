@@ -63,6 +63,7 @@ import {
   type CanonicalEntity,
 } from '@oracle/contracts/canonical/mutation';
 import type { FieldObservation } from '@oracle/contracts/canonical/lineage';
+import type { EvidenceSourceReference } from '@oracle/contracts/evidence';
 import { reduceBoundedCanonicalPartition } from '@oracle/canonical-model/entities/bounded-reducer';
 import type {
   BoundedCanonicalPartitionSummary,
@@ -119,6 +120,8 @@ import {
   type BoundedServingRelationInput,
   type BoundedServingReleaseMetadata,
   type BoundedServingSourceLineage,
+  type BoundedPropertyQuerySourceReference,
+  type BoundedTrustedCanonicalLineageResolver,
   type BoundedReleaseFinalizationCoordinator,
   type BoundedReleaseFinalizationWinner,
 } from '@oracle/data-runtime/serving/bounded-release';
@@ -156,10 +159,16 @@ const FEATURE_BUNDLE_SCHEMA_SHA256 = sha256({
   projections: ['public', 'restricted'],
 });
 const PROCESS_BUDGETS = new Map<string, ProcessWideBoundedBudget>();
-let ACTIVE_PROCESS_RUN: string | null = null;
+const ACTIVE_PROCESS_RESOURCES = new Map<string, string>();
 
 type CountyFeatureKind = (typeof FEATURE_KINDS)[number];
 type CountyFeatureEvidence = InquiryResult<unknown>;
+type ExactEvidenceSourceReference = Readonly<
+  Omit<EvidenceSourceReference, 'fieldPaths'> &
+    Pick<BoundedPropertyQuerySourceReference, 'recordSha256' | 'lineageSha256'> & {
+      fieldPaths: readonly string[];
+    }
+>;
 type FeatureBundle = Readonly<{
   propertyId: string;
   publicEvidence: readonly CountyFeatureEvidence[];
@@ -218,9 +227,14 @@ export function createBoundedPipelineProcessors(
 ): PipelineProcessors {
   const outputRoot = resolve(options.outputDirectory);
   const scratchRoot = resolve(options.scratchDirectory ?? join(outputRoot, 'bounded-scratch'));
+  const resourceRoots = Object.freeze([...new Set([scratchRoot, outputRoot])].sort(compareUtf8));
+  const resourceIdentity = sha256({
+    format: 'oracle-bounded-resource-identity-v1',
+    roots: resourceRoots,
+  });
   const partitionCount = options.partitionCount ?? PARTITION_COUNT;
   const budget = options.budget ?? DEFAULT_BUDGET;
-  const sharedBudget = processGlobalBudget(budget);
+  const sharedBudget = processGlobalBudget(budget, resourceIdentity);
   if (!Number.isSafeInteger(partitionCount) || partitionCount < 12) {
     throw new RangeError('partitionCount must be a safe integer of at least 12');
   }
@@ -233,6 +247,8 @@ export function createBoundedPipelineProcessors(
         partitionCount,
         budget,
         sharedBudget,
+        resourceRoots,
+        resourceIdentity,
         ...(options.crash === undefined ? {} : { crash: options.crash }),
       }),
     reconcile: () => Promise.reject(new Error('bounded_streaming_v2 uses processBoundedCounty')),
@@ -248,6 +264,8 @@ type RuntimeOptions = Readonly<{
   partitionCount: number;
   budget: BoundedProcessingBudget;
   sharedBudget: ProcessWideBoundedBudget;
+  resourceRoots: readonly string[];
+  resourceIdentity: string;
   crash?: BoundedPipelineProcessorOptions['crash'];
 }>;
 
@@ -267,8 +285,9 @@ async function processBoundedCounty(
     );
   }
   request.signal.throwIfAborted();
-  const releaseProcessRun = acquireProcessRun(request.configuration.runId);
+  const releaseProcessRun = acquireProcessRun(options.resourceRoots, request.configuration.runId);
   try {
+    await Promise.all(options.resourceRoots.map((root) => mkdir(root, { recursive: true })));
     const confined = confinedRunRoot(options.scratchRoot, request.configuration.runId);
     await mkdir(confined, { recursive: true });
     const sharedBudget = options.sharedBudget;
@@ -279,7 +298,11 @@ async function processBoundedCounty(
         'Another bounded county worker holds the process budget',
       );
     }
-    const runLease = await acquireRunLease(confined, request.configuration.runId);
+    const runLease = await acquireRunLease(
+      options.resourceRoots,
+      request.configuration.runId,
+      options.resourceIdentity,
+    );
     try {
       const exactMutationLogicalSha256 = await computeExactMutationLogicalSha256(request);
       const trustedAcquisition = await materializeTrustedAcquisition(
@@ -476,26 +499,30 @@ async function processBoundedCounty(
   }
 }
 
-function acquireProcessRun(runId: string): () => void {
-  if (ACTIVE_PROCESS_RUN !== null) {
+function acquireProcessRun(resourceRoots: readonly string[], runId: string): () => void {
+  const conflict = resourceRoots.find((root) => ACTIVE_PROCESS_RESOURCES.has(root));
+  if (conflict !== undefined) {
     throw new BoundedPipelineIntegrityError(
-      `A bounded county invocation already owns the process budget: ${ACTIVE_PROCESS_RUN}`,
+      `A bounded county invocation already owns resource ${conflict}: ${ACTIVE_PROCESS_RESOURCES.get(conflict)}`,
     );
   }
-  ACTIVE_PROCESS_RUN = runId;
+  for (const root of resourceRoots) ACTIVE_PROCESS_RESOURCES.set(root, runId);
   let released = false;
   return () => {
     if (released) return;
-    if (ACTIVE_PROCESS_RUN !== runId) {
-      throw new BoundedPipelineIntegrityError('Process-wide bounded run fence changed');
+    if (resourceRoots.some((root) => ACTIVE_PROCESS_RESOURCES.get(root) !== runId)) {
+      throw new BoundedPipelineIntegrityError('Process-wide bounded resource fence changed');
     }
     released = true;
-    ACTIVE_PROCESS_RUN = null;
+    for (const root of resourceRoots) ACTIVE_PROCESS_RESOURCES.delete(root);
   };
 }
 
-function processGlobalBudget(policy: BoundedProcessingBudget): ProcessWideBoundedBudget {
-  const key = budgetPolicySha256(policy);
+function processGlobalBudget(
+  policy: BoundedProcessingBudget,
+  resourceIdentity: string,
+): ProcessWideBoundedBudget {
+  const key = `${resourceIdentity}\0${budgetPolicySha256(policy)}`;
   const existing = PROCESS_BUDGETS.get(key);
   if (existing !== undefined) return existing;
   const created = new ProcessWideBoundedBudget(policy);
@@ -527,15 +554,26 @@ function assertReleaseableSourceInventory(
     );
   }
   if (runStatus !== trusted.runStatus) {
-    const trustedIds = new Set(trusted.sources.map(({ sourceId }) => sourceId));
-    const unbound = sources
-      .filter(
-        ({ sourceId, terminalState }) => !trustedIds.has(sourceId) && terminalState !== 'complete',
-      )
-      .map(({ sourceId }) => sourceId)
-      .sort(compareUtf8);
     throw new BoundedPipelineIntegrityError(
-      `Serving runStatus cannot omit non-acquired source state: ${unbound.join(',')}`,
+      `Serving runStatus differs from the complete source-state inventory`,
+    );
+  }
+  const trustedStates = new Map(trusted.sources.map((source) => [source.sourceId, source]));
+  const unbound = sources
+    .filter((source) => {
+      const bound = trustedStates.get(source.sourceId);
+      return (
+        bound?.snapshotId !==
+          (source.snapshotIdentity.observedContentId ?? source.snapshotIdentity.intentId) ||
+        bound.terminalState !==
+          (source.terminalState === 'complete' ? 'succeeded' : source.terminalState)
+      );
+    })
+    .map(({ sourceId }) => sourceId)
+    .sort(compareUtf8);
+  if (trustedStates.size !== sources.length || unbound.length !== 0) {
+    throw new BoundedPipelineIntegrityError(
+      `Trusted acquisition omits complete source state: ${unbound.join(',')}`,
     );
   }
 }
@@ -574,17 +612,48 @@ type RunLease = Readonly<{
   release(): Promise<void>;
 }>;
 
-async function acquireRunLease(root: string, runId: string): Promise<RunLease> {
-  const path = confinedChild(root, 'bounded-run-lease.json');
+async function acquireRunLease(
+  resourceRoots: readonly string[],
+  runId: string,
+  resourceIdentity: string,
+): Promise<RunLease> {
   const token = randomBytes(32).toString('hex');
+  const releases: (() => Promise<void>)[] = [];
+  try {
+    for (const root of resourceRoots) {
+      releases.push(await acquireResourceLease(root, runId, resourceIdentity, token));
+    }
+  } catch (error) {
+    while (releases.length > 0) await releases.pop()?.();
+    throw error;
+  }
+  return Object.freeze({
+    token,
+    release: async () => {
+      while (releases.length > 0) await releases.pop()?.();
+    },
+  });
+}
+
+async function acquireResourceLease(
+  root: string,
+  runId: string,
+  resourceIdentity: string,
+  token: string,
+): Promise<() => Promise<void>> {
+  const path = confinedChild(root, '.oracle-bounded-resource-lease.json');
   const record = {
-    format: 'oracle-bounded-run-fence-v1' as const,
+    format: 'oracle-bounded-resource-fence-v1' as const,
+    resourceIdentity,
     runId,
     token,
     pid: process.pid,
   };
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    const candidatePath = confinedChild(root, `bounded-run-lease.candidate-${token}.json`);
+    const candidatePath = confinedChild(
+      root,
+      `.oracle-bounded-resource-lease.candidate-${token}.json`,
+    );
     try {
       const handle = await open(candidatePath, 'wx');
       try {
@@ -598,32 +667,31 @@ async function acquireRunLease(root: string, runId: string): Promise<RunLease> {
       } finally {
         await rm(candidatePath, { force: true });
       }
-      return Object.freeze({
-        token,
-        release: async () => {
-          let current: unknown;
+      return async () => {
+        let current: unknown;
+        try {
+          const handle = await open(path, 'r');
           try {
-            const handle = await open(path, 'r');
-            try {
-              current = JSON.parse(await handle.readFile({ encoding: 'utf8' })) as unknown;
-            } finally {
-              await handle.close();
-            }
-          } catch (error) {
-            if (isErrno(error, 'ENOENT')) return;
-            throw error;
+            current = JSON.parse(await handle.readFile({ encoding: 'utf8' })) as unknown;
+          } finally {
+            await handle.close();
           }
-          if (
-            current === null ||
-            typeof current !== 'object' ||
-            (current as { token?: unknown }).token !== token ||
-            (current as { pid?: unknown }).pid !== process.pid
-          ) {
-            throw new BoundedPipelineIntegrityError('Bounded run lease winner changed');
-          }
-          await rm(path, { force: true });
-        },
-      });
+        } catch (error) {
+          if (isErrno(error, 'ENOENT')) return;
+          throw error;
+        }
+        if (
+          current === null ||
+          typeof current !== 'object' ||
+          (current as { resourceIdentity?: unknown }).resourceIdentity !== resourceIdentity ||
+          (current as { runId?: unknown }).runId !== runId ||
+          (current as { token?: unknown }).token !== token ||
+          (current as { pid?: unknown }).pid !== process.pid
+        ) {
+          throw new BoundedPipelineIntegrityError('Bounded resource lease winner changed');
+        }
+        await rm(path, { force: true });
+      };
     } catch (error) {
       await rm(candidatePath, { force: true });
       if (!isErrno(error, 'EEXIST')) throw error;
@@ -637,12 +705,12 @@ async function acquireRunLease(root: string, runId: string): Promise<RunLease> {
       }
       if (existing !== null && processIsAlive(existing.pid)) {
         throw new BoundedPipelineIntegrityError(
-          `Bounded run is already leased by process ${existing.pid}`,
+          `Bounded resource is already leased by process ${existing.pid}`,
         );
       }
       const orphanPath = confinedChild(
         root,
-        `bounded-run-lease.orphan-${sha256(existing ?? { unreadable: true }).slice(0, 16)}.json`,
+        `.oracle-bounded-resource-lease.orphan-${sha256(existing ?? { unreadable: true }).slice(0, 16)}.json`,
       );
       try {
         await rename(path, orphanPath);
@@ -652,7 +720,7 @@ async function acquireRunLease(root: string, runId: string): Promise<RunLease> {
       }
     }
   }
-  throw new BoundedPipelineIntegrityError('Bounded run lease could not be acquired');
+  throw new BoundedPipelineIntegrityError('Bounded resource lease could not be acquired');
 }
 
 async function readRunLease(
@@ -715,6 +783,14 @@ async function initializeDatabase(connection: DuckDBConnection): Promise<void> {
     generation_id VARCHAR NOT NULL, partition_id INTEGER NOT NULL, entity_id VARCHAR NOT NULL, entity_kind VARCHAR NOT NULL,
     entity_json VARCHAR NOT NULL, aggregate_json VARCHAR NOT NULL, aggregate_sha256 VARCHAR NOT NULL,
     PRIMARY KEY(generation_id, entity_id))`);
+  await connection.run(`CREATE TABLE IF NOT EXISTS canonical_field_lineage (
+    generation_id VARCHAR NOT NULL, entity_id VARCHAR NOT NULL, observation_id VARCHAR NOT NULL,
+    field_path VARCHAR NOT NULL, source_id VARCHAR NOT NULL, snapshot_id VARCHAR NOT NULL,
+    artifact_id VARCHAR NOT NULL, record_key VARCHAR NOT NULL, record_sha256 VARCHAR NOT NULL,
+    lineage_sha256 VARCHAR NOT NULL)`);
+  await connection.run(
+    'CREATE INDEX IF NOT EXISTS canonical_field_lineage_lookup ON canonical_field_lineage(generation_id, source_id, snapshot_id, artifact_id, record_key, record_sha256, lineage_sha256, field_path)',
+  );
   await connection.run(`CREATE TABLE IF NOT EXISTS canonical_link_candidate (
     generation_id VARCHAR NOT NULL, link_id VARCHAR NOT NULL, link_json VARCHAR NOT NULL,
     PRIMARY KEY(generation_id, link_id))`);
@@ -1008,13 +1084,7 @@ async function materializeTrustedAcquisition(
       await verifyAcquiredObject(request, artifact, sharedBudget, maximumBufferedBytes);
     }
   }
-  const acquiredManifests = request.acquiredSources.map((lane) => {
-    const source = sourceInventory.get(lane.sourceId);
-    if (source === undefined)
-      throw new BoundedPipelineIntegrityError('Acquired source disappeared');
-    return source;
-  });
-  const trustedSources = [...acquiredManifests]
+  const trustedSources = [...request.sources]
     .sort((left, right) => compareUtf8(left.sourceId, right.sourceId))
     .map((source) => {
       const acquiredArtifacts = [...(acquiredBySource.get(source.sourceId) ?? [])].sort(
@@ -1023,7 +1093,8 @@ async function materializeTrustedAcquisition(
       const snapshotId =
         source.snapshotIdentity.observedContentId ?? source.snapshotIdentity.intentId;
       if (
-        acquiredArtifacts.length === 0 ||
+        ((source.terminalState === 'complete' || source.terminalState === 'partial') &&
+          acquiredArtifacts.length === 0) ||
         acquiredArtifacts.some(
           (artifact) => artifact.sourceId !== source.sourceId || artifact.snapshotId !== snapshotId,
         )
@@ -1081,7 +1152,10 @@ async function materializeTrustedAcquisition(
         permissionState,
         limitations,
         capabilities,
-        permitAuthorityIds: permitAuthority === undefined ? [] : [permitAuthority.authorityId],
+        permitAuthorityIds:
+          permitAuthority === undefined || terminalState !== 'succeeded'
+            ? []
+            : [permitAuthority.authorityId],
       };
     });
   if (acquiredBySource.size !== 0) {
@@ -1090,7 +1164,7 @@ async function materializeTrustedAcquisition(
     );
   }
   const trustedSourceMap = new Map(trustedSources.map((source) => [source.sourceId, source]));
-  const capabilities = capabilityStates(acquiredManifests)
+  const capabilities = capabilityStates(request.sources)
     .map((capability) => {
       const value = {
         capability: capability.capability,
@@ -1110,11 +1184,7 @@ async function materializeTrustedAcquisition(
     county: 'Santa Clara' as const,
     state: 'CA' as const,
     createdAt: request.configuration.requestedAt,
-    runStatus: acquiredManifests.some(({ terminalState }) => terminalState === 'failed')
-      ? ('failed' as const)
-      : acquiredManifests.every(({ terminalState }) => terminalState === 'complete')
-        ? ('succeeded' as const)
-        : ('partial' as const),
+    runStatus: sourceInventoryRunStatus(request.sources),
     sources: trustedSources,
     capabilities,
     ...authoritativeRegistry(trustedSources, capabilities),
@@ -1587,7 +1657,54 @@ async function reduceCanonical(
     );
     await crash?.('after_canonical_partition', { partitionId });
   }
+  await rebuildCanonicalFieldLineageIndex(connection, processing.generationId, signal);
   return Object.freeze(summaries);
+}
+
+async function rebuildCanonicalFieldLineageIndex(
+  connection: DuckDBConnection,
+  generationId: string,
+  signal: AbortSignal,
+): Promise<void> {
+  await connection.run('BEGIN TRANSACTION');
+  let appender: DuckDBAppender | null = null;
+  try {
+    await connection.run(
+      `DELETE FROM canonical_field_lineage WHERE generation_id=${sql(generationId)}`,
+    );
+    appender = await connection.createAppender('canonical_field_lineage');
+    for await (const aggregate of streamKeysetJson<CanonicalEntityAggregate>(
+      connection,
+      `SELECT entity_id AS key, aggregate_json AS value FROM canonical_entity WHERE generation_id=${sql(generationId)}`,
+      'key',
+    )) {
+      signal.throwIfAborted();
+      for (const observation of aggregate.observations) {
+        const sourceRecord = observation.lineage.sourceRecord;
+        appender.appendVarchar(generationId);
+        appender.appendVarchar(aggregate.entity.id);
+        appender.appendVarchar(observation.observationId);
+        appender.appendVarchar(observation.fieldPath);
+        appender.appendVarchar(sourceRecord.sourceId);
+        appender.appendVarchar(sourceRecord.snapshotId);
+        appender.appendVarchar(sourceRecord.artifactId);
+        appender.appendVarchar(sourceRecord.recordKey);
+        appender.appendVarchar(sourceRecord.recordSha256);
+        appender.appendVarchar(observation.lineage.lineageSha256);
+        appender.endRow();
+      }
+    }
+    appender.flushSync();
+    appender.closeSync();
+    appender = null;
+    await connection.run('COMMIT');
+  } catch (error) {
+    if (appender !== null) {
+      appender.closeSync();
+    }
+    await connection.run('ROLLBACK');
+    throw error;
+  }
 }
 
 async function materializeMutationPartition(
@@ -2974,7 +3091,12 @@ function sourceObservation(observation: FieldObservation, kind: string): SourceO
     observedAt: observation.observedAt,
     sourceAsOf: observation.sourceAsOf,
     visibility: observation.visibility,
-    fields: Object.freeze({ fieldPath: observation.fieldPath, value: observation.value }),
+    fields: Object.freeze({
+      fieldPath: observation.fieldPath,
+      value: observation.value,
+      recordSha256: observation.lineage.sourceRecord.recordSha256,
+      lineageSha256: observation.lineage.lineageSha256,
+    }),
   });
 }
 
@@ -3711,6 +3833,7 @@ async function buildMarts(
         reference: trustedAcquisition.reference,
         resolver: trustedAcquisition.resolver,
       }),
+      trustedCanonicalLineage: canonicalLineageResolver(connection, processing.generationId),
       finalization: Object.freeze({
         attemptId: `${processing.generationId}:${releaseCheckpoint.expectedRevision}`,
         coordinator: new FileReleaseFinalizationCoordinator(join(root, 'release-finalization')),
@@ -3967,20 +4090,33 @@ async function* martRows(
             `Feature stage omitted evidence for ${property.id}`,
           );
         }
-        const completed = Object.freeze({
-          row: propertyServingRow(property, address, features, visibility),
-          sourceIds: exactSourceIds([
-            ...property.sourceIds,
-            ...(address?.sourceIds ?? []),
-            ...features.flatMap(({ evidence }) =>
-              evidence.sourceReferences.map(({ sourceId }) => sourceId),
-            ),
-          ]),
-          fieldSourceIds: propertyQueryFieldSourceIds(
-            propertyAggregate,
-            addressAggregate,
-            features,
+        const servingRow = propertyServingRow(property, address, features, visibility);
+        const fieldSourceReferences = propertyQueryFieldSourceIds(
+          propertyAggregate,
+          addressAggregate,
+          features,
+          servingRow,
+        );
+        const fieldSourceIds = Object.freeze(
+          Object.fromEntries(
+            Object.entries(fieldSourceReferences).map(([fieldName, references]) => [
+              fieldName,
+              exactSourceIds(references.map(({ sourceId }) => sourceId)),
+            ]),
           ),
+        );
+        const sourceIds = exactSourceIds(Object.values(fieldSourceIds).flatMap((value) => value));
+        const completed = Object.freeze({
+          row: Object.freeze({
+            ...servingRow,
+            source_ids_json: canonicalJson(sourceIds),
+            field_source_ids_json: propertyQueryFieldSourceIdsJson(
+              fieldSourceReferences,
+              servingRow,
+            ),
+          }),
+          sourceIds,
+          fieldSourceIds,
         });
         const lease = sharedBudget.acquire(1, Buffer.byteLength(canonicalJson(completed), 'utf8'));
         try {
@@ -4274,38 +4410,55 @@ function propertyQueryFieldSourceIds(
   property: CanonicalEntityAggregate,
   address: CanonicalEntityAggregate | null,
   evidence: readonly CountyFeatureEvidence[],
-): Readonly<Record<string, readonly string[]>> {
+  servingRow: ServingRow,
+): Readonly<Record<string, readonly ExactEvidenceSourceReference[]>> {
   const byFeature = new Map(
     evidence.map((value) => [
       value.feature,
-      exactSourceIds(value.evidence.sourceReferences.map(({ sourceId }) => sourceId)),
+      exactSourceReferences(
+        value.sourceObservations.map((observation) => exactFeatureSourceReference(observation)),
+      ),
     ]),
   );
   const observed = (
     aggregate: CanonicalEntityAggregate | null,
     paths: readonly string[],
-  ): readonly string[] =>
+  ): readonly ExactEvidenceSourceReference[] =>
     aggregate === null
       ? Object.freeze([])
-      : exactSourceIds(
+      : exactSourceReferences(
           aggregate.observations
             .filter(({ fieldPath }) => paths.includes(fieldPath))
-            .map(({ lineage }) => lineage.sourceRecord.sourceId),
+            .map(({ fieldPath, lineage }) => ({
+              sourceId: lineage.sourceRecord.sourceId,
+              snapshotId: lineage.sourceRecord.snapshotId,
+              artifactId: lineage.sourceRecord.artifactId,
+              recordKey: lineage.sourceRecord.recordKey,
+              recordSha256: lineage.sourceRecord.recordSha256,
+              lineageSha256: lineage.lineageSha256,
+              fieldPaths: [fieldPath],
+            })),
         );
-  const feature = (kind: CountyFeatureKind): readonly string[] =>
+  const feature = (kind: CountyFeatureKind): readonly ExactEvidenceSourceReference[] =>
     byFeature.get(kind) ?? Object.freeze([]);
-  const allFeatures = exactSourceIds([...byFeature.values()].flatMap((value) => value));
+  const allFeatures = exactSourceReferences([...byFeature.values()].flatMap((value) => value));
+  const ifPresent = (
+    fieldName: string,
+    references: readonly ExactEvidenceSourceReference[],
+  ): readonly ExactEvidenceSourceReference[] =>
+    servingRow[fieldName] === null ? Object.freeze([]) : references;
+  const propertyIdentity = observed(property, ['/apn']);
   return Object.freeze({
-    property_id: exactSourceIds(property.entity.sourceIds),
-    parcel_identifier: observed(property, ['/apn']),
-    address_street: observed(address, ['/line1']),
-    address_city: exactSourceIds([
-      ...observed(address, ['/locality']),
-      ...observed(property, ['/jurisdiction']),
-    ]),
-    address_zip: observed(address, ['/postalCode']),
-    latitude: observed(address, ['/location']),
-    longitude: observed(address, ['/location']),
+    property_id: propertyIdentity,
+    parcel_identifier: propertyIdentity,
+    address_street: ifPresent('address_street', observed(address, ['/line1'])),
+    address_city: ifPresent(
+      'address_city',
+      address !== null ? observed(address, ['/locality']) : observed(property, ['/jurisdiction']),
+    ),
+    address_zip: ifPresent('address_zip', observed(address, ['/postalCode'])),
+    latitude: ifPresent('latitude', observed(address, ['/location'])),
+    longitude: ifPresent('longitude', observed(address, ['/location'])),
     roof_support_class: feature('roof_age'),
     roof_age_years: feature('roof_age'),
     roof_reference_date: feature('roof_age'),
@@ -4326,6 +4479,299 @@ function propertyQueryFieldSourceIds(
     combined_review_score: Object.freeze([]),
     evidence_coverage: allFeatures,
     visibility: Object.freeze([]),
+  });
+}
+
+function exactFeatureSourceReference(observation: SourceObservation): ExactEvidenceSourceReference {
+  const candidate = observation.reference;
+  const recordSha256 = observation.fields.recordSha256;
+  const lineageSha256 = observation.fields.lineageSha256;
+  if (
+    typeof recordSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/u.test(recordSha256) ||
+    typeof lineageSha256 !== 'string' ||
+    !/^[a-f0-9]{64}$/u.test(lineageSha256)
+  ) {
+    throw new BoundedPipelineIntegrityError(
+      'Feature source reference is not bound to canonical record and observation lineage',
+    );
+  }
+  return Object.freeze({
+    sourceId: candidate.sourceId,
+    snapshotId: candidate.snapshotId,
+    artifactId: candidate.artifactId,
+    recordKey: candidate.recordKey,
+    recordSha256,
+    lineageSha256,
+    fieldPaths: Object.freeze([...candidate.fieldPaths]),
+  });
+}
+
+function propertyQueryFieldSourceIdsJson(
+  fieldSourceReferences: Readonly<Record<string, readonly ExactEvidenceSourceReference[]>>,
+  servingRow: ServingRow,
+): string {
+  return canonicalJson(
+    Object.entries(fieldSourceReferences)
+      .sort(([left], [right]) => compareUtf8(left, right))
+      .map(([fieldName, sourceReferences]) => {
+        const sourceIds = exactSourceIds(sourceReferences.map(({ sourceId }) => sourceId));
+        return {
+          field_name: fieldName,
+          source_ids: sourceIds,
+          source_references: sourceReferences,
+          field_lineage_sha256: propertyQueryFieldLineageSha256(
+            fieldName,
+            servingRow[fieldName],
+            sourceReferences,
+          ),
+        };
+      }),
+  );
+}
+
+function propertyQueryFieldLineageSha256(
+  fieldName: string,
+  value: ServingRow[string] | undefined,
+  sourceReferences: readonly ExactEvidenceSourceReference[],
+): string {
+  if (value === undefined) {
+    throw new BoundedPipelineIntegrityError(`Property-query field ${fieldName} is absent`);
+  }
+  return sha256({
+    contract: 'oracle-property-query-field-lineage-v1',
+    fieldName,
+    value,
+    sourceReferences,
+  });
+}
+
+function exactSourceReferences(
+  values: readonly ExactEvidenceSourceReference[],
+): readonly ExactEvidenceSourceReference[] {
+  const canonical = values.map((reference) =>
+    Object.freeze({
+      sourceId: reference.sourceId,
+      snapshotId: reference.snapshotId,
+      artifactId: reference.artifactId,
+      recordKey: reference.recordKey,
+      recordSha256: reference.recordSha256,
+      lineageSha256: reference.lineageSha256,
+      fieldPaths: Object.freeze(exactSourceIds(reference.fieldPaths)),
+    }),
+  );
+  return Object.freeze(
+    [...new Map(canonical.map((reference) => [canonicalJson(reference), reference])).entries()]
+      .sort(([left], [right]) => compareUtf8(left, right))
+      .map(([, reference]) => reference),
+  );
+}
+
+type CanonicalLineageFieldSpec = Readonly<{
+  fieldPaths: readonly string[];
+  entityKinds: readonly CanonicalEntity['entityKind'][];
+}>;
+
+const PROPERTY_QUERY_IDENTITY_LINEAGE = Object.freeze({
+  fieldPaths: Object.freeze(['/apn']),
+  entityKinds: Object.freeze(['property'] as const),
+}) satisfies CanonicalLineageFieldSpec;
+const PROPERTY_QUERY_ROOF_LINEAGE = Object.freeze({
+  fieldPaths: Object.freeze([
+    '/completedAt',
+    '/description',
+    '/effectiveYearBuilt',
+    '/issuedAt',
+    '/permitType',
+    '/status',
+    '/yearBuilt',
+  ]),
+  entityKinds: Object.freeze(['permit', 'property'] as const),
+}) satisfies CanonicalLineageFieldSpec;
+const PROPERTY_QUERY_WATER_LINEAGE = Object.freeze({
+  fieldPaths: Object.freeze(['/featureType', '/geometry', '/location', '/name', '/parcelGeometry']),
+  entityKinds: Object.freeze(['address', 'hydro-feature', 'property'] as const),
+}) satisfies CanonicalLineageFieldSpec;
+const PROPERTY_QUERY_TRANSIT_LINEAGE = Object.freeze({
+  fieldPaths: Object.freeze(['/boardable', '/location', '/name', '/parcelGeometry', '/serviceIds']),
+  entityKinds: Object.freeze(['address', 'property', 'transit-stop'] as const),
+}) satisfies CanonicalLineageFieldSpec;
+const PROPERTY_QUERY_STARBUCKS_LINEAGE = Object.freeze({
+  fieldPaths: Object.freeze([
+    '/brandIdentifiers',
+    '/categories',
+    '/location',
+    '/name',
+    '/operatingState',
+    '/parcelGeometry',
+  ]),
+  entityKinds: Object.freeze(['address', 'place', 'property'] as const),
+}) satisfies CanonicalLineageFieldSpec;
+const PROPERTY_QUERY_OWNERSHIP_LINEAGE = Object.freeze({
+  fieldPaths: Object.freeze([
+    '/effectiveFrom',
+    '/effectiveTo',
+    '/eventType',
+    '/occurredAt',
+    '/recordedDocumentId',
+    '/supportState',
+  ]),
+  entityKinds: Object.freeze(['ownership-event', 'ownership-interest'] as const),
+}) satisfies CanonicalLineageFieldSpec;
+const PROPERTY_QUERY_REGIONAL_OWNER_LINEAGE = Object.freeze({
+  fieldPaths: Object.freeze([
+    '/addressIds',
+    '/displayName',
+    '/effectiveFrom',
+    '/effectiveTo',
+    '/partyId',
+    '/partyKind',
+    '/supportState',
+  ]),
+  entityKinds: Object.freeze(['ownership-interest', 'party'] as const),
+}) satisfies CanonicalLineageFieldSpec;
+
+function propertyQueryCanonicalLineageSpec(fieldName: string): CanonicalLineageFieldSpec | null {
+  if (fieldName === 'property_id' || fieldName === 'parcel_identifier') {
+    return PROPERTY_QUERY_IDENTITY_LINEAGE;
+  }
+  if (fieldName === 'address_street') {
+    return Object.freeze({ fieldPaths: Object.freeze(['/line1']), entityKinds: ['address'] });
+  }
+  if (fieldName === 'address_city') {
+    return Object.freeze({
+      fieldPaths: Object.freeze(['/jurisdiction', '/locality']),
+      entityKinds: Object.freeze(['address', 'property'] as const),
+    });
+  }
+  if (fieldName === 'address_zip') {
+    return Object.freeze({ fieldPaths: Object.freeze(['/postalCode']), entityKinds: ['address'] });
+  }
+  if (fieldName === 'latitude' || fieldName === 'longitude') {
+    return Object.freeze({ fieldPaths: Object.freeze(['/location']), entityKinds: ['address'] });
+  }
+  if (fieldName.startsWith('roof_')) return PROPERTY_QUERY_ROOF_LINEAGE;
+  if (fieldName.startsWith('water_')) return PROPERTY_QUERY_WATER_LINEAGE;
+  if (
+    fieldName.startsWith('ownership_') ||
+    fieldName === 'years_since_exchange' ||
+    fieldName === 'last_exchange_date'
+  ) {
+    return PROPERTY_QUERY_OWNERSHIP_LINEAGE;
+  }
+  if (fieldName.startsWith('regional_owner_') || fieldName === 'is_regional_owner') {
+    return PROPERTY_QUERY_REGIONAL_OWNER_LINEAGE;
+  }
+  if (fieldName.startsWith('transit_')) return PROPERTY_QUERY_TRANSIT_LINEAGE;
+  if (fieldName.startsWith('starbucks_')) return PROPERTY_QUERY_STARBUCKS_LINEAGE;
+  if (fieldName === 'evidence_coverage') {
+    return Object.freeze({
+      fieldPaths: Object.freeze(
+        exactSourceIds([
+          ...PROPERTY_QUERY_ROOF_LINEAGE.fieldPaths,
+          ...PROPERTY_QUERY_WATER_LINEAGE.fieldPaths,
+          ...PROPERTY_QUERY_OWNERSHIP_LINEAGE.fieldPaths,
+          ...PROPERTY_QUERY_REGIONAL_OWNER_LINEAGE.fieldPaths,
+          ...PROPERTY_QUERY_TRANSIT_LINEAGE.fieldPaths,
+          ...PROPERTY_QUERY_STARBUCKS_LINEAGE.fieldPaths,
+        ]),
+      ),
+      entityKinds: Object.freeze([
+        'address',
+        'hydro-feature',
+        'ownership-event',
+        'ownership-interest',
+        'party',
+        'permit',
+        'place',
+        'property',
+        'transit-stop',
+      ] as const),
+    });
+  }
+  return null;
+}
+
+function canonicalLineageResolver(
+  connection: DuckDBConnection,
+  generationId: string,
+): BoundedTrustedCanonicalLineageResolver {
+  return Object.freeze({
+    async verifyPropertyQueryFieldReference({
+      propertyId,
+      fieldName,
+      fieldValue,
+      reference,
+    }: Parameters<BoundedTrustedCanonicalLineageResolver['verifyPropertyQueryFieldReference']>[0]) {
+      if (
+        typeof propertyId !== 'string' ||
+        propertyId.trim().length === 0 ||
+        fieldValue === undefined
+      ) {
+        return false;
+      }
+      const specification = propertyQueryCanonicalLineageSpec(fieldName);
+      if (
+        specification === null ||
+        reference.fieldPaths.some((fieldPath) => !specification.fieldPaths.includes(fieldPath))
+      ) {
+        return false;
+      }
+      let propertyBindingMatched = false;
+      for await (const row of streamRows(
+        connection,
+        `SELECT property.aggregate_json, address.aggregate_json AS address_aggregate_json, evidence.projection, evidence.features_json FROM canonical_entity property LEFT JOIN canonical_entity address ON address.generation_id=property.generation_id AND address.entity_kind='address' AND address.entity_id=json_extract_string(property.entity_json,'$.primaryAddressId') LEFT JOIN property_feature_bundle evidence ON evidence.property_id=property.entity_id WHERE property.generation_id=${sql(generationId)} AND property.entity_kind='property' AND property.entity_id=${sql(propertyId)} ORDER BY evidence.projection`,
+      )) {
+        const propertyAggregate = JSON.parse(
+          stringValue(row.aggregate_json),
+        ) as CanonicalEntityAggregate;
+        if (propertyAggregate.entity.entityKind !== 'property') return false;
+        const addressAggregate =
+          row.address_aggregate_json === null || row.address_aggregate_json === undefined
+            ? null
+            : (JSON.parse(stringValue(row.address_aggregate_json)) as CanonicalEntityAggregate);
+        const address =
+          addressAggregate?.entity.entityKind === 'address' ? addressAggregate.entity : null;
+        const projection = stringValue(row.projection);
+        if (projection !== 'public' && projection !== 'restricted') return false;
+        const features = JSON.parse(stringValue(row.features_json)) as CountyFeatureEvidence[];
+        if (features.length !== FEATURE_KINDS.length) return false;
+        const servingRow = propertyServingRow(
+          propertyAggregate.entity,
+          address,
+          features,
+          projection,
+        );
+        const canonicalValue = servingRow[fieldName];
+        if (
+          canonicalValue === undefined ||
+          canonicalJson(canonicalValue) !== canonicalJson(fieldValue)
+        ) {
+          continue;
+        }
+        const canonicalReferences = propertyQueryFieldSourceIds(
+          propertyAggregate,
+          addressAggregate,
+          features,
+          servingRow,
+        )[fieldName];
+        if (
+          canonicalReferences?.some(
+            (candidate) => canonicalJson(candidate) === canonicalJson(reference),
+          ) === true
+        ) {
+          propertyBindingMatched = true;
+          break;
+        }
+      }
+      if (!propertyBindingMatched) return false;
+      const fieldPaths = exactSourceIds(reference.fieldPaths);
+      const matched = await scalarCount(
+        connection,
+        `SELECT count(DISTINCT lineage.field_path)::BIGINT AS value FROM canonical_field_lineage lineage JOIN canonical_entity entity ON entity.generation_id=lineage.generation_id AND entity.entity_id=lineage.entity_id WHERE lineage.generation_id=${sql(generationId)} AND lineage.source_id=${sql(reference.sourceId)} AND lineage.snapshot_id=${sql(reference.snapshotId)} AND lineage.artifact_id=${sql(reference.artifactId)} AND lineage.record_key=${sql(reference.recordKey)} AND lineage.record_sha256=${sql(reference.recordSha256)} AND lineage.lineage_sha256=${sql(reference.lineageSha256)} AND lineage.field_path IN (${fieldPaths.map(sql).join(',')}) AND entity.entity_kind IN (${specification.entityKinds.map(sql).join(',')})`,
+      );
+      return matched === fieldPaths.length;
+    },
   });
 }
 
@@ -4815,7 +5261,9 @@ async function writeRelationInput(
       rowLineageRule:
         relation === 'property_evidence'
           ? Object.freeze({ kind: 'source_ids_and_references_exact' as const })
-          : relation === 'field_coverage' || relation === 'pipeline_runs'
+          : relation === 'property_query' ||
+              relation === 'field_coverage' ||
+              relation === 'pipeline_runs'
             ? Object.freeze({ kind: 'source_ids_exact' as const })
             : relation === 'source_coverage'
               ? Object.freeze({ kind: 'source_id_exact' as const })
