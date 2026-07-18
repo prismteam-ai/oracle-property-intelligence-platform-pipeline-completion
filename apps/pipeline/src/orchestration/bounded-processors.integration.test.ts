@@ -24,6 +24,7 @@ import {
   normalizeTransitStopRecord,
 } from '@oracle/canonical-model/normalizers/geospatial';
 import { testContext } from '@oracle/canonical-model/normalizers/test-context.test-support';
+import { createSharedRecordBudget } from '@oracle/source-adapters/spi/record-budget';
 import { describe, expect, it } from 'vitest';
 
 import { canonicalJson } from './canonical-json.js';
@@ -33,7 +34,12 @@ import {
   createBoundedPipelineProcessors,
   normalizeBoundedIndexValue,
 } from './bounded-processors.js';
-import type { ChunkSequence } from './chunks.js';
+import {
+  CanonicalChunkWriter,
+  emptyChunkLedger,
+  type ChunkReference,
+  type ChunkSequence,
+} from './chunks.js';
 import type {
   BoundedCountyProcessingRequest,
   PipelineConfiguration,
@@ -224,6 +230,86 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     await expect(
       createProcessor().processBoundedCounty?.({ ...request, artifactStore: corruptingStore }),
     ).rejects.toThrow('Acquired object bytes changed');
+
+    const rooted = await rootedChunkSequence(artifactStore, mutations);
+    const rootedInventory = rooted.chunkInventory;
+    if (rootedInventory == null) throw new Error('Expected rooted mutation inventory');
+    const rootedRequest = {
+      ...request,
+      mutationSources: [{ sourceId: SOURCE_ID, snapshotId: SNAPSHOT_ID, sequence: rooted }],
+    };
+    await expect(
+      createProcessor().processBoundedCounty?.({
+        ...rootedRequest,
+        mutationSources: [
+          {
+            sourceId: SOURCE_ID,
+            snapshotId: SNAPSHOT_ID,
+            sequence: Object.freeze({
+              ...rooted,
+              chunkInventory: Object.freeze({
+                ...rootedInventory,
+                recordCount: rootedInventory.recordCount + 1,
+              }),
+            }),
+          },
+        ],
+      }),
+    ).rejects.toThrow('descriptor inventory rejected');
+    const rootedReferences: ChunkReference[] = [];
+    for await (const reference of rooted.readReferences?.() ?? []) rootedReferences.push(reference);
+    const firstRootedReference = rootedReferences[0];
+    if (firstRootedReference === undefined) throw new Error('Expected rooted mutation reference');
+    await expect(
+      createProcessor().processBoundedCounty?.({
+        ...rootedRequest,
+        mutationSources: [
+          {
+            sourceId: SOURCE_ID,
+            snapshotId: SNAPSHOT_ID,
+            sequence: Object.freeze({
+              ...rooted,
+              readReferences: async function* () {
+                yield await Promise.resolve(
+                  Object.freeze({ ...firstRootedReference, byteSize: 1 }),
+                );
+              },
+            }),
+          },
+        ],
+      }),
+    ).rejects.toThrow('Rooted mutation reference changed');
+    await expect(
+      createProcessor().processBoundedCounty?.({
+        ...rootedRequest,
+        mutationSources: [
+          {
+            sourceId: SOURCE_ID,
+            snapshotId: SNAPSHOT_ID,
+            sequence: Object.freeze({
+              ...rooted,
+              licenseSnapshotRefs: Object.freeze(['sc:license:substituted']),
+            }),
+          },
+        ],
+      }),
+    ).rejects.toThrow('Rooted mutation physical identity changed');
+    const corruptPageStore: BoundedCountyProcessingRequest['artifactStore'] = Object.freeze({
+      putImmutable: artifactStore.putImmutable.bind(artifactStore),
+      putImmutableStreaming: artifactStore.putImmutableStreaming.bind(artifactStore),
+      head: artifactStore.head.bind(artifactStore),
+      headByLogicalKey: artifactStore.headByLogicalKey.bind(artifactStore),
+      read: (uri: string, range?: Readonly<{ start: number; endInclusive: number }>) =>
+        uri === rootedInventory.pageIndexUri
+          ? oneBuffer(Buffer.from('{}', 'utf8'))
+          : artifactStore.read(uri, range),
+    });
+    await expect(
+      createProcessor().processBoundedCounty?.({
+        ...rootedRequest,
+        artifactStore: corruptPageStore,
+      }),
+    ).rejects.toThrow('semantic hash mismatch');
 
     await mkdir(join(root, 'output'), { recursive: true });
     const leasePath = join(root, 'output', '.oracle-bounded-resource-lease.json');
@@ -709,6 +795,30 @@ function chunkSequence<T>(values: readonly T[]): ChunkSequence<T> {
       for (const value of values) yield await Promise.resolve(value);
     },
   } satisfies ChunkSequence<T>);
+}
+
+async function rootedChunkSequence<T>(
+  artifactStore: LocalArtifactStore,
+  values: readonly T[],
+): Promise<ChunkSequence<T>> {
+  const logicalPrefix = 'fixture/rooted-mutations';
+  let ledger = emptyChunkLedger(logicalPrefix);
+  const writer = new CanonicalChunkWriter<T>({
+    store: artifactStore,
+    logicalPrefix,
+    visibility: 'public',
+    licenseSnapshotRef: 'license:test:v1',
+    budget: createSharedRecordBudget(2),
+    signal: new AbortController().signal,
+    maximumRecordsPerChunk: 2,
+    restoredLedger: ledger,
+    onLedger: (next) => {
+      ledger = next;
+      return Promise.resolve();
+    },
+  });
+  for (const value of values) await writer.append(value);
+  return writer.finish();
 }
 
 function sourceManifest(accepted: number): SourceExecutionManifest {

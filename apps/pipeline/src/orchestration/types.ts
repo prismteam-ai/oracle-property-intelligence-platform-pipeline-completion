@@ -12,7 +12,7 @@ import type {
 } from '@oracle/source-adapters/spi/adapter';
 import type { HttpTransport } from '@oracle/source-adapters/spi/http';
 
-import type { ChunkReference, ChunkSequence } from './chunks.js';
+import type { ChunkLedger, ChunkReference, ChunkSequence } from './chunks.js';
 
 export const ORCHESTRATION_PHASES = Object.freeze([
   'discover',
@@ -146,6 +146,7 @@ export type PipelineRunManifest = Readonly<{
     observedHighWaterCombinedRecordsAndEvents: number;
     activeRecordsAtCompletion: number;
     bufferedEventsAtCompletion: number;
+    /** All record-budget permits, including canonical events and physical projection writes. */
     totalBudgetAcquisitions: number;
   }>;
   sources: readonly SourceExecutionManifest[];
@@ -255,11 +256,11 @@ export type PersistedSourceState = Readonly<{
   acquisitionRecords: number;
   acquisitionLogicalSha256: string | null;
   mutationArtifact: PhaseArtifact | null;
-  mutationChunks: readonly ChunkReference[];
-  validationIssueChunks: readonly ChunkReference[];
   mutationLogicalSha256: string | null;
   validationIssueLogicalSha256: string | null;
-  normalizationChunks: readonly ChunkReference[];
+  normalizationLedger: ChunkLedger;
+  mutationLedger: ChunkLedger;
+  validationIssueLedger: ChunkLedger;
   normalizationEventRecords: number;
   normalizationLogicalSha256: string | null;
   normalizationCursor: NormalizationCursor | null;

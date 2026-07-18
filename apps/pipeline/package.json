@@ -11,6 +11,7 @@
     "check": "node dist/cli.js --check",
     "lint": "eslint src",
     "stress:bounded-county": "esbuild src/orchestration/bounded-county-stress.ts --bundle --format=esm --platform=node --target=node22 --external:@duckdb/node-api --outfile=dist/bounded-county-stress.js && node --max-old-space-size=256 dist/bounded-county-stress.js",
+    "stress:streaming-ledger": "esbuild src/orchestration/streaming-stress.ts --bundle --format=esm --platform=node --target=node22 --external:@duckdb/node-api --outfile=dist/streaming-stress.js && node --max-old-space-size=128 dist/streaming-stress.js",
     "test": "vitest run src",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },

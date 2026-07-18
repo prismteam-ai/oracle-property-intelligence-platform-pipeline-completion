@@ -1132,6 +1132,52 @@ describe('bounded_streaming_v2 processing contract', () => {
     ).toBe(false);
   });
 
+  it('binds rooted mutation inventories to explicit licenses and inline inventories to chunks', () => {
+    const inline = mutationLog();
+    const inlineSource = required(inline.sources[0]);
+    const inlineWithWrongLicenses = {
+      ...inline,
+      sources: [{ ...inlineSource, licenseSnapshotRefs: [] }],
+    };
+    inlineWithWrongLicenses.physicalManifestSha256 =
+      physicalMutationManifestSha256(inlineWithWrongLicenses);
+    expect(
+      boundedProcessingInputSchema.safeParse(
+        processingInput({ mutationLog: inlineWithWrongLicenses }),
+      ).success,
+    ).toBe(false);
+
+    const rootedSource = {
+      ...inlineSource,
+      chunks: [],
+      chunkInventory: { ...descriptorInventoryFixture().root, recordCount: 4 },
+      licenseSnapshotRefs: ['license:test'],
+    };
+    const rootedWithoutHash = {
+      ...inline,
+      sources: [rootedSource],
+    };
+    const rooted = {
+      ...rootedWithoutHash,
+      physicalManifestSha256: physicalMutationManifestSha256(rootedWithoutHash),
+    };
+    expect(
+      boundedProcessingInputSchema.safeParse(processingInput({ mutationLog: rooted })).success,
+    ).toBe(true);
+
+    for (const licenseSnapshotRefs of [undefined, [], ['license:z', 'license:a']]) {
+      const invalidSource = { ...rootedSource, licenseSnapshotRefs };
+      const invalidWithoutHash = { ...inline, sources: [invalidSource] };
+      const invalid = {
+        ...invalidWithoutHash,
+        physicalManifestSha256: physicalMutationManifestSha256(invalidWithoutHash),
+      };
+      expect(
+        boundedProcessingInputSchema.safeParse(processingInput({ mutationLog: invalid })).success,
+      ).toBe(false);
+    }
+  });
+
   it('rejects impossible budgets, unknown fields, and stale generation identities', () => {
     const valid = processingInput();
     expect(

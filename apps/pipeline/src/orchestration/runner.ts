@@ -41,9 +41,14 @@ import { commitRunState, loadRunState } from './checkpoint.js';
 import {
   CanonicalChunkWriter,
   combineChunkSequences,
+  emptyChunkLedger,
   emptyChunkSequence,
+  migrateLegacyChunkLedger,
   openChunkSequence,
   openChunkSequencePrefix,
+  openLedgerChunkSequence,
+  openLedgerChunkSequencePrefix,
+  type ChunkLedger,
   type ChunkReference,
   type ChunkSequence,
 } from './chunks.js';
@@ -70,6 +75,15 @@ import {
 const SOURCE_PHASES = ORCHESTRATION_PHASES.slice(0, 7);
 const LEGACY_OBSERVATION_MAX_VALUES = 10_000;
 const BORROWED_RECORD_LEASE: RecordBudgetLease = Object.freeze({ release: () => undefined });
+const NORMALIZATION_MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
+
+function normalizationRecordByteCap(): number {
+  return Math.min(1024 * 1024, Math.floor(NORMALIZATION_MAX_BUFFERED_BYTES / 16));
+}
+
+function normalizationChunkByteCap(): number {
+  return Math.min(4 * 1024 * 1024, Math.floor(NORMALIZATION_MAX_BUFFERED_BYTES / 4));
+}
 
 interface MutableRun {
   envelope: CheckpointEnvelope | undefined;
@@ -124,9 +138,22 @@ export const REQUIRED_COUNTY_CAPABILITIES = Object.freeze([
   'santa_clara_fbn',
 ] as const);
 
-function emptySource(source: SourceConfiguration): PersistedSourceState {
+function normalizationLogicalPrefix(runId: string, sourceId: string): string {
+  return `runs/${runId.replace('sc:run:', '')}/${sourceId.replaceAll(/[^a-zA-Z0-9._~-]/gu, '-')}/normalize/events`;
+}
+
+function mutationLogicalPrefix(runId: string, sourceId: string): string {
+  return `runs/${runId.replace('sc:run:', '')}/${sourceId.replaceAll(/[^a-zA-Z0-9._~-]/gu, '-')}/normalize/mutations`;
+}
+
+function validationIssueLogicalPrefix(runId: string, sourceId: string): string {
+  return `runs/${runId.replace('sc:run:', '')}/${sourceId.replaceAll(/[^a-zA-Z0-9._~-]/gu, '-')}/normalize/validation-issues`;
+}
+
+function emptySource(runId: string, source: SourceConfiguration): PersistedSourceState {
+  const sourceId = source.adapter.describe().sourceId;
   return Object.freeze({
-    sourceId: source.adapter.describe().sourceId,
+    sourceId,
     snapshotId: source.snapshotId,
     completedPhase: null,
     discoveryArtifact: null,
@@ -136,11 +163,11 @@ function emptySource(source: SourceConfiguration): PersistedSourceState {
     acquisitionRecords: 0,
     acquisitionLogicalSha256: null,
     mutationArtifact: null,
-    mutationChunks: Object.freeze([]),
-    validationIssueChunks: Object.freeze([]),
     mutationLogicalSha256: null,
     validationIssueLogicalSha256: null,
-    normalizationChunks: Object.freeze([]),
+    normalizationLedger: emptyChunkLedger(normalizationLogicalPrefix(runId, sourceId)),
+    mutationLedger: emptyChunkLedger(mutationLogicalPrefix(runId, sourceId)),
+    validationIssueLedger: emptyChunkLedger(validationIssueLogicalPrefix(runId, sourceId)),
     normalizationEventRecords: 0,
     normalizationLogicalSha256: null,
     normalizationCursor: null,
@@ -166,13 +193,330 @@ function initialState(
     schemaVersion: 2,
     runId: configuration.runId,
     configurationHash,
-    sources: Object.freeze(configuration.sources.map((source) => emptySource(source))),
+    sources: Object.freeze(
+      configuration.sources.map((source) => emptySource(configuration.runId, source)),
+    ),
     reconcileArtifact: null,
     featureArtifact: null,
     martArtifact: null,
     manifestArtifact: null,
     completedPhase: null,
   });
+}
+
+async function migrateLegacyNormalizationLedgers(
+  state: PersistedRunState,
+  configuration: PipelineConfiguration,
+  expectedConfigurationHash: string,
+  dependencies: OrchestrationDependencies,
+): Promise<Readonly<{ state: PersistedRunState; migrated: boolean }>> {
+  const format = classifyNormalizationCheckpointFormat(state);
+  if (format === 'legacy') {
+    assertLegacyMigrationPreconditions(state, configuration, expectedConfigurationHash);
+    if (
+      (await dependencies.checkpointStore.load(`bounded-processing:${configuration.runId}`)) !==
+      undefined
+    ) {
+      throw new Error('Legacy normalization cannot migrate after bounded processing has begun');
+    }
+  }
+  let migrated = false;
+  const sources: PersistedSourceState[] = [];
+  for (const source of state.sources) {
+    const raw = source as unknown as Record<string, unknown>;
+    const eventPrefix = normalizationLogicalPrefix(state.runId, source.sourceId);
+    if (format === 'current') {
+      const candidate = source;
+      await validateMigratedNormalizationState(
+        source,
+        candidate.normalizationLedger,
+        eventPrefix,
+        dependencies,
+      );
+      await openLedgerChunkSequencePrefix(
+        dependencies.artifactStore,
+        candidate.mutationLedger,
+        mutationLogicalPrefix(state.runId, source.sourceId),
+      );
+      await openLedgerChunkSequencePrefix(
+        dependencies.artifactStore,
+        candidate.validationIssueLedger,
+        validationIssueLogicalPrefix(state.runId, source.sourceId),
+      );
+      sources.push(candidate);
+      continue;
+    }
+    const legacyReferences = raw.normalizationChunks as readonly ChunkReference[];
+    assertLegacyProjectionInventories(raw, legacyReferences, source);
+    const verified = await openChunkSequencePrefix<NormalizationEvent>(
+      dependencies.artifactStore,
+      legacyReferences,
+      eventPrefix,
+    );
+    assertNormalizationOuterIdentity(
+      source,
+      verified,
+      legacyReferences.at(-1)?.resumeCursor ?? null,
+    );
+    await assertNormalizationProjectionIdentity(source, verified);
+    const normalizationLedger = await migrateLegacyChunkLedger(
+      dependencies.artifactStore,
+      eventPrefix,
+      legacyReferences,
+    );
+    await validateMigratedNormalizationState(
+      source,
+      normalizationLedger,
+      eventPrefix,
+      dependencies,
+    );
+    const migratedSource = { ...raw };
+    delete migratedSource.normalizationChunks;
+    delete migratedSource.mutationChunks;
+    delete migratedSource.validationIssueChunks;
+    migratedSource.mutationLedger = emptyChunkLedger(
+      mutationLogicalPrefix(state.runId, source.sourceId),
+    );
+    migratedSource.validationIssueLedger = emptyChunkLedger(
+      validationIssueLogicalPrefix(state.runId, source.sourceId),
+    );
+    const candidate = Object.freeze({
+      ...migratedSource,
+      normalizationLedger,
+    }) as PersistedSourceState;
+    await openLedgerChunkSequencePrefix(
+      dependencies.artifactStore,
+      candidate.mutationLedger,
+      mutationLogicalPrefix(state.runId, source.sourceId),
+    );
+    await openLedgerChunkSequencePrefix(
+      dependencies.artifactStore,
+      candidate.validationIssueLedger,
+      validationIssueLogicalPrefix(state.runId, source.sourceId),
+    );
+    sources.push(candidate);
+    migrated = true;
+  }
+  return Object.freeze({
+    state: migrated ? Object.freeze({ ...state, sources: Object.freeze(sources) }) : state,
+    migrated,
+  });
+}
+
+type NormalizationCheckpointFormat = 'legacy' | 'current';
+
+function classifyNormalizationCheckpointFormat(
+  state: PersistedRunState,
+): NormalizationCheckpointFormat {
+  const formats = state.sources.map((source): NormalizationCheckpointFormat => {
+    const raw = source as unknown as Record<string, unknown>;
+    const legacyFields = [raw.normalizationChunks, raw.mutationChunks, raw.validationIssueChunks];
+    const ledgerFields = [raw.normalizationLedger, raw.mutationLedger, raw.validationIssueLedger];
+    const fullyLegacy =
+      legacyFields.every((value) => Array.isArray(value)) &&
+      ledgerFields.every((value) => value === undefined);
+    const fullyCurrent =
+      legacyFields.every((value) => value === undefined) &&
+      ledgerFields.every(
+        (value) =>
+          typeof value === 'object' &&
+          value !== null &&
+          (value as { schemaVersion?: unknown }).schemaVersion === 'oracle-chunk-ledger-v1',
+      );
+    if (fullyLegacy === fullyCurrent) {
+      throw new Error(
+        `Checkpoint source has mixed or incomplete chunk formats: ${source.sourceId}`,
+      );
+    }
+    return fullyLegacy ? 'legacy' : 'current';
+  });
+  const first = formats[0];
+  if (first === undefined || formats.some((format) => format !== first)) {
+    throw new Error('Checkpoint run mixes legacy and current chunk formats');
+  }
+  return first;
+}
+
+function assertLegacyProjectionInventories(
+  source: Readonly<Record<string, unknown>>,
+  normalizationChunks: readonly ChunkReference[],
+  persisted: PersistedSourceState,
+): void {
+  for (const field of ['mutationChunks', 'validationIssueChunks'] as const) {
+    const alias = source[field];
+    const valid = phaseCompleted(persisted, 'normalize')
+      ? Array.isArray(alias) && canonicalJson(alias) === canonicalJson(normalizationChunks)
+      : Array.isArray(alias) && alias.length === 0;
+    if (!valid) {
+      throw new Error(
+        `Legacy ${field} has invalid ${phaseCompleted(persisted, 'normalize') ? 'completed alias' : 'partial zero-state'} semantics for ${persisted.sourceId}`,
+      );
+    }
+  }
+}
+
+function assertLegacyMigrationPreconditions(
+  state: PersistedRunState,
+  configuration: PipelineConfiguration,
+  expectedConfigurationHash: string,
+): void {
+  if (
+    state.runId !== configuration.runId ||
+    state.configurationHash !== expectedConfigurationHash
+  ) {
+    throw new Error('Legacy checkpoint run/configuration identity changed');
+  }
+  if (
+    state.reconcileArtifact !== null ||
+    state.featureArtifact !== null ||
+    state.martArtifact !== null ||
+    state.manifestArtifact !== null ||
+    state.completedPhase !== null
+  ) {
+    throw new Error('Legacy normalization cannot migrate after downstream authority has begun');
+  }
+  const expectedSources = configuration.sources.map((configured) => ({
+    sourceId: configured.adapter.describe().sourceId,
+    snapshotId: configured.snapshotId,
+  }));
+  if (
+    state.sources.length !== expectedSources.length ||
+    new Set(state.sources.map(({ sourceId }) => sourceId)).size !== state.sources.length
+  ) {
+    throw new Error('Legacy checkpoint source inventory is incomplete or duplicated');
+  }
+  for (const [index, source] of state.sources.entries()) {
+    const expected = expectedSources[index];
+    if (source.sourceId !== expected?.sourceId || source.snapshotId !== expected.snapshotId) {
+      throw new Error('Legacy checkpoint source order or snapshot identity changed');
+    }
+    for (const key of [
+      'acquisitionRecords',
+      'normalizationEventRecords',
+      'decodedRecords',
+      'acceptedRecords',
+      'rejectedRecords',
+      'mutationRecords',
+      'validationIssueRecords',
+    ] as const) {
+      if (!Number.isSafeInteger(source[key]) || source[key] < 0) {
+        throw new Error(`Legacy checkpoint has an invalid ${key} counter`);
+      }
+    }
+    if (source.acceptedRecords + source.rejectedRecords !== source.decodedRecords) {
+      throw new Error(`Legacy checkpoint record balance changed for ${source.sourceId}`);
+    }
+    if (
+      (source.normalizationLogicalSha256 === null) !== !phaseCompleted(source, 'normalize') ||
+      (source.mutationLogicalSha256 === null) !== !phaseCompleted(source, 'normalize') ||
+      (source.validationIssueLogicalSha256 === null) !== !phaseCompleted(source, 'normalize')
+    ) {
+      throw new Error(`Legacy normalization identity state is inconsistent for ${source.sourceId}`);
+    }
+    if (
+      !phaseCompleted(source, 'normalize') &&
+      (source.normalizationEventRecords !== 0 ||
+        source.mutationRecords !== 0 ||
+        source.validationIssueRecords !== 0)
+    ) {
+      throw new Error(`Legacy projection zero-state is inconsistent for ${source.sourceId}`);
+    }
+    const cursor = source.normalizationCursor;
+    if (cursor !== null) {
+      const parsed = parseNormalizationCursor(canonicalJson(cursor));
+      if (
+        parsed?.decodedRecords !== source.decodedRecords ||
+        parsed.acceptedRecords !== source.acceptedRecords ||
+        parsed.rejectedRecords !== source.rejectedRecords
+      ) {
+        throw new Error(`Legacy normalization cursor counters changed for ${source.sourceId}`);
+      }
+    } else if (
+      source.decodedRecords !== 0 ||
+      source.acceptedRecords !== 0 ||
+      source.rejectedRecords !== 0
+    ) {
+      throw new Error(`Legacy normalization counters lack a cursor for ${source.sourceId}`);
+    }
+  }
+}
+
+async function validateMigratedNormalizationState(
+  source: PersistedSourceState,
+  ledger: ChunkLedger,
+  logicalPrefix: string,
+  dependencies: OrchestrationDependencies,
+): Promise<void> {
+  const sequence = await openLedgerChunkSequencePrefix<NormalizationEvent>(
+    dependencies.artifactStore,
+    ledger,
+    logicalPrefix,
+  );
+  assertNormalizationOuterIdentity(source, sequence, ledger.resumeCursor);
+  await assertNormalizationProjectionIdentity(source, sequence);
+}
+
+function assertNormalizationOuterIdentity(
+  source: PersistedSourceState,
+  sequence: ChunkSequence<NormalizationEvent>,
+  resumeCursor: string | null,
+): void {
+  if (source.normalizationLogicalSha256 === null) {
+    if (source.normalizationEventRecords !== 0 || phaseCompleted(source, 'normalize')) {
+      throw new Error(`Incomplete normalization identity is inconsistent for ${source.sourceId}`);
+    }
+  } else if (
+    sequence.recordCount !== source.normalizationEventRecords ||
+    sequence.logicalSha256 !== source.normalizationLogicalSha256
+  ) {
+    throw new Error(`Normalization outer identity changed for ${source.sourceId}`);
+  }
+  const cursor = parseNormalizationCursor(resumeCursor);
+  if (canonicalJson(cursor) !== canonicalJson(source.normalizationCursor)) {
+    throw new Error(`Normalization cursor changed for ${source.sourceId}`);
+  }
+  if (
+    cursor !== null &&
+    (cursor.decodedRecords !== source.decodedRecords ||
+      cursor.acceptedRecords !== source.acceptedRecords ||
+      cursor.rejectedRecords !== source.rejectedRecords)
+  ) {
+    throw new Error(`Normalization counters changed for ${source.sourceId}`);
+  }
+}
+
+async function assertNormalizationProjectionIdentity(
+  source: PersistedSourceState,
+  events: ChunkSequence<NormalizationEvent>,
+): Promise<void> {
+  if (
+    source.mutationLogicalSha256 === null &&
+    source.validationIssueLogicalSha256 === null &&
+    !phaseCompleted(source, 'normalize')
+  ) {
+    return;
+  }
+  const mutationHash = createHash('sha256');
+  const issueHash = createHash('sha256');
+  let mutationRecords = 0;
+  let issueRecords = 0;
+  for await (const event of events.read()) {
+    if (event.kind === 'mutation') {
+      mutationHash.update(`${canonicalJson(event.value)}\n`);
+      mutationRecords += 1;
+    } else if (event.kind === 'validation_issue') {
+      issueHash.update(`${canonicalJson(event.value)}\n`);
+      issueRecords += 1;
+    }
+  }
+  if (
+    mutationRecords !== source.mutationRecords ||
+    issueRecords !== source.validationIssueRecords ||
+    mutationHash.digest('hex') !== source.mutationLogicalSha256 ||
+    issueHash.digest('hex') !== source.validationIssueLogicalSha256
+  ) {
+    throw new Error(`Normalization projection identity changed for ${source.sourceId}`);
+  }
 }
 
 function configurationHash(configuration: PipelineConfiguration): string {
@@ -751,6 +1095,8 @@ async function runSource(
         budget: recordBudget,
         signal: dependencies.signal,
         maximumRecordsPerChunk: 1,
+        maximumBytesPerRecord: normalizationRecordByteCap(),
+        maximumBytesPerChunk: normalizationChunkByteCap(),
         restoredChunks: state.acquisitionChunks,
         cursorFor: ({ metadata }) => metadata.artifactId,
         onChunk: async (chunks) => {
@@ -841,6 +1187,12 @@ async function runSource(
       void request;
     }
 
+    const eventPrefix = normalizationLogicalPrefix(configuration.runId, state.sourceId);
+    const mutationPrefix = mutationLogicalPrefix(configuration.runId, state.sourceId);
+    const validationPrefix = validationIssueLogicalPrefix(configuration.runId, state.sourceId);
+    const licenseSnapshotRef =
+      acquiredMetadata[0]?.licenseSnapshotRef ?? `descriptor:${descriptor.sourceId}`;
+
     if (phaseCompleted(state, 'normalize')) {
       if (
         state.normalizationLogicalSha256 === null ||
@@ -849,21 +1201,60 @@ async function runSource(
       ) {
         throw new Error(`Checkpoint omitted v2 chunk identities for ${state.sourceId}`);
       }
-      const events = await openChunkSequence<NormalizationEvent>(
+      const events = await openLedgerChunkSequence<NormalizationEvent>(
         dependencies.artifactStore,
-        state.normalizationChunks,
+        state.normalizationLedger,
         {
           recordCount: state.normalizationEventRecords,
           logicalSha256: state.normalizationLogicalSha256,
+          logicalPrefix: eventPrefix,
         },
       );
-      mutations = await projectNormalizationEvents(events, 'mutation', {
-        recordCount: state.mutationRecords,
-        logicalSha256: state.mutationLogicalSha256,
+      mutations = await materializeNormalizationProjection({
+        events,
+        kind: 'mutation',
+        store: dependencies.artifactStore,
+        budget: recordBudget,
+        signal: dependencies.signal,
+        maximumRecordsPerChunk: configuration.profile.maxBufferedRecords,
+        maximumBytesPerRecord: normalizationRecordByteCap(),
+        maximumBytesPerChunk: normalizationChunkByteCap(),
+        logicalPrefix: mutationPrefix,
+        visibility: descriptor.defaultVisibility,
+        licenseSnapshotRef,
+        restoredLedger: state.mutationLedger,
+        onLedger: async (ledger) => {
+          const candidate = Object.freeze({ ...state, mutationLedger: ledger });
+          await coordinator.updateSource(candidate);
+          state = candidate;
+        },
+        expected: {
+          recordCount: state.mutationRecords,
+          logicalSha256: state.mutationLogicalSha256,
+        },
       });
-      validationIssues = await projectNormalizationEvents(events, 'validation_issue', {
-        recordCount: state.validationIssueRecords,
-        logicalSha256: state.validationIssueLogicalSha256,
+      validationIssues = await materializeNormalizationProjection({
+        events,
+        kind: 'validation_issue',
+        store: dependencies.artifactStore,
+        budget: recordBudget,
+        signal: dependencies.signal,
+        maximumRecordsPerChunk: configuration.profile.maxBufferedRecords,
+        maximumBytesPerRecord: normalizationRecordByteCap(),
+        maximumBytesPerChunk: normalizationChunkByteCap(),
+        logicalPrefix: validationPrefix,
+        visibility: descriptor.defaultVisibility,
+        licenseSnapshotRef,
+        restoredLedger: state.validationIssueLedger,
+        onLedger: async (ledger) => {
+          const candidate = Object.freeze({ ...state, validationIssueLedger: ledger });
+          await coordinator.updateSource(candidate);
+          state = candidate;
+        },
+        expected: {
+          recordCount: state.validationIssueRecords,
+          logicalSha256: state.validationIssueLogicalSha256,
+        },
       });
     } else {
       const records = {
@@ -876,28 +1267,27 @@ async function runSource(
         acquiredReferences,
         dependencies,
       );
-      validateNormalizationResume(state.normalizationChunks, resume);
+      validateNormalizationResume(state.normalizationLedger, resume);
       const cap = configuration.profile.recordCap;
-      const logicalPrefix = `runs/${configuration.runId.replace('sc:run:', '')}/${state.sourceId.replaceAll(/[^a-zA-Z0-9._~-]/gu, '-')}`;
-      const licenseSnapshotRef =
-        acquiredMetadata[0]?.licenseSnapshotRef ?? `descriptor:${descriptor.sourceId}`;
       const eventWriter = new CanonicalChunkWriter<NormalizationEvent>({
         store: dependencies.artifactStore,
-        logicalPrefix: `${logicalPrefix}/normalize/events`,
+        logicalPrefix: eventPrefix,
         visibility: descriptor.defaultVisibility,
         licenseSnapshotRef,
         budget: recordBudget,
         signal: dependencies.signal,
         maximumRecordsPerChunk: configuration.profile.maxBufferedRecords,
+        maximumBytesPerRecord: normalizationRecordByteCap(),
+        maximumBytesPerChunk: normalizationChunkByteCap(),
         onBufferedRecordDelta: onBufferedEventDelta,
-        restoredChunks: state.normalizationChunks,
+        restoredLedger: state.normalizationLedger,
         cursorFor: ({ cursor }) => canonicalJson(cursor),
-        onChunk: async (chunks) => {
-          const cursor = parseNormalizationCursor(chunks.at(-1)?.resumeCursor ?? null);
+        onLedger: async (ledger) => {
+          const cursor = parseNormalizationCursor(ledger.resumeCursor);
           if (cursor === null) throw new Error('Normalization chunk omitted its resume cursor');
           const candidate = Object.freeze({
             ...state,
-            normalizationChunks: chunks,
+            normalizationLedger: ledger,
             normalizationCursor: cursor,
             decodedRecords: cursor.decodedRecords,
             acceptedRecords: cursor.acceptedRecords,
@@ -940,7 +1330,15 @@ async function runSource(
           await eventWriter.flush();
           return;
         }
-        await eventWriter.append(event, eventLease);
+        const transfer = { ownedByWriter: false };
+        try {
+          await eventWriter.append(event, eventLease, () => {
+            transfer.ownedByWriter = true;
+          });
+        } catch (error) {
+          if (!transfer.ownedByWriter) eventLease.release();
+          throw error;
+        }
       };
       const phase = await timedPhase(
         'decode',
@@ -1192,20 +1590,54 @@ async function runSource(
       const validateTiming: PhaseTiming = Object.freeze({ ...phase.timing, phase: 'validate' });
       const normalizeTiming: PhaseTiming = Object.freeze({ ...phase.timing, phase: 'normalize' });
       const events = phase.value;
-      mutations = await projectNormalizationEvents(events, 'mutation');
-      validationIssues = await projectNormalizationEvents(events, 'validation_issue');
+      mutations = await materializeNormalizationProjection({
+        events,
+        kind: 'mutation',
+        store: dependencies.artifactStore,
+        budget: recordBudget,
+        signal: dependencies.signal,
+        maximumRecordsPerChunk: configuration.profile.maxBufferedRecords,
+        maximumBytesPerRecord: normalizationRecordByteCap(),
+        maximumBytesPerChunk: normalizationChunkByteCap(),
+        logicalPrefix: mutationPrefix,
+        visibility: descriptor.defaultVisibility,
+        licenseSnapshotRef,
+        restoredLedger: state.mutationLedger,
+        onLedger: async (ledger) => {
+          const candidate = Object.freeze({ ...state, mutationLedger: ledger });
+          await coordinator.updateSource(candidate);
+          state = candidate;
+        },
+      });
+      validationIssues = await materializeNormalizationProjection({
+        events,
+        kind: 'validation_issue',
+        store: dependencies.artifactStore,
+        budget: recordBudget,
+        signal: dependencies.signal,
+        maximumRecordsPerChunk: configuration.profile.maxBufferedRecords,
+        maximumBytesPerRecord: normalizationRecordByteCap(),
+        maximumBytesPerChunk: normalizationChunkByteCap(),
+        logicalPrefix: validationPrefix,
+        visibility: descriptor.defaultVisibility,
+        licenseSnapshotRef,
+        restoredLedger: state.validationIssueLedger,
+        onLedger: async (ledger) => {
+          const candidate = Object.freeze({ ...state, validationIssueLedger: ledger });
+          await coordinator.updateSource(candidate);
+          state = candidate;
+        },
+      });
       state = Object.freeze({
         ...state,
         completedPhase: 'normalize',
         decodedRecords: records.decoded,
         acceptedRecords: records.accepted,
         rejectedRecords: records.rejected,
-        normalizationChunks: events.chunks,
+        normalizationLedger: state.normalizationLedger,
         normalizationEventRecords: events.recordCount,
         normalizationLogicalSha256: events.logicalSha256,
-        normalizationCursor: parseNormalizationCursor(events.chunks.at(-1)?.resumeCursor ?? null),
-        mutationChunks: events.chunks,
-        validationIssueChunks: events.chunks,
+        normalizationCursor: parseNormalizationCursor(state.normalizationLedger.resumeCursor),
         mutationLogicalSha256: mutations.logicalSha256,
         validationIssueLogicalSha256: validationIssues.logicalSha256,
         mutationRecords: mutations.recordCount,
@@ -1352,23 +1784,44 @@ function parseNormalizationCursor(value: string | null): NormalizationCursor | n
   if (typeof cursor.recordComplete !== 'boolean') {
     throw new TypeError('Invalid normalization resume cursor recordComplete');
   }
+  if (
+    (cursor.acceptedRecords as number) + (cursor.rejectedRecords as number) !==
+    cursor.decodedRecords
+  ) {
+    throw new TypeError('Invalid normalization resume cursor record balance');
+  }
   return Object.freeze(cursor) as NormalizationCursor;
 }
 
 function validateNormalizationResume(
-  chunks: readonly ChunkReference[],
+  ledger: ChunkLedger,
   cursor: NormalizationCursor | null,
 ): void {
-  const persisted = parseNormalizationCursor(chunks.at(-1)?.resumeCursor ?? null);
+  const persisted = parseNormalizationCursor(ledger.resumeCursor);
   if (canonicalJson(persisted) !== canonicalJson(cursor)) {
     throw new Error('Normalization checkpoint cursor does not match its final chunk reference');
   }
 }
 
-async function projectNormalizationEvents<TKind extends 'mutation' | 'validation_issue'>(
-  events: ChunkSequence<NormalizationEvent>,
-  kind: TKind,
-  expected?: Readonly<{ recordCount: number; logicalSha256: string }>,
+export async function materializeNormalizationProjection<
+  TKind extends 'mutation' | 'validation_issue',
+>(
+  input: Readonly<{
+    events: ChunkSequence<NormalizationEvent>;
+    kind: TKind;
+    store: OrchestrationDependencies['artifactStore'];
+    budget: SharedRecordBudget;
+    signal: AbortSignal;
+    maximumRecordsPerChunk: number;
+    maximumBytesPerRecord?: number;
+    maximumBytesPerChunk?: number;
+    logicalPrefix: string;
+    visibility: string;
+    licenseSnapshotRef: string;
+    restoredLedger: ChunkLedger;
+    onLedger: (ledger: ChunkLedger) => Promise<void>;
+    expected?: Readonly<{ recordCount: number; logicalSha256: string }>;
+  }>,
 ): Promise<
   ChunkSequence<
     Extract<NormalizationEvent, { kind: TKind }> extends { value: infer TValue } ? TValue : never
@@ -1376,31 +1829,60 @@ async function projectNormalizationEvents<TKind extends 'mutation' | 'validation
 > {
   type TValue =
     Extract<NormalizationEvent, { kind: TKind }> extends { value: infer Value } ? Value : never;
-  const hash = createHash('sha256');
-  let recordCount = 0;
-  for await (const event of events.read()) {
-    if (event.kind !== kind) continue;
-    hash.update(`${canonicalJson(event.value)}\n`);
-    recordCount += 1;
-  }
-  const logicalSha256 = hash.digest('hex');
-  if (
-    expected !== undefined &&
-    (expected.recordCount !== recordCount || expected.logicalSha256 !== logicalSha256)
-  ) {
-    throw new Error(`Projected ${kind} logical identity mismatch`);
-  }
-  return Object.freeze({
-    schemaVersion: '2.0.0' as const,
-    recordCount,
-    logicalSha256,
-    chunks: events.chunks,
-    read: async function* () {
-      for await (const event of events.read()) {
-        if (event.kind === kind) yield event.value as TValue;
-      }
-    },
+  const persisted = await openLedgerChunkSequencePrefix<TValue>(
+    input.store,
+    input.restoredLedger,
+    input.logicalPrefix,
+  );
+  const committed = persisted.read()[Symbol.asyncIterator]();
+  const writer = new CanonicalChunkWriter<TValue>({
+    store: input.store,
+    logicalPrefix: input.logicalPrefix,
+    visibility: input.visibility,
+    licenseSnapshotRef: input.licenseSnapshotRef,
+    budget: input.budget,
+    signal: input.signal,
+    maximumRecordsPerChunk: input.maximumRecordsPerChunk,
+    ...(input.maximumBytesPerRecord === undefined
+      ? {}
+      : { maximumBytesPerRecord: input.maximumBytesPerRecord }),
+    ...(input.maximumBytesPerChunk === undefined
+      ? {}
+      : { maximumBytesPerChunk: input.maximumBytesPerChunk }),
+    restoredLedger: input.restoredLedger,
+    onLedger: input.onLedger,
   });
+  try {
+    await writer.restore();
+    for await (const event of input.events.read()) {
+      if (event.kind !== input.kind) continue;
+      const value = event.value as TValue;
+      const prior = await committed.next();
+      if (!prior.done) {
+        if (canonicalJson(prior.value) !== canonicalJson(value)) {
+          throw new Error(`Persisted ${input.kind} projection is not an exact event prefix`);
+        }
+        continue;
+      }
+      await writer.append(value);
+    }
+    if (!(await committed.next()).done) {
+      throw new Error(`Persisted ${input.kind} projection exceeds its event source`);
+    }
+    const sequence = await writer.finish();
+    if (
+      input.expected !== undefined &&
+      (input.expected.recordCount !== sequence.recordCount ||
+        input.expected.logicalSha256 !== sequence.logicalSha256)
+    ) {
+      throw new Error(`Projected ${input.kind} logical identity mismatch`);
+    }
+    return sequence;
+  } catch (error) {
+    writer.abort();
+    await committed.return?.();
+    throw error;
+  }
 }
 
 async function collectLegacyArtifact(
@@ -1592,10 +2074,16 @@ export async function runPipeline(
   if (loaded.state !== undefined && loaded.state.configurationHash !== hash) {
     throw new Error(`Run ${configuration.runId} cannot resume with changed configuration`);
   }
+  const migrated =
+    loaded.state === undefined
+      ? Object.freeze({ state: initialState(configuration, hash), migrated: false })
+      : await migrateLegacyNormalizationLedgers(loaded.state, configuration, hash, dependencies);
   const run: MutableRun = {
     envelope: loaded.envelope,
-    state: loaded.state ?? initialState(configuration, hash),
+    state: migrated.state,
   };
+  const coordinator = new RunCheckpointCoordinator(run, dependencies);
+  if (loaded.state === undefined || migrated.migrated) await coordinator.updateRun({});
   if (run.state.manifestArtifact !== null) {
     const manifest = await loadRequired<PipelineRunManifest>(
       dependencies,
@@ -1606,8 +2094,6 @@ export async function runPipeline(
     if (manifestArtifact === undefined) throw new Error('Completed run manifest is missing');
     return Object.freeze({ manifest, manifestArtifact });
   }
-  const coordinator = new RunCheckpointCoordinator(run, dependencies);
-  if (loaded.state === undefined) await coordinator.updateRun({});
   const recordBudget = createSharedRecordBudget(configuration.profile.maxBufferedRecords);
   let activeRecords = 0;
   let highWaterActiveRecords = 0;

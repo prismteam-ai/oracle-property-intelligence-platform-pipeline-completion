@@ -133,6 +133,7 @@ import {
 
 import { capabilityStates } from './default-processors.js';
 import { canonicalJson, sha256 } from './canonical-json.js';
+import { readCanonicalLines } from './chunks.js';
 import type {
   BoundedCountyProcessingRequest,
   BoundedCountyProcessingResult,
@@ -304,6 +305,7 @@ async function processBoundedCounty(
       options.resourceIdentity,
     );
     try {
+      await verifyRootedMutationSequences(request, sharedBudget, options.budget.maxBufferedBytes);
       const exactMutationLogicalSha256 = await computeExactMutationLogicalSha256(request);
       const trustedAcquisition = await materializeTrustedAcquisition(
         request,
@@ -1019,6 +1021,108 @@ async function computeExactMutationLogicalSha256(
   return hash.digest('hex');
 }
 
+async function verifyRootedMutationSequences(
+  request: BoundedCountyProcessingRequest,
+  sharedBudget: ProcessWideBoundedBudget,
+  maximumBytes: number,
+): Promise<void> {
+  for (const source of request.mutationSources) {
+    const root = source.sequence.chunkInventory;
+    if (root == null) continue;
+    if (source.sequence.readReferences === undefined) {
+      throw new BoundedPipelineIntegrityError(
+        `Rooted mutation sequence omitted references: ${source.sourceId}`,
+      );
+    }
+    const inventory = streamVerifiedBoundedDescriptorInventory({
+      root,
+      resolver: descriptorPageResolver(request, sharedBudget, maximumBytes),
+      parseDescriptor: (value) => mutationChunkInputSchema.parse(value),
+      orderKey: ({ sequence }) => sequence.toString().padStart(16, '0'),
+      recordCount: ({ recordCount }) => recordCount,
+      byteSize: ({ byteSize }) => byteSize,
+    });
+    // The descriptor iterator and completion reject together; attach immediately so a resolver
+    // failure cannot become an unhandled rejection before iterator cleanup reaches the catch.
+    void inventory.completion.catch(() => undefined);
+    const rooted = inventory.descriptors[Symbol.asyncIterator]();
+    const declared = source.sequence.readReferences()[Symbol.asyncIterator]();
+    const logical = createHash('sha256');
+    const licenses = new Set<string>();
+    let recordCount = 0;
+    try {
+      for (;;) {
+        const [rootedNext, declaredNext] = await Promise.all([rooted.next(), declared.next()]);
+        if (rootedNext.done || declaredNext.done) {
+          if (rootedNext.done !== declaredNext.done) {
+            throw new BoundedPipelineIntegrityError(
+              `Rooted mutation references differ from their page inventory: ${source.sourceId}`,
+            );
+          }
+          break;
+        }
+        const descriptor = rootedNext.value;
+        const reference = declaredNext.value;
+        if (canonicalJson(descriptor) !== canonicalJson(reference)) {
+          throw new BoundedPipelineIntegrityError(
+            `Rooted mutation reference changed: ${source.sourceId}`,
+          );
+        }
+        const stored = await request.artifactStore.headByLogicalKey(reference.logicalKey);
+        if (
+          stored?.uri !== reference.uri ||
+          stored.sha256 !== reference.sha256 ||
+          stored.byteSize !== reference.byteSize ||
+          stored.mediaType !== reference.mediaType
+        ) {
+          throw new BoundedPipelineIntegrityError(
+            `Rooted mutation chunk changed: ${reference.logicalKey}`,
+          );
+        }
+        let chunkRecords = 0;
+        let chunkBytes = 0;
+        for await (const line of readCanonicalLines(request.artifactStore, reference)) {
+          if (line.byteLength > maximumBytes) {
+            throw new BoundedPipelineBudgetError('Rooted mutation record exceeds byte budget');
+          }
+          canonicalMutationSchema.parse(
+            JSON.parse(new TextDecoder('utf8', { fatal: true }).decode(line)) as unknown,
+          );
+          logical.update(line);
+          chunkRecords += 1;
+          chunkBytes += line.byteLength;
+        }
+        if (chunkRecords !== reference.recordCount || chunkBytes !== reference.byteSize) {
+          throw new BoundedPipelineIntegrityError(
+            `Rooted mutation chunk counts changed: ${reference.logicalKey}`,
+          );
+        }
+        recordCount += chunkRecords;
+        licenses.add(reference.licenseSnapshotRef);
+      }
+      await inventory.completion;
+      await rooted.return?.();
+      await declared.return?.();
+    } catch (error) {
+      await rooted.return?.();
+      await declared.return?.();
+      throw error;
+    }
+    const declaredLicenses = [...new Set(source.sequence.licenseSnapshotRefs ?? [])].sort(
+      compareUtf8,
+    );
+    if (
+      recordCount !== source.sequence.recordCount ||
+      logical.digest('hex') !== source.sequence.logicalSha256 ||
+      canonicalJson([...licenses].sort(compareUtf8)) !== canonicalJson(declaredLicenses)
+    ) {
+      throw new BoundedPipelineIntegrityError(
+        `Rooted mutation physical identity changed: ${source.sourceId}`,
+      );
+    }
+  }
+}
+
 async function verifyMutationSpool(
   connection: DuckDBConnection,
   processing: BoundedProcessingInput,
@@ -1353,6 +1457,20 @@ function authoritativeRegistry(
   return Object.freeze({ authoritativeCountyRegistry: registry });
 }
 
+function mutationLicenseSnapshotRefs(processing: BoundedProcessingInput): readonly string[] {
+  return Object.freeze(
+    [
+      ...new Set(
+        processing.mutationLog.sources.flatMap(
+          (source) =>
+            source.licenseSnapshotRefs ??
+            source.chunks.map(({ licenseSnapshotRef }) => licenseSnapshotRef),
+        ),
+      ),
+    ].sort(compareUtf8),
+  );
+}
+
 function createProcessingInput(
   request: BoundedCountyProcessingRequest,
   options: RuntimeOptions,
@@ -1369,7 +1487,16 @@ function createProcessingInput(
     mutationSchemaSha256: MUTATION_SCHEMA_SHA256,
     recordCount: sequence.recordCount,
     logicalSha256: sequence.logicalSha256,
-    chunks: sequence.chunks.map((chunk) => mutationChunkInputSchema.parse(chunk)),
+    chunks:
+      sequence.chunkInventory == null
+        ? sequence.chunks.map((chunk) => mutationChunkInputSchema.parse(chunk))
+        : [],
+    chunkInventory: sequence.chunkInventory ?? null,
+    ...(sequence.chunkInventory == null
+      ? {}
+      : {
+          licenseSnapshotRefs: [...new Set(sequence.licenseSnapshotRefs ?? [])].sort(compareUtf8),
+        }),
   }));
   const mutationLogWithoutHash = {
     format: 'oracle-bounded-mutation-log-v2' as const,
@@ -1521,11 +1648,7 @@ async function materializeAllMutationPartitions(
         lastSortKey: value.lastSortKey,
         schemaSha256: MUTATION_SCHEMA_SHA256,
         sourceLineageSha256: processing.sourceManifestSha256,
-        licenseIdentitySha256: sha256(
-          processing.mutationLog.sources.map(({ chunks }) =>
-            chunks.map(({ licenseSnapshotRef }) => licenseSnapshotRef),
-          ),
-        ),
+        licenseIdentitySha256: sha256(mutationLicenseSnapshotRefs(processing)),
         visibility: 'mixed_internal',
       });
       await connection.run(
@@ -2555,11 +2678,7 @@ async function deriveFeatures(
         inputManifestSha256: processing.logicalOutputIdentitySha256,
         outputSchemaSha256: FEATURE_BUNDLE_SCHEMA_SHA256,
         sourceLineageSha256: processing.sourceManifestSha256,
-        licenseIdentitySha256: sha256(
-          processing.mutationLog.sources.flatMap(({ chunks }) =>
-            chunks.map(({ licenseSnapshotRef }) => licenseSnapshotRef),
-          ),
-        ),
+        licenseIdentitySha256: sha256(mutationLicenseSnapshotRefs(processing)),
         budget: processing.budget,
         ...Object.freeze({
           maxInputBytesPerRecord: Math.max(1, Math.floor(processing.budget.maxBufferedBytes / 4)),
@@ -4703,11 +4822,7 @@ function canonicalLineageResolver(
       fieldValue,
       reference,
     }: Parameters<BoundedTrustedCanonicalLineageResolver['verifyPropertyQueryFieldReference']>[0]) {
-      if (
-        typeof propertyId !== 'string' ||
-        propertyId.trim().length === 0 ||
-        fieldValue === undefined
-      ) {
+      if (typeof propertyId !== 'string' || propertyId.trim().length === 0) {
         return false;
       }
       const specification = propertyQueryCanonicalLineageSpec(fieldName);
@@ -5526,15 +5641,7 @@ async function materializeStageValueArtifact(
     lastSortKey: partitionId.toString().padStart(8, '0'),
     schemaSha256: sha256({ dataset, stage, version: processing.stageVersions[stage] }),
     sourceLineageSha256: processing.sourceManifestSha256,
-    licenseIdentitySha256: sha256(
-      [
-        ...new Set(
-          processing.mutationLog.sources.flatMap(({ chunks }) =>
-            chunks.map(({ licenseSnapshotRef }) => licenseSnapshotRef),
-          ),
-        ),
-      ].sort(compareUtf8),
-    ),
+    licenseIdentitySha256: sha256(mutationLicenseSnapshotRefs(processing)),
     visibility: 'mixed_internal' as const,
   });
   await recordStageArtifact(connection, artifact);

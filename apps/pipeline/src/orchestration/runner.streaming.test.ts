@@ -5,6 +5,7 @@ import { join } from 'node:path';
 
 import { LocalArtifactStore } from '@oracle/artifacts/implementations/local-artifact-store';
 import { LocalCheckpointStore } from '@oracle/artifacts/implementations/local-checkpoint-store';
+import { createCheckpointEnvelope, type CheckpointValue } from '@oracle/artifacts/checkpoint-store';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
 import { runIdSchema, snapshotIdSchema, sourceIdSchema } from '@oracle/contracts/ids';
 import {
@@ -15,6 +16,7 @@ import {
   type AcquisitionPlan,
   type AcquisitionRequest,
   type SourceCheckpoint,
+  type ValidationIssue,
 } from '@oracle/contracts/source';
 import {
   createStreamingAcquiredArtifact,
@@ -32,20 +34,51 @@ import type {
   ValidationContext,
 } from '@oracle/source-adapters/spi/adapter';
 import type { CsvDecodedRecord } from '@oracle/source-adapters/spi/decode';
-import { afterEach, describe, expect, it } from 'vitest';
+import {
+  createSharedRecordBudget,
+  type SharedRecordBudget,
+} from '@oracle/source-adapters/spi/record-budget';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { runPipeline } from './runner.js';
+import { materializeNormalizationProjection, runPipeline } from './runner.js';
+import {
+  emptyChunkLedger,
+  openLedgerChunkSequence,
+  streamChunkLedgerReferences,
+  type ChunkLedger,
+  type ChunkReference,
+} from './chunks.js';
 import type {
   OrchestrationDependencies,
   PipelineConfiguration,
   PipelineProcessors,
+  PersistedSourceState,
   SourceConfiguration,
 } from './types.js';
+
+type RecordBudgetModule = Readonly<{
+  createSharedRecordBudget: typeof createSharedRecordBudget;
+}>;
+
+const createdRecordBudgets = vi.hoisted(() => [] as SharedRecordBudget[]);
+
+vi.mock('@oracle/source-adapters/spi/record-budget', async (importOriginal) => {
+  const actual = await importOriginal<RecordBudgetModule>();
+  return {
+    ...actual,
+    createSharedRecordBudget(capacity: number): SharedRecordBudget {
+      const budget = actual.createSharedRecordBudget(capacity);
+      createdRecordBudgets.push(budget);
+      return budget;
+    },
+  };
+});
 
 const INSTANT = '2026-07-18T00:00:00.000Z';
 const roots: string[] = [];
 
 afterEach(async () => {
+  createdRecordBudgets.splice(0);
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -74,11 +107,13 @@ type AdapterBehavior = Readonly<{
   itemCount?: number;
   decodedPerArtifact?: number;
   normalizeFanout?: number;
+  oversizedFinalizeBytes?: number;
   abortAfterFirstAcquireYield?: boolean;
   replayRequestKeyOverride?: string;
   abortAfterFirstFinalizeYield?: boolean;
   abortInValidate?: boolean;
   failValidate?: boolean;
+  validationIssueCount?: number;
   failNormalize?: boolean;
   finalizeCount?: number;
   waitInPlan?: Promise<void>;
@@ -283,7 +318,17 @@ class GeneratedAdapter implements StreamingSourceAdapter<CsvDecodedRecord, CsvDe
       context.signal.throwIfAborted();
     }
     if (this.#behavior.failValidate === true) throw new Error('validate failed');
-    return { status: 'accepted', record, issues: [] };
+    return {
+      status: 'accepted',
+      record,
+      issues: Array.from({ length: this.#behavior.validationIssueCount ?? 0 }, (_, index) => ({
+        code: `generated_${index}`,
+        severity: 'warning' as const,
+        message: `Generated warning ${index}`,
+        recordKey: String(record.ordinal),
+        fieldPath: 'value',
+      })),
+    };
   }
 
   public async *normalize(record: CsvDecodedRecord): AsyncIterable<CanonicalMutation> {
@@ -308,6 +353,14 @@ class GeneratedAdapter implements StreamingSourceAdapter<CsvDecodedRecord, CsvDe
         for await (const artifact of artifacts.read()) {
           void artifact;
           counters.finalizeArtifactReads += 1;
+        }
+        if (behavior.oversizedFinalizeBytes !== undefined) {
+          counters.finalizeAdvances += 1;
+          yield Object.freeze({
+            ...testMutation(`${slug}-oversized-final`),
+            payload: 'x'.repeat(behavior.oversizedFinalizeBytes),
+          });
+          return;
         }
         for (let index = 0; index < (behavior.finalizeCount ?? 0); index += 1) {
           counters.finalizeAdvances += 1;
@@ -449,6 +502,122 @@ function dependencies(
 }
 
 describe('streaming runner restart and budget contracts', () => {
+  it('releases a pre-transfer oversized event lease so another source can progress', async () => {
+    const store = await stores('oversized-event-lease');
+    const controller = new AbortController();
+    const oversized = new GeneratedAdapter('oversized-event', controller, counters(), {
+      decodedPerArtifact: 0,
+      oversizedFinalizeBytes: 1024 * 1024,
+    });
+    const healthy = new GeneratedAdapter('healthy-after-oversized', controller, counters(), {
+      normalizeFanout: 1,
+    });
+    const baseConfiguration = configuration('d'.repeat(64), [source(oversized), source(healthy)], {
+      maxBufferedRecords: 2,
+    });
+    const pipelineConfiguration = {
+      ...baseConfiguration,
+      profile: { ...baseConfiguration.profile, maxConcurrentSources: 1 },
+    } satisfies PipelineConfiguration;
+    createdRecordBudgets.splice(0);
+    const result = await runPipeline(pipelineConfiguration, dependencies(store, controller));
+    const oversizedResult = result.manifest.sources.find(
+      ({ sourceId }) => sourceId === oversized.describe().sourceId,
+    );
+    const healthyResult = result.manifest.sources.find(
+      ({ sourceId }) => sourceId === healthy.describe().sourceId,
+    );
+    expect(oversizedResult).toMatchObject({ terminalState: 'failed', summary: null });
+    expect(oversizedResult?.limitations).toContainEqual(
+      expect.stringContaining('Canonical record exceeds'),
+    );
+    expect(healthyResult).toMatchObject({
+      terminalState: 'complete',
+      summary: { normalizedMutations: 1 },
+    });
+    expect(result.manifest.backpressure).toMatchObject({
+      activeRecordsAtCompletion: 0,
+      bufferedEventsAtCompletion: 0,
+    });
+    expect(createdRecordBudgets).toHaveLength(1);
+    expect(createdRecordBudgets[0]?.metrics()).toMatchObject({
+      capacity: 2,
+      highWaterRecords: 2,
+      inUse: 0,
+    });
+  });
+
+  it('releases projection leases after checkpoint failure and permits exact retry progress', async () => {
+    const store = await stores('projection-checkpoint-failure');
+    const logicalPrefix = 'runs/projection-failure/normalize/mutations';
+    const restoredLedger = emptyChunkLedger(logicalPrefix);
+    const values = [testMutation('projection-0'), testMutation('projection-1')];
+    const events = Object.freeze({
+      schemaVersion: '2.0.0' as const,
+      recordCount: 2,
+      logicalSha256: '0'.repeat(64),
+      chunks: Object.freeze([]),
+      chunkInventory: null,
+      read: async function* () {
+        for (const [index, value] of values.entries()) {
+          yield await Promise.resolve({
+            schemaVersion: '2.0.0' as const,
+            kind: 'mutation' as const,
+            cursor: {
+              artifactIndex: 0,
+              recordOrdinal: 1,
+              issueOffset: 0,
+              mutationOffset: index + 1,
+              recordComplete: false,
+              decodedRecords: 0,
+              acceptedRecords: 0,
+              rejectedRecords: 0,
+            },
+            value,
+          });
+        }
+      },
+    });
+    const budget = createSharedRecordBudget(2);
+    await expect(
+      materializeNormalizationProjection({
+        events,
+        kind: 'mutation',
+        store: store.artifacts,
+        budget,
+        signal: new AbortController().signal,
+        maximumRecordsPerChunk: 2,
+        logicalPrefix,
+        visibility: 'public',
+        licenseSnapshotRef: 'sc:license:projection:test',
+        restoredLedger,
+        onLedger: () => Promise.reject(new Error('injected projection checkpoint failure')),
+      }),
+    ).rejects.toThrow('injected projection checkpoint failure');
+    expect(budget.metrics().inUse).toBe(0);
+
+    let checkpoint = restoredLedger;
+    const retried = await materializeNormalizationProjection({
+      events,
+      kind: 'mutation',
+      store: store.artifacts,
+      budget,
+      signal: new AbortController().signal,
+      maximumRecordsPerChunk: 2,
+      logicalPrefix,
+      visibility: 'public',
+      licenseSnapshotRef: 'sc:license:projection:test',
+      restoredLedger,
+      onLedger: (ledger) => {
+        checkpoint = ledger;
+        return Promise.resolve();
+      },
+    });
+    expect(retried.recordCount).toBe(2);
+    expect(checkpoint.totalRecords).toBe(2);
+    expect(budget.metrics().inUse).toBe(0);
+  });
+
   it('persists each yielded acquisition and replays identical-body plan items without reacquiring', async () => {
     const store = await stores('acquire-replay');
     const measured = counters();
@@ -538,6 +707,376 @@ describe('streaming runner restart and budget contracts', () => {
     expect(secondMeasured.finalizeCalls).toBe(1);
     expect(secondMeasured.finalizeArtifactReads).toBe(1);
     expect(result.manifest.sources[0]?.summary?.normalizedMutations).toBe(2);
+  });
+
+  it('migrates a persisted legacy run only after exact byte/prefix identity and leaves failures authoritative', async () => {
+    const store = await stores('persisted-ledger-migration');
+    const config = configuration('9'.repeat(64), [
+      source(
+        new GeneratedAdapter('persisted-ledger-migration', new AbortController(), counters(), {
+          finalizeCount: 2,
+          validationIssueCount: 2,
+        }),
+      ),
+    ]);
+    const firstController = new AbortController();
+    const interrupted = new GeneratedAdapter(
+      'persisted-ledger-migration',
+      firstController,
+      counters(),
+      { finalizeCount: 2, validationIssueCount: 2, abortAfterFirstFinalizeYield: true },
+    );
+    await expect(
+      runPipeline(
+        configuration('9'.repeat(64), [source(interrupted)]),
+        dependencies(store, firstController),
+      ),
+    ).rejects.toThrow('abort after finalizer output');
+
+    const scope = `pipeline-run:${config.runId}`;
+    const toLegacy = async (tamper: boolean) => {
+      const current = await store.checkpoints.load(scope);
+      if (current === undefined) throw new Error('Expected persisted run checkpoint');
+      const payload = current.payload as unknown as Record<string, unknown>;
+      const sources = payload.sources as Record<string, unknown>[];
+      const currentSource = sources[0];
+      if (currentSource === undefined) throw new Error('Expected persisted source state');
+      const ledger = currentSource.normalizationLedger as ChunkLedger;
+      const references: ChunkReference[] = [];
+      for await (const reference of streamChunkLedgerReferences(
+        store.artifacts,
+        ledger,
+        ledger.logicalPrefix,
+      )) {
+        references.push(reference);
+      }
+      if (tamper && references[0] !== undefined) {
+        references[0] = Object.freeze({ ...references[0], sha256: '0'.repeat(64) });
+      }
+      const legacySource = { ...currentSource };
+      delete legacySource.normalizationLedger;
+      delete legacySource.mutationLedger;
+      delete legacySource.validationIssueLedger;
+      legacySource.normalizationChunks = references;
+      const completedNormalization =
+        legacySource.completedPhase === 'normalize' || legacySource.completedPhase === 'summarize';
+      legacySource.mutationChunks = completedNormalization ? references : [];
+      legacySource.validationIssueChunks = completedNormalization ? references : [];
+      const legacyPayload = Object.freeze({
+        ...payload,
+        sources: Object.freeze([Object.freeze(legacySource), ...sources.slice(1)]),
+      });
+      const envelope = createCheckpointEnvelope({
+        scope,
+        previousRevision: current.revision,
+        writtenAt: INSTANT,
+        payload: legacyPayload as CheckpointValue,
+      });
+      const committed = await store.checkpoints.commit({
+        expectedRevision: current.revision,
+        checkpoint: envelope,
+      });
+      if (committed.status !== 'committed') throw new Error('Legacy fixture commit conflicted');
+      return committed.checkpoint;
+    };
+
+    let legacy = await toLegacy(false);
+    const validLegacyPayload = legacy.payload;
+    const commitLegacyPayload = async (payload: CheckpointValue) => {
+      const current = await store.checkpoints.load(scope);
+      if (current === undefined) throw new Error('Expected current legacy checkpoint');
+      const envelope = createCheckpointEnvelope({
+        scope,
+        previousRevision: current.revision,
+        writtenAt: INSTANT,
+        payload,
+      });
+      const committed = await store.checkpoints.commit({
+        expectedRevision: current.revision,
+        checkpoint: envelope,
+      });
+      if (committed.status !== 'committed') throw new Error('Legacy mutation conflicted');
+      return committed.checkpoint;
+    };
+    const corruptAlias = async (field: 'mutationChunks' | 'validationIssueChunks') => {
+      const payload = validLegacyPayload as unknown as Record<string, unknown>;
+      const sources = payload.sources as Record<string, unknown>[];
+      const currentSource = sources[0];
+      if (currentSource === undefined) throw new Error('Expected legacy source');
+      const normalizationReferences = currentSource.normalizationChunks as ChunkReference[];
+      const corrupt = Object.freeze({
+        ...currentSource,
+        [field]: Object.freeze([
+          Object.freeze({
+            ...normalizationReferences[0],
+            resumeCursor: 'corrupt-partial-projection-cursor',
+          }),
+        ]),
+      });
+      const corrupted = await commitLegacyPayload(
+        Object.freeze({
+          ...payload,
+          sources: Object.freeze([corrupt, ...sources.slice(1)]),
+        }) as CheckpointValue,
+      );
+      const controller = new AbortController();
+      await expect(
+        runPipeline(
+          configuration('9'.repeat(64), [
+            source(
+              new GeneratedAdapter('persisted-ledger-migration', controller, counters(), {
+                finalizeCount: 2,
+                validationIssueCount: 2,
+              }),
+            ),
+          ]),
+          dependencies(store, controller),
+        ),
+      ).rejects.toThrow(`Legacy ${field} has invalid partial zero-state semantics`);
+      expect((await store.checkpoints.load(scope))?.revision).toBe(corrupted.revision);
+      legacy = await commitLegacyPayload(validLegacyPayload);
+    };
+    await corruptAlias('mutationChunks');
+    await corruptAlias('validationIssueChunks');
+    const rejectCorruptState = async (
+      mutate: (payload: Record<string, unknown>) => CheckpointValue,
+      message: string,
+    ) => {
+      const corrupted = await commitLegacyPayload(
+        mutate(validLegacyPayload as unknown as Record<string, unknown>),
+      );
+      const controller = new AbortController();
+      await expect(
+        runPipeline(
+          configuration('9'.repeat(64), [
+            source(
+              new GeneratedAdapter('persisted-ledger-migration', controller, counters(), {
+                finalizeCount: 2,
+                validationIssueCount: 2,
+              }),
+            ),
+          ]),
+          dependencies(store, controller),
+        ),
+      ).rejects.toThrow(message);
+      expect((await store.checkpoints.load(scope))?.revision).toBe(corrupted.revision);
+      legacy = await commitLegacyPayload(validLegacyPayload);
+    };
+    await rejectCorruptState((payload) => {
+      const sources = payload.sources as Record<string, unknown>[];
+      return Object.freeze({
+        ...payload,
+        sources: Object.freeze([
+          Object.freeze({
+            ...sources[0],
+            normalizationLedger: emptyChunkLedger('mixed-format/events'),
+          }),
+        ]),
+      });
+    }, 'mixed or incomplete chunk formats');
+    await rejectCorruptState((payload) => {
+      const sources = payload.sources as Record<string, unknown>[];
+      const current = { ...sources[0] };
+      delete current.normalizationChunks;
+      delete current.mutationChunks;
+      delete current.validationIssueChunks;
+      current.normalizationLedger = emptyChunkLedger('incomplete-current/events');
+      current.mutationLedger = emptyChunkLedger('incomplete-current/mutations');
+      return Object.freeze({
+        ...payload,
+        sources: Object.freeze([Object.freeze(current)]),
+      }) as unknown as CheckpointValue;
+    }, 'mixed or incomplete chunk formats');
+    await rejectCorruptState(
+      (payload) => Object.freeze({ ...payload, runId: `sc:run:${'8'.repeat(64)}` }),
+      'run/configuration identity changed',
+    );
+    await rejectCorruptState((payload) => {
+      const sources = payload.sources as Record<string, unknown>[];
+      return Object.freeze({
+        ...payload,
+        sources: Object.freeze([
+          Object.freeze({ ...sources[0], snapshotId: `sc:snapshot:changed:${'0'.repeat(64)}` }),
+        ]),
+      });
+    }, 'source order or snapshot identity changed');
+    await rejectCorruptState((payload) => {
+      const sources = payload.sources as Record<string, unknown>[];
+      return Object.freeze({
+        ...payload,
+        sources: Object.freeze([
+          Object.freeze({ ...sources[0], acceptedRecords: Number.MAX_SAFE_INTEGER + 1 }),
+        ]),
+      });
+    }, 'invalid acceptedRecords counter');
+    await rejectCorruptState((payload) => {
+      const sources = payload.sources as Record<string, unknown>[];
+      return Object.freeze({
+        ...payload,
+        sources: Object.freeze([Object.freeze({ ...sources[0], mutationRecords: 1 })]),
+      });
+    }, 'projection zero-state is inconsistent');
+    await rejectCorruptState((payload) => {
+      const sources = payload.sources as Record<string, unknown>[];
+      return Object.freeze({
+        ...payload,
+        sources: Object.freeze([
+          Object.freeze({
+            ...sources[0],
+            decodedRecords: 2,
+            acceptedRecords: 1,
+            rejectedRecords: 0,
+          }),
+        ]),
+      });
+    }, 'record balance changed');
+    await rejectCorruptState((payload) => {
+      const sources = payload.sources as Record<string, unknown>[];
+      const current = sources[0];
+      const cursor = current?.normalizationCursor as Record<string, unknown>;
+      return Object.freeze({
+        ...payload,
+        sources: Object.freeze([
+          Object.freeze({
+            ...current,
+            normalizationCursor: Object.freeze({
+              ...cursor,
+              decodedRecords: 1,
+              acceptedRecords: 0,
+              rejectedRecords: 0,
+            }),
+          }),
+        ]),
+      });
+    }, 'cursor record balance');
+    const legacySourceBeforeResume = (
+      (legacy.payload as unknown as Record<string, unknown>).sources as Record<string, unknown>[]
+    )[0];
+    expect(
+      (legacySourceBeforeResume?.normalizationChunks as ChunkReference[]).length,
+    ).toBeGreaterThan(0);
+    const downstreamAuthority = createCheckpointEnvelope({
+      scope: `bounded-processing:${config.runId}`,
+      previousRevision: null,
+      writtenAt: INSTANT,
+      payload: Object.freeze({ authority: 'begun' }),
+    });
+    const downstreamController = new AbortController();
+    const downstreamDependencies = Object.freeze({
+      ...dependencies(store, downstreamController),
+      checkpointStore: Object.freeze({
+        load: (requestedScope: string) =>
+          requestedScope === downstreamAuthority.scope
+            ? Promise.resolve(downstreamAuthority)
+            : store.checkpoints.load(requestedScope),
+        commit: store.checkpoints.commit.bind(store.checkpoints),
+      }),
+    });
+    await expect(
+      runPipeline(
+        configuration('9'.repeat(64), [
+          source(
+            new GeneratedAdapter('persisted-ledger-migration', downstreamController, counters(), {
+              finalizeCount: 2,
+              validationIssueCount: 2,
+            }),
+          ),
+        ]),
+        downstreamDependencies,
+      ),
+    ).rejects.toThrow('after bounded processing has begun');
+    expect((await store.checkpoints.load(scope))?.revision).toBe(legacy.revision);
+    const resumeController = new AbortController();
+    const resumed = new GeneratedAdapter(
+      'persisted-ledger-migration',
+      resumeController,
+      counters(),
+      { finalizeCount: 2, validationIssueCount: 2 },
+    );
+    const result = await runPipeline(
+      configuration('9'.repeat(64), [source(resumed)]),
+      dependencies(store, resumeController),
+    );
+    expect(result.manifest.sources[0]?.summary?.normalizedMutations).toBe(2);
+    const migrated = await store.checkpoints.load(scope);
+    expect(migrated?.revision).not.toBe(legacy.revision);
+    const migratedSource = (
+      (migrated?.payload as unknown as Record<string, unknown>).sources as Record<string, unknown>[]
+    )[0];
+    expect(migratedSource?.normalizationLedger).toMatchObject({
+      schemaVersion: 'oracle-chunk-ledger-v1',
+    });
+    expect(migratedSource).not.toHaveProperty('normalizationChunks');
+    const persistedSource = migratedSource as unknown as PersistedSourceState;
+    const mutationSequence = await openLedgerChunkSequence<CanonicalMutation>(
+      store.artifacts,
+      persistedSource.mutationLedger,
+      {
+        recordCount: persistedSource.mutationRecords,
+        logicalSha256: persistedSource.mutationLogicalSha256 ?? '',
+        logicalPrefix: persistedSource.mutationLedger.logicalPrefix,
+      },
+    );
+    const issueSequence = await openLedgerChunkSequence<ValidationIssue>(
+      store.artifacts,
+      persistedSource.validationIssueLedger,
+      {
+        recordCount: persistedSource.validationIssueRecords,
+        logicalSha256: persistedSource.validationIssueLogicalSha256 ?? '',
+        logicalPrefix: persistedSource.validationIssueLedger.logicalPrefix,
+      },
+    );
+    const mutations: CanonicalMutation[] = [];
+    for await (const mutation of mutationSequence.read()) mutations.push(mutation);
+    const issues: ValidationIssue[] = [];
+    for await (const issue of issueSequence.read()) issues.push(issue);
+    expect(mutations).toEqual([
+      testMutation('persisted-ledger-migration-final-0'),
+      testMutation('persisted-ledger-migration-final-1'),
+    ]);
+    expect(issues.map(({ code }) => code)).toEqual(['generated_0', 'generated_1']);
+    expect(mutationSequence.chunkInventory?.recordCount).toBe(2);
+    expect(issueSequence.chunkInventory?.recordCount).toBe(2);
+    const expectedLicense = resumed.describe().license.licenseSnapshotId;
+    expect(mutationSequence.licenseSnapshotRefs).toEqual([expectedLicense]);
+    expect(issueSequence.licenseSnapshotRefs).toEqual([expectedLicense]);
+    const legacyPayload = legacy.payload as unknown as Record<string, unknown>;
+    const migratedPayload = migrated?.payload as unknown as Record<string, unknown>;
+    expect(migratedPayload.runId).toBe(legacyPayload.runId);
+    expect(migratedPayload.configurationHash).toBe(legacyPayload.configurationHash);
+    const legacySource = (legacyPayload.sources as Record<string, unknown>[])[0];
+    const legacyReferences = legacySource?.normalizationChunks as ChunkReference[];
+    const migratedReferences: ChunkReference[] = [];
+    for await (const reference of streamChunkLedgerReferences(
+      store.artifacts,
+      persistedSource.normalizationLedger,
+      persistedSource.normalizationLedger.logicalPrefix,
+    )) {
+      migratedReferences.push(reference);
+    }
+    expect(migratedReferences.slice(0, legacyReferences.length)).toEqual(legacyReferences);
+    expect(legacySource?.normalizationCursor).toEqual(
+      JSON.parse(legacyReferences.at(-1)?.resumeCursor ?? 'null'),
+    );
+    expect(persistedSource.normalizationCursor).toEqual(
+      JSON.parse(persistedSource.normalizationLedger.resumeCursor ?? 'null'),
+    );
+
+    const invalidLegacy = await toLegacy(true);
+    const rejectedController = new AbortController();
+    const rejected = new GeneratedAdapter(
+      'persisted-ledger-migration',
+      rejectedController,
+      counters(),
+      { finalizeCount: 2, validationIssueCount: 2 },
+    );
+    await expect(
+      runPipeline(
+        configuration('9'.repeat(64), [source(rejected)]),
+        dependencies(store, rejectedController),
+      ),
+    ).rejects.toBeInstanceOf(Error);
+    expect((await store.checkpoints.load(scope))?.revision).toBe(invalidLegacy.revision);
   });
 
   it('acquires the one global permit before advancing concurrent finalizers and cleans up rejection', async () => {

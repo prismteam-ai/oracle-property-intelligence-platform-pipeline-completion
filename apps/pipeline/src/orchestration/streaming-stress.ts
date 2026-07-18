@@ -6,7 +6,14 @@ import { join } from 'node:path';
 import { LocalArtifactStore } from '@oracle/artifacts/implementations/local-artifact-store';
 import { LocalCheckpointStore } from '@oracle/artifacts/implementations/local-checkpoint-store';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
-import { runIdSchema, snapshotIdSchema, sourceIdSchema } from '@oracle/contracts/ids';
+import {
+  artifactIdSchema,
+  runIdSchema,
+  snapshotIdSchema,
+  sourceIdSchema,
+} from '@oracle/contracts/ids';
+import { normalizePropertyRecord } from '@oracle/canonical-model/normalizers/property';
+import { testContext } from '@oracle/canonical-model/normalizers/test-context.test-support';
 import {
   acquiredArtifactSchema,
   acquisitionPlanSchema,
@@ -37,8 +44,9 @@ import type {
 } from './types.js';
 
 const INSTANT = '2026-07-18T00:00:00.000Z';
-const RECORDS = 1_000_000;
-const MAX_BUFFERED_RECORDS = 1_000;
+const RECORDS = 20_000;
+const MAX_BUFFERED_RECORDS = 8;
+const MAX_RSS_BYTES = 512 * 1024 * 1024;
 const RAW_BYTES = new TextEncoder().encode('generated-v2-stress\n');
 const RAW_SHA256 = createHash('sha256').update(RAW_BYTES).digest('hex');
 const SOURCE_ID = sourceIdSchema.parse('sc:source:generated-streaming-stress');
@@ -58,6 +66,7 @@ class MillionRecordAdapter implements StreamingSourceAdapter<CsvDecodedRecord, C
   public decodedRecords = 0;
   public normalizedMutations = 0;
   public peakHeapBytes = process.memoryUsage().heapUsed;
+  public peakRssBytes = process.memoryUsage().rss;
 
   readonly #descriptor = sourceDescriptorSchema.parse({
     sourceId: SOURCE_ID,
@@ -218,12 +227,49 @@ class MillionRecordAdapter implements StreamingSourceAdapter<CsvDecodedRecord, C
   public async *normalize(record: CsvDecodedRecord): AsyncIterable<CanonicalMutation> {
     this.normalizedMutations += 1;
     if (record.ordinal % MAX_BUFFERED_RECORDS === 0) this.#sampleHeap();
-    yield await Promise.resolve(
-      Object.freeze({
-        kind: 'generated_streaming_stress_mutation',
-        ordinal: record.ordinal,
-      }) as unknown as CanonicalMutation,
+    const apn = `${String(100 + Math.floor(record.ordinal / 100_000)).padStart(3, '0')}-${String(
+      Math.floor(record.ordinal / 1_000) % 100,
+    ).padStart(2, '0')}-${String(record.ordinal % 1_000).padStart(3, '0')}`;
+    const sourceRecordSha256 = createHash('sha256')
+      .update(`parcel:${record.ordinal}`)
+      .digest('hex');
+    const mutations = normalizePropertyRecord(
+      {
+        apn,
+        jurisdiction: 'SANTA CLARA',
+        address: {
+          line1: `${100 + (record.ordinal % 9_000)} Assessment Avenue`,
+          locality: 'San Jose',
+          postalCode: '95113',
+          location: {
+            type: 'Point',
+            coordinates: [
+              -121.9 + (record.ordinal % 100) / 10_000,
+              37.3 + (record.ordinal % 100) / 10_000,
+            ],
+          },
+        },
+        unit: null,
+        parcelGeometry: null,
+        landAreaSquareMeters: 450 + (record.ordinal % 1_000),
+        yearBuilt: 1900 + (record.ordinal % 125),
+        effectiveYearBuilt: null,
+      },
+      testContext({
+        sourceId: SOURCE_ID,
+        snapshotId: SNAPSHOT_ID,
+        artifactId: artifactIdSchema.parse(`sc:artifact:sha256:${RAW_SHA256}`),
+        runId: RUN_ID,
+        sourceRecordKey: `parcel-${record.ordinal}`,
+        sourceRecordSha256,
+        rawPointer: `/parcels/${record.ordinal}`,
+        transformName: 'parcel-ledger-stress',
+        sequenceStart: record.ordinal * 32,
+      }),
     );
+    const mutation = mutations.find(({ kind }) => kind === 'entity_upsert');
+    if (mutation === undefined) throw new Error('Parcel stress normalizer omitted entity mutation');
+    yield await Promise.resolve(mutation);
   }
 
   public summarize(run: SourceRunObservationV2) {
@@ -262,7 +308,9 @@ class MillionRecordAdapter implements StreamingSourceAdapter<CsvDecodedRecord, C
   }
 
   #sampleHeap(): void {
-    this.peakHeapBytes = Math.max(this.peakHeapBytes, process.memoryUsage().heapUsed);
+    const memory = process.memoryUsage();
+    this.peakHeapBytes = Math.max(this.peakHeapBytes, memory.heapUsed);
+    this.peakRssBytes = Math.max(this.peakRssBytes, memory.rss);
   }
 }
 
@@ -308,12 +356,13 @@ try {
     sources: [source],
     maximumPhaseAttempts: 1,
   };
+  const checkpointStore = new LocalCheckpointStore({ rootDirectory: join(root, 'checkpoints') });
   const dependencies: OrchestrationDependencies = {
     artifactStore: new LocalArtifactStore({
       rootDirectory: join(root, 'artifacts'),
       now: () => INSTANT,
     }),
-    checkpointStore: new LocalCheckpointStore({ rootDirectory: join(root, 'checkpoints') }),
+    checkpointStore,
     analyticalRuntime: { open: () => Promise.reject(new Error('analytical runtime not used')) },
     http: { send: () => Promise.reject(new Error('HTTP not used')) },
     clock: new FixedClock(),
@@ -324,15 +373,47 @@ try {
   const result = await runPipeline(configuration, dependencies);
   adapter.sampleHeap();
   const sourceResult = result.manifest.sources[0];
+  const checkpoint = await checkpointStore.load(`pipeline-run:${RUN_ID}`);
+  const persistedSource = ((
+    checkpoint?.payload as Readonly<{ sources?: readonly Record<string, unknown>[] }>
+  ).sources ?? [])[0];
+  const mutationLedger = persistedSource?.mutationLedger as
+    Readonly<{ totalRecords: number; totalChunks: number }> | undefined;
+  const normalizationLedger = persistedSource?.normalizationLedger as
+    Readonly<{ totalRecords: number; totalChunks: number }> | undefined;
+  const assertions: readonly [boolean, string][] = [
+    [sourceResult?.terminalState === 'complete', 'source did not complete'],
+    [adapter.decodedRecords === RECORDS, 'decoded record count changed'],
+    [adapter.normalizedMutations === RECORDS, 'normalization count changed'],
+    [reconciledMutations === RECORDS, 'projection read count changed'],
+    [adapter.projectedLogicalSha256 !== null, 'projection hash is missing'],
+    [(mutationLedger?.totalRecords ?? 0) === RECORDS, 'mutation ledger is not truthful'],
+    [(mutationLedger?.totalChunks ?? 0) > 0, 'mutation ledger has no physical chunks'],
+    [(normalizationLedger?.totalRecords ?? 0) > RECORDS, 'event ledger was not materialized'],
+    [(normalizationLedger?.totalChunks ?? 0) > 0, 'event ledger has no physical chunks'],
+    [adapter.peakRssBytes <= MAX_RSS_BYTES, 'peak RSS exceeded the 512 MiB gate'],
+    [result.manifest.backpressure.activeRecordsAtCompletion === 0, 'record leases leaked'],
+    [result.manifest.backpressure.bufferedEventsAtCompletion === 0, 'event leases leaked'],
+  ];
+  const failedAssertions = assertions.filter(([passed]) => !passed).map(([, message]) => message);
+  if (failedAssertions.length > 0) {
+    throw new Error(`Streaming ledger stress failed: ${failedAssertions.join('; ')}`);
+  }
   process.stdout.write(
     `${JSON.stringify({
       schemaVersion: 'oracle-streaming-runner-foundation-stress-v3',
+      pass: true,
       proofScope: 'foundation_only_acquisition_normalization_runner',
       downstreamCountyProof: false,
       logicalRecords: adapter.decodedRecords,
       normalizedMutations: adapter.normalizedMutations,
       reconciledMutations,
       configuredMaxBufferedRecords: MAX_BUFFERED_RECORDS,
+      maximumRssBytes: MAX_RSS_BYTES,
+      mutationLedgerRecords: mutationLedger?.totalRecords ?? null,
+      mutationLedgerChunks: mutationLedger?.totalChunks ?? null,
+      normalizationLedgerRecords: normalizationLedger?.totalRecords ?? null,
+      normalizationLedgerChunks: normalizationLedger?.totalChunks ?? null,
       observedHighWaterRecords: result.manifest.backpressure.observedHighWaterRecords,
       observedHighWaterActiveRecords: result.manifest.backpressure.observedHighWaterActiveRecords,
       observedHighWaterBufferedEvents: result.manifest.backpressure.observedHighWaterBufferedEvents,
@@ -342,6 +423,7 @@ try {
       bufferedEventsAtCompletion: result.manifest.backpressure.bufferedEventsAtCompletion,
       totalBudgetAcquisitions: result.manifest.backpressure.totalBudgetAcquisitions,
       peakHeapBytes: adapter.peakHeapBytes,
+      peakRssBytes: adapter.peakRssBytes,
       logicalSha256: adapter.projectedLogicalSha256,
       terminalState: sourceResult?.terminalState ?? null,
       coverageRatio: sourceResult?.coverage.ratio ?? null,

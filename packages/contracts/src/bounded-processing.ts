@@ -549,6 +549,7 @@ export const mutationSourceInputSchema = z
     logicalSha256: sha256Schema,
     chunks: z.array(mutationChunkInputSchema).max(BOUNDED_MAX_INLINE_DESCRIPTORS),
     chunkInventory: boundedDescriptorRootSchema.nullable().optional(),
+    licenseSnapshotRefs: z.array(nonEmptyStringSchema).max(32).optional(),
   })
   .superRefine((source, context) => {
     if (!snapshotBelongsToSource(source.snapshotId, source.sourceId)) {
@@ -587,6 +588,35 @@ export const mutationSourceInputSchema = z
       nextOrdinal = chunk.lastOrdinal + 1;
     });
     const rooted = source.chunkInventory ?? null;
+    const inlineLicenses = [
+      ...new Set(source.chunks.map(({ licenseSnapshotRef }) => licenseSnapshotRef)),
+    ].sort(compareUtf8);
+    const declaredLicenses = source.licenseSnapshotRefs;
+    if (
+      declaredLicenses !== undefined &&
+      (new Set(declaredLicenses).size !== declaredLicenses.length ||
+        [...declaredLicenses]
+          .sort(compareUtf8)
+          .some((value, index) => value !== declaredLicenses[index]))
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['licenseSnapshotRefs'],
+        message: 'Mutation source license references must be sorted and unique',
+      });
+    }
+    if (
+      (rooted !== null && (declaredLicenses === undefined || declaredLicenses.length === 0)) ||
+      (rooted === null &&
+        declaredLicenses !== undefined &&
+        canonicalJson(declaredLicenses) !== canonicalJson(inlineLicenses))
+    ) {
+      context.addIssue({
+        code: 'custom',
+        path: ['licenseSnapshotRefs'],
+        message: 'Mutation source license references must exactly bind its physical inventory',
+      });
+    }
     if (
       (rooted === null && source.recordCount !== total) ||
       (rooted !== null &&

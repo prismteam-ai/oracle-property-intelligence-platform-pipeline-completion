@@ -248,7 +248,9 @@ describe('executable pipeline commands', () => {
       observedHighWaterCombinedRecordsAndEvents: 50,
       activeRecordsAtCompletion: 0,
       bufferedEventsAtCompletion: 0,
-      totalBudgetAcquisitions: 62,
+      // Includes permits used to materialize the truthful mutation/validation physical projections,
+      // not only the canonical normalization-event stream.
+      totalBudgetAcquisitions: 116,
     });
   });
 
