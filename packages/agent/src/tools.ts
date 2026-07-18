@@ -1,4 +1,5 @@
-import { tool, type Tool } from 'ai';
+import { jsonSchema, tool, type Schema, type Tool, zodSchema } from 'ai';
+import type { ZodType } from 'zod';
 
 import {
   NAMED_EVIDENCE_TOOL_NAMES,
@@ -30,6 +31,43 @@ export type NamedEvidenceTools = Record<
   NamedEvidenceToolName,
   Tool<unknown, NamedEvidenceEnvelope>
 >;
+
+type ModelJsonSchema = Awaited<Schema['jsonSchema']>;
+
+const BEDROCK_UNSUPPORTED_NUMERIC_SCHEMA_KEYWORDS = new Set([
+  'exclusiveMaximum',
+  'exclusiveMinimum',
+  'maximum',
+  'minimum',
+]);
+
+function removeUnsupportedNumericBounds(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(removeUnsupportedNumericBounds);
+  if (typeof value !== 'object' || value === null) return value;
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, child]) =>
+      BEDROCK_UNSUPPORTED_NUMERIC_SCHEMA_KEYWORDS.has(key)
+        ? []
+        : [[key, removeUnsupportedNumericBounds(child)]],
+    ),
+  );
+}
+
+function bedrockCompatibleInputSchema(schema: ZodType): Schema {
+  const authoritativeSchema = zodSchema(schema);
+  return jsonSchema(
+    async () =>
+      removeUnsupportedNumericBounds(await authoritativeSchema.jsonSchema) as ModelJsonSchema,
+    {
+      validate: async (value) => {
+        const result = await schema.safeParseAsync(value);
+        return result.success
+          ? { success: true, value: result.data }
+          : { success: false, error: result.error };
+      },
+    },
+  );
+}
 
 function invocationLedger(value: unknown): InvocationLedger {
   if (typeof value !== 'object' || value === null || !('ledger' in value)) {
@@ -73,9 +111,10 @@ function assertSafePayload(value: unknown, path = '$'): void {
 export function createNamedEvidenceTools(executor: NamedEvidenceExecutor): NamedEvidenceTools {
   return Object.fromEntries(
     NAMED_EVIDENCE_TOOL_NAMES.map((name) => {
+      const inputSchema = namedEvidenceInputSchemas[name];
       const result = tool({
         description: `Read immutable Oracle evidence using ${name}. This tool is read-only and release-bound.`,
-        inputSchema: namedEvidenceInputSchemas[name],
+        inputSchema: bedrockCompatibleInputSchema(inputSchema),
         strict: true,
         execute: async (input, options) => {
           const ledger = invocationLedger(options.experimental_context);
@@ -84,7 +123,7 @@ export function createNamedEvidenceTools(executor: NamedEvidenceExecutor): Named
             ledger.failures += 1;
             throw new RangeError('Named evidence tool-call budget exceeded');
           }
-          const parsedInput = namedEvidenceInputSchemas[name].parse(input);
+          const parsedInput = inputSchema.parse(input);
           if (parsedInput.releaseId !== undefined && parsedInput.releaseId !== ledger.releaseId) {
             throw new TypeError('Tool release does not match the immutable agent release');
           }
