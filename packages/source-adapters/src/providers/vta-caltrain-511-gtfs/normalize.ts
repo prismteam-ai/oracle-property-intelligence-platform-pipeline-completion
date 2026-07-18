@@ -365,7 +365,21 @@ export function createCanonicalTransitMutations(
 
 const GTFS_ANALYTICAL_OPERATION = 'decode_gtfs_bounded_finalize';
 const GTFS_QUERY_TIMEOUT_MS = 120_000;
+const MAX_GTFS_CSV_LINE_BYTES = 1024 * 1024;
 const MAX_SERVICE_PAIRS_PER_STOP = 4096;
+const GTFS_CSV_SOURCE = `read_csv_auto(?,
+  delim = ',',
+  quote = '"',
+  escape = '"',
+  header = true,
+  all_varchar = true,
+  encoding = 'utf-8',
+  nullstr = '__ORACLE_GTFS_NULL__',
+  allow_quoted_nulls = false,
+  null_padding = false,
+  strict_mode = true,
+  max_line_size = ${MAX_GTFS_CSV_LINE_BYTES}
+)`;
 
 function csvSource(
   uri: string | undefined,
@@ -376,7 +390,7 @@ function csvSource(
 }> {
   if (uri !== undefined) {
     return Object.freeze({
-      sql: "read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__')",
+      sql: GTFS_CSV_SOURCE,
       parameters: Object.freeze([uri]),
     });
   }
@@ -488,8 +502,8 @@ export async function* createStreamingCanonicalTransitMutations(
   let sequence = 0;
   try {
     const commonCtes = `
-      trips AS (SELECT * FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__')),
-      routes AS (SELECT * FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__')),
+      trips AS (SELECT * FROM ${GTFS_CSV_SOURCE}),
+      routes AS (SELECT * FROM ${GTFS_CSV_SOURCE}),
       calendars AS (SELECT * FROM ${calendars.sql}),
       calendar_dates AS (SELECT * FROM ${calendarDates.sql}),
       active_services AS (
@@ -613,7 +627,7 @@ export async function* createStreamingCanonicalTransitMutations(
                    count(*) > 0 AS active,
                    bool_or(coalesce(st.pickup_type, '0') <> '1') AS pickup_allowed,
                    bool_or(coalesce(st.drop_off_type, '0') <> '1') AS dropoff_allowed
-            FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__') st
+            FROM ${GTFS_CSV_SOURCE} st
             JOIN active_trips t ON t.trip_id = st.trip_id
             GROUP BY st.stop_id
           )
@@ -623,10 +637,10 @@ export async function* createStreamingCanonicalTransitMutations(
                  coalesce(a.dropoff_allowed, false) AS dropoff_allowed,
                  CASE WHEN coalesce(s.parent_station, '') = '' THEN true
                       ELSE EXISTS (
-                        SELECT 1 FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__') p
+                        SELECT 1 FROM ${GTFS_CSV_SOURCE} p
                         WHERE p.stop_id = s.parent_station
                       ) END AS parent_exists
-          FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__') s
+          FROM ${GTFS_CSV_SOURCE} s
           LEFT JOIN stop_activity a ON a.stop_id = s.stop_id
           WHERE s.stop_id > ? ORDER BY s.stop_id`,
         parameters: [...commonParameters, stopTimesUri, stopsUri, stopsUri, lastStopId],
@@ -653,7 +667,7 @@ export async function* createStreamingCanonicalTransitMutations(
               SELECT * FROM trips WHERE service_id IN (SELECT service_id FROM active_services)
             )
             SELECT DISTINCT t.route_id, t.service_id
-            FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__') st
+            FROM ${GTFS_CSV_SOURCE} st
             JOIN active_trips t ON t.trip_id = st.trip_id
             WHERE st.stop_id = ?
               AND (t.route_id > ? OR (t.route_id = ? AND t.service_id > ?))
