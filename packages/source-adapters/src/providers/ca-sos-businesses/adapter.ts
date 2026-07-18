@@ -1,7 +1,14 @@
 import { createHash } from 'node:crypto';
+import { closeSync, createReadStream, openSync, writeSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Readable } from 'node:stream';
 
-import { assertStoredArtifactIntegrity } from '@oracle/artifacts/artifact-store';
+import {
+  assertStoredArtifactIntegrity,
+  type StoredArtifact,
+} from '@oracle/artifacts/artifact-store';
 import { createCheckpointEnvelope, type CheckpointValue } from '@oracle/artifacts/checkpoint-store';
 import {
   fieldLineageSchema,
@@ -28,22 +35,23 @@ import {
 } from '@oracle/contracts/source';
 import type { Visibility } from '@oracle/contracts/visibility';
 import { parse } from 'csv-parse';
-import { unzipSync } from 'fflate';
+import { Unzip, UnzipInflate, UnzipPassThrough } from 'fflate';
 
 import {
-  createAcquiredByteArtifact,
-  type AcquiredByteArtifact,
+  createStreamingAcquiredArtifact,
+  type AcquiredArtifactSource,
 } from '../../spi/acquired-artifact.js';
+import { persistAcquiredBody } from '../../spi/acquisition.js';
 import type {
-  AcquisitionContext,
-  DecodeContext,
   DiscoveryContext,
   DiscoveryResult,
   NormalizationContext,
   PlanningContext,
   RecordValidation,
-  SourceAdapter,
-  SourceRunObservation,
+  SourceRunObservationV2,
+  StreamingAcquisitionContext,
+  StreamingDecodeContext,
+  StreamingSourceAdapter,
   SummaryContext,
   ValidationContext,
 } from '../../spi/adapter.js';
@@ -70,6 +78,10 @@ const ACCEPT = 'application/zip, application/octet-stream, text/csv';
 const ACCEPT_HASH = sha256Hex(new TextEncoder().encode(ACCEPT));
 const DEFAULT_MAXIMUM_BYTES = 2 * 1024 * 1024 * 1024;
 const CSV_CHUNK_BYTES = 64 * 1024;
+const MAXIMUM_CSV_RECORD_BYTES = 1024 * 1024;
+const MAXIMUM_ZIP_ENTRIES = 4_096;
+const MAXIMUM_ZIP_ENTRY_NAME_BYTES = 1_024;
+const MAXIMUM_ZIP_AGGREGATE_NAME_BYTES = 1024 * 1024;
 const TEXT_ENCODER = new TextEncoder();
 
 class CaSosBusinessError extends Error {
@@ -132,6 +144,10 @@ function header(headers: HttpHeaders, name: string): string | undefined {
   return Object.entries(headers).find(([key]) => key.toLowerCase() === target)?.[1];
 }
 
+function optionalMetadata(value: string | undefined): string | null {
+  return value === undefined || value.length === 0 ? null : value;
+}
+
 function parseHttpDate(value: string | undefined): string | null {
   if (value === undefined) return null;
   const milliseconds = Date.parse(value);
@@ -155,7 +171,7 @@ function isAbortError(error: unknown): boolean {
 }
 
 async function requestWithRetry(
-  context: DiscoveryContext | AcquisitionContext,
+  context: DiscoveryContext | StreamingAcquisitionContext,
   url: string,
   phase: 'discover' | 'acquire',
 ): Promise<Readonly<{ response: HttpResponse; attempt: number }>> {
@@ -219,37 +235,6 @@ async function requestWithRetry(
   );
 }
 
-async function collectBody(
-  response: HttpResponse,
-  signal: AbortSignal,
-  maximumBytes: number,
-): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  for await (const chunk of response.body) {
-    signal.throwIfAborted();
-    size += chunk.byteLength;
-    if (size > maximumBytes) {
-      throw sourceError(
-        'SCHEMA_DRIFT',
-        'Bulk artifact exceeds the frozen byte ceiling',
-        'acquire',
-        {
-          maximumBytes,
-        },
-      );
-    }
-    chunks.push(Uint8Array.from(chunk));
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
-}
-
 function checkpointPayload(
   checkpoint: SourceCheckpoint,
 ): Readonly<Record<string, CheckpointValue>> {
@@ -288,16 +273,30 @@ function parseCheckpoint(
   candidate: unknown,
   plan: AcquisitionPlan,
   origin: 'caller' | 'store',
+  expectedArtifactId: AcquiredArtifact['artifactId'],
 ): SourceCheckpoint {
   const parsed = sourceCheckpointSchema.safeParse(candidate);
   if (!parsed.success) {
     throw sourceError('SCHEMA_DRIFT', `Invalid ${origin} checkpoint`, 'acquire');
   }
+  const checkpoint = parsed.data;
+  const isInitial =
+    checkpoint.nextSequence === 0 &&
+    checkpoint.completedRequestKeys.length === 0 &&
+    checkpoint.acquiredArtifactIds.length === 0 &&
+    !checkpoint.complete;
+  const isComplete =
+    checkpoint.nextSequence === 1 &&
+    checkpoint.completedRequestKeys.length === 1 &&
+    checkpoint.completedRequestKeys[0] === 'business-entities' &&
+    checkpoint.acquiredArtifactIds.length === 1 &&
+    checkpoint.acquiredArtifactIds[0] === expectedArtifactId &&
+    checkpoint.complete;
   if (
-    parsed.data.sourceId !== plan.sourceId ||
-    parsed.data.snapshotId !== plan.snapshotId ||
-    parsed.data.contractVersion !== plan.contractVersion ||
-    parsed.data.nextSequence > 1
+    checkpoint.sourceId !== plan.sourceId ||
+    checkpoint.snapshotId !== plan.snapshotId ||
+    checkpoint.contractVersion !== plan.contractVersion ||
+    (!isInitial && !isComplete)
   ) {
     throw sourceError(
       'SCHEMA_DRIFT',
@@ -305,7 +304,7 @@ function parseCheckpoint(
       'acquire',
     );
   }
-  return parsed.data;
+  return checkpoint;
 }
 
 function isStringArray(value: unknown): value is string[] {
@@ -324,29 +323,44 @@ function assertHeader(actual: readonly string[], expected: readonly string[]): v
   }
 }
 
-async function* csvRows(bytes: Uint8Array, signal: AbortSignal, expectedHeader: readonly string[]) {
+async function* strictUtf8(
+  body: AsyncIterable<Uint8Array>,
+  signal: AbortSignal,
+): AsyncIterable<string> {
+  const decoder = new TextDecoder('utf-8', { fatal: true });
   try {
-    new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-  } catch {
-    throw sourceError('RECORD_QUALITY', 'CA SOS bulk CSV is not valid UTF-8', 'decode');
+    for await (const chunk of body) {
+      signal.throwIfAborted();
+      const value = decoder.decode(chunk, { stream: true });
+      if (value.length > 0) yield value;
+    }
+    const final = decoder.decode();
+    if (final.length > 0) yield final;
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw sourceError('RECORD_QUALITY', 'CA SOS bulk CSV is not valid UTF-8', 'decode');
+    }
+    throw error;
   }
-  const readable = Readable.from(
-    (function* chunks(): Iterable<Uint8Array> {
-      for (let offset = 0; offset < bytes.byteLength; offset += CSV_CHUNK_BYTES) {
-        signal.throwIfAborted();
-        yield bytes.slice(offset, Math.min(bytes.byteLength, offset + CSV_CHUNK_BYTES));
-      }
-    })(),
-  );
+}
+
+async function* csvRows(
+  body: AsyncIterable<Uint8Array>,
+  signal: AbortSignal,
+  expectedHeader: readonly string[],
+) {
+  const readable = Readable.from(strictUtf8(body, signal));
   const parser = readable.pipe(
     parse({
       bom: true,
       columns: false,
       encoding: 'utf8',
+      max_record_size: MAXIMUM_CSV_RECORD_BYTES,
       relax_column_count: false,
       skip_empty_lines: true,
     }),
   );
+  readable.on('error', (error: Error) => parser.destroy(error));
   let csvHeader: readonly string[] | undefined;
   try {
     for await (const candidate of parser) {
@@ -376,97 +390,200 @@ async function* csvRows(bytes: Uint8Array, signal: AbortSignal, expectedHeader: 
   }
 }
 
-function csvBytes(
-  artifact: AcquiredByteArtifact,
-  encoding: CaSosBusinessAdapterOptions['encoding'],
+function assertSafeZipPath(name: string): void {
+  const normalized = name.replaceAll('\\', '/');
+  const segments = normalized.split('/');
+  const pathSegments = normalized.endsWith('/') ? segments.slice(0, -1) : segments;
+  if (
+    normalized.startsWith('/') ||
+    /^[a-z]:/iu.test(normalized) ||
+    name.includes('\\') ||
+    pathSegments.length === 0 ||
+    pathSegments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')
+  ) {
+    throw sourceError('SCHEMA_DRIFT', 'CA SOS ZIP contains an unsafe entry path', 'decode', {
+      path: name,
+    });
+  }
+}
+
+interface ZipCsvSpool {
+  readonly directory: string;
+  readonly path: string;
+  readonly byteLength: number;
+  readonly sha256: string;
+}
+
+async function spoolSelectedCsv(
+  artifact: AcquiredArtifactSource,
   sourceLock: CaSosBusinessSourceLock,
   maximumBytes: number,
-): Uint8Array {
-  const bytes = artifact.bytes.copy();
-  if (encoding === 'csv') return bytes;
-  const files: Readonly<{ name: string; originalSize: number }>[] = [];
-  try {
-    unzipSync(bytes, {
-      filter: (file) => {
-        files.push(Object.freeze({ name: file.name, originalSize: file.originalSize }));
-        return false;
-      },
-    });
-  } catch (error) {
-    throw sourceError('RECORD_QUALITY', 'CA SOS bulk ZIP is malformed', 'decode', {
-      cause: error instanceof Error ? error.message : String(error),
-    });
+  signal: AbortSignal,
+): Promise<ZipCsvSpool> {
+  if (artifact.content === undefined || sourceLock.csvEntryPath === null) {
+    throw sourceError('SCHEMA_DRIFT', 'CA SOS ZIP decode requires streaming v2', 'decode');
   }
+  const directory = await mkdtemp(join(tmpdir(), 'oracle-ca-sos-'));
+  const path = join(directory, 'selected.csv');
+  const descriptor = openSync(path, 'wx', 0o600);
+  let selectedEntries = 0;
+  let selectedFinalChunks = 0;
+  let selectedBytes = 0;
   let declaredBytes = 0;
+  let zipEntries = 0;
+  let aggregateNameBytes = 0;
+  let callbackError: unknown;
+  const selectedHash = createHash('sha256');
   const csvEntries: string[] = [];
-  for (const file of files) {
-    const normalized = file.name.replaceAll('\\', '/');
-    const segments = normalized.split('/');
-    const isDirectory = normalized.endsWith('/');
-    const pathSegments = isDirectory ? segments.slice(0, -1) : segments;
-    if (
-      normalized.startsWith('/') ||
-      /^[a-z]:/iu.test(normalized) ||
-      file.name.includes('\\') ||
-      pathSegments.length === 0 ||
-      pathSegments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')
-    ) {
-      throw sourceError('SCHEMA_DRIFT', 'CA SOS ZIP contains an unsafe entry path', 'decode', {
-        path: file.name,
-      });
+  const unzip = new Unzip((file) => {
+    try {
+      signal.throwIfAborted();
+      zipEntries += 1;
+      if (zipEntries > MAXIMUM_ZIP_ENTRIES) {
+        throw sourceError(
+          'SCHEMA_DRIFT',
+          'CA SOS ZIP entry count exceeds the frozen ceiling',
+          'decode',
+          {
+            maximumEntries: MAXIMUM_ZIP_ENTRIES,
+          },
+        );
+      }
+      const nameBytes = Buffer.byteLength(file.name, 'utf8');
+      if (nameBytes > MAXIMUM_ZIP_ENTRY_NAME_BYTES) {
+        throw sourceError(
+          'SCHEMA_DRIFT',
+          'CA SOS ZIP entry name exceeds the frozen byte ceiling',
+          'decode',
+          { maximumNameBytes: MAXIMUM_ZIP_ENTRY_NAME_BYTES },
+        );
+      }
+      aggregateNameBytes += nameBytes;
+      if (
+        !Number.isSafeInteger(aggregateNameBytes) ||
+        aggregateNameBytes > MAXIMUM_ZIP_AGGREGATE_NAME_BYTES
+      ) {
+        throw sourceError(
+          'SCHEMA_DRIFT',
+          'CA SOS ZIP aggregate entry-name bytes exceed the frozen ceiling',
+          'decode',
+          { maximumAggregateNameBytes: MAXIMUM_ZIP_AGGREGATE_NAME_BYTES },
+        );
+      }
+      assertSafeZipPath(file.name);
+      if (!Number.isSafeInteger(file.originalSize) || (file.originalSize ?? -1) < 0) {
+        throw sourceError('SCHEMA_DRIFT', 'CA SOS ZIP contains an invalid declared size', 'decode');
+      }
+      declaredBytes += file.originalSize ?? 0;
+      if (!Number.isSafeInteger(declaredBytes) || declaredBytes > maximumBytes) {
+        throw sourceError(
+          'SCHEMA_DRIFT',
+          'CA SOS ZIP aggregate declared bytes exceed the frozen byte ceiling',
+          'decode',
+          { maximumBytes },
+        );
+      }
+      if (!file.name.endsWith('/') && file.name.toLowerCase().endsWith('.csv')) {
+        csvEntries.push(file.name);
+      }
+      if (file.name !== sourceLock.csvEntryPath) return;
+      selectedEntries += 1;
+      file.ondata = (error, data, final) => {
+        if (error !== null) {
+          callbackError = error;
+          return;
+        }
+        try {
+          signal.throwIfAborted();
+          selectedBytes += data.byteLength;
+          if (!Number.isSafeInteger(selectedBytes) || selectedBytes > maximumBytes) {
+            throw sourceError(
+              'SCHEMA_DRIFT',
+              'CA SOS ZIP decoded CSV exceeds the frozen byte ceiling',
+              'decode',
+              { maximumBytes },
+            );
+          }
+          if (data.byteLength > 0) {
+            writeSync(descriptor, data);
+            selectedHash.update(data);
+          }
+          if (final) selectedFinalChunks += 1;
+        } catch (error_) {
+          callbackError = error_;
+          file.terminate();
+        }
+      };
+      file.start();
+    } catch (error) {
+      callbackError = error;
+      file.terminate();
     }
-    if (isDirectory) continue;
-    if (!Number.isSafeInteger(file.originalSize) || file.originalSize < 0) {
-      throw sourceError('SCHEMA_DRIFT', 'CA SOS ZIP contains an invalid declared size', 'decode');
+  });
+  unzip.register(UnzipPassThrough);
+  unzip.register(UnzipInflate);
+  try {
+    for await (const chunk of artifact.content.read({ maxChunkBytes: CSV_CHUNK_BYTES })) {
+      signal.throwIfAborted();
+      unzip.push(chunk);
+      if (callbackError !== undefined) {
+        throw callbackError instanceof Error
+          ? callbackError
+          : new Error('CA SOS ZIP decoder callback failed');
+      }
     }
-    declaredBytes += file.originalSize;
-    if (!Number.isSafeInteger(declaredBytes) || declaredBytes > maximumBytes) {
+    unzip.push(new Uint8Array(), true);
+    if (callbackError !== undefined) {
+      throw callbackError instanceof Error
+        ? callbackError
+        : new Error('CA SOS ZIP decoder callback failed');
+    }
+    if (selectedEntries === 0 && csvEntries.length === 0) {
+      throw sourceError('RECORD_QUALITY', 'CA SOS bulk ZIP is malformed', 'decode');
+    }
+    if (selectedEntries !== 1 || selectedFinalChunks !== selectedEntries) {
       throw sourceError(
         'SCHEMA_DRIFT',
-        'CA SOS ZIP aggregate declared bytes exceed the frozen byte ceiling',
+        'CA SOS ZIP source-locked CSV entry is missing, duplicate, or incomplete',
         'decode',
-        { maximumBytes },
+        { expectedCsvEntry: sourceLock.csvEntryPath, csvEntries },
       );
     }
-    if (normalized.toLowerCase().endsWith('.csv')) csvEntries.push(file.name);
-  }
-  const candidates = csvEntries.filter((path) => path === sourceLock.csvEntryPath);
-  if (candidates.length !== 1) {
-    throw sourceError(
-      'SCHEMA_DRIFT',
-      'CA SOS ZIP source-locked CSV entry is missing or duplicate',
-      'decode',
-      {
-        expectedCsvEntry: sourceLock.csvEntryPath,
-        csvEntries,
-      },
-    );
-  }
-  const selectedPath = candidates[0];
-  if (selectedPath === undefined) {
-    throw sourceError('SCHEMA_DRIFT', 'CA SOS ZIP CSV selection failed', 'decode');
-  }
-  let entries: Readonly<Record<string, Uint8Array>>;
-  try {
-    entries = unzipSync(bytes, { filter: (file) => file.name === selectedPath });
+    closeSync(descriptor);
+    return Object.freeze({
+      directory,
+      path,
+      byteLength: selectedBytes,
+      sha256: selectedHash.digest('hex'),
+    });
   } catch (error) {
+    try {
+      closeSync(descriptor);
+    } catch {
+      // Descriptor may already be closed after successful extraction.
+    }
+    await rm(directory, { recursive: true, force: true });
+    if (error instanceof CaSosBusinessError) throw error;
     throw sourceError('RECORD_QUALITY', 'CA SOS bulk ZIP is malformed', 'decode', {
       cause: error instanceof Error ? error.message : String(error),
     });
   }
-  const csv = entries[selectedPath];
-  if (csv === undefined) {
-    throw sourceError('RECORD_QUALITY', 'CA SOS ZIP selected CSV could not be decoded', 'decode');
+}
+
+async function verifySpool(spool: ZipCsvSpool, signal: AbortSignal): Promise<void> {
+  const hash = createHash('sha256');
+  let byteLength = 0;
+  const input = createReadStream(spool.path, {
+    highWaterMark: CSV_CHUNK_BYTES,
+  }) as AsyncIterable<Uint8Array>;
+  for await (const chunk of input) {
+    signal.throwIfAborted();
+    byteLength += chunk.byteLength;
+    hash.update(chunk);
   }
-  if (csv.byteLength > maximumBytes) {
-    throw sourceError(
-      'SCHEMA_DRIFT',
-      'CA SOS ZIP decoded CSV exceeds the frozen byte ceiling',
-      'decode',
-      { maximumBytes },
-    );
+  if (byteLength !== spool.byteLength || hash.digest('hex') !== spool.sha256) {
+    throw sourceError('RECORD_QUALITY', 'CA SOS temporary CSV spool integrity mismatch', 'decode');
   }
-  return csv;
 }
 
 function rawSourceRow(
@@ -624,18 +741,7 @@ function fieldLineage(
   });
 }
 
-function visibilityCounts(mutations: readonly CanonicalMutation[]) {
-  const counts: Record<Visibility, number> = {
-    public: 0,
-    authenticated: 0,
-    restricted: 0,
-    prohibited_public: 0,
-  };
-  for (const mutation of mutations) counts[mutation.visibility] += 1;
-  return counts;
-}
-
-class CaSosBusinessAdapter implements SourceAdapter<
+class CaSosBusinessAdapter implements StreamingSourceAdapter<
   CaSosDecodedBusinessRecord,
   CaSosValidatedBusinessRecord
 > {
@@ -755,17 +861,23 @@ class CaSosBusinessAdapter implements SourceAdapter<
   public async *acquire(
     plan: AcquisitionPlan,
     checkpoint: SourceCheckpoint | undefined,
-    context: AcquisitionContext,
-  ): AsyncIterable<AcquiredByteArtifact> {
+    context: StreamingAcquisitionContext,
+  ): AsyncIterable<AcquiredArtifactSource> {
     if (plan.sourceId !== CA_SOS_BUSINESS_SOURCE_ID || plan.items.length !== 1) {
       throw sourceError('SCHEMA_DRIFT', 'CA SOS acquisition plan mismatch', 'acquire');
     }
+    const sha256 = this.#options.expectedSha256;
+    const expectedArtifactId = `sc:artifact:sha256:${sha256}` as AcquiredArtifact['artifactId'];
     const scope = `${plan.sourceId}/${plan.snapshotId}`;
     let stored = await context.checkpointStore.load(scope);
     const callerCheckpoint =
-      checkpoint === undefined ? undefined : parseCheckpoint(checkpoint, plan, 'caller');
+      checkpoint === undefined
+        ? undefined
+        : parseCheckpoint(checkpoint, plan, 'caller', expectedArtifactId);
     const persistedCheckpoint =
-      stored === undefined ? undefined : parseCheckpoint(stored.payload, plan, 'store');
+      stored === undefined
+        ? undefined
+        : parseCheckpoint(stored.payload, plan, 'store', expectedArtifactId);
     if (
       callerCheckpoint !== undefined &&
       persistedCheckpoint !== undefined &&
@@ -777,19 +889,86 @@ class CaSosBusinessAdapter implements SourceAdapter<
         'acquire',
       );
     }
-    if ((persistedCheckpoint ?? callerCheckpoint)?.complete === true) return;
     const item = plan.items[0];
     if (item === undefined) return;
+    const resume = persistedCheckpoint ?? callerCheckpoint;
+    const extension = this.#options.encoding === 'zip' ? 'zip' : 'csv';
+    const logicalKey = `raw/ca-sos-businesses/${plan.snapshotId}/${this.#options.sourceVersion}/${sha256}.${extension}`;
+    const existing = await context.artifactStore.headByLogicalKey(logicalKey);
+    if (existing !== undefined) {
+      if (existing.sha256 !== sha256 || existing.byteSize > this.#maximumBytes) {
+        throw sourceError(
+          'RECONCILIATION',
+          'CA SOS orphan artifact does not match source lock',
+          'acquire',
+        );
+      }
+      const existingMetadata = acquiredArtifactSchema.parse({
+        artifactId: `sc:artifact:sha256:${sha256}`,
+        sourceId: plan.sourceId,
+        snapshotId: plan.snapshotId,
+        retrievedAt: existing.metadata.retrievedAt,
+        sourceAsOf: { state: 'reported', at: this.#options.sourceAsOf },
+        request: {
+          requestKey: item.requestKey,
+          method: 'GET',
+          url: item.url,
+          headers: [{ name: 'accept', valueSha256: ACCEPT_HASH }],
+          bodySha256: null,
+          attempt: Number(existing.metadata.attempt),
+        },
+        response: {
+          httpStatus: Number(existing.metadata.httpStatus),
+          etag: optionalMetadata(existing.metadata.etag),
+          lastModified: optionalMetadata(existing.metadata.lastModified),
+          finalUrl: item.url,
+        },
+        mediaType: existing.mediaType,
+        encoding: this.#options.encoding,
+        byteSize: existing.byteSize,
+        sha256,
+        schemaFingerprint: {
+          algorithm: 'sha256',
+          value: this.#sourceLock.schemaFingerprint,
+          schemaName: 'ca-sos-business-entity-raw-source-lock-v1',
+          canonicalizationVersion: CA_SOS_CONTRACT_VERSION,
+        },
+        rawUri: existing.uri,
+        licenseSnapshotRef: CA_SOS_BUSINESS_LICENSE_ID,
+        visibility: 'prohibited_public',
+      });
+      const adopted = await createStreamingAcquiredArtifact(
+        existingMetadata,
+        context.artifactStore,
+      );
+      if (resume?.complete !== true) {
+        const adoptedCheckpoint = createSourceCheckpoint(
+          plan,
+          adopted.metadata.artifactId,
+          context.clock.now(),
+        );
+        const adoptedEnvelope = createCheckpointEnvelope({
+          scope,
+          previousRevision: stored?.revision ?? null,
+          writtenAt: adoptedCheckpoint.updatedAt,
+          payload: checkpointPayload(adoptedCheckpoint),
+        });
+        const adoptedCommit = await context.checkpointStore.commit({
+          expectedRevision: stored?.revision ?? null,
+          checkpoint: adoptedEnvelope,
+        });
+        if (adoptedCommit.status === 'conflict') {
+          throw sourceError('RECONCILIATION', 'CA SOS orphan checkpoint conflicted', 'acquire');
+        }
+      }
+      yield adopted;
+      return;
+    }
+    if (resume?.complete === true) {
+      throw sourceError('RECONCILIATION', 'CA SOS checkpoint artifact is missing', 'acquire');
+    }
     context.signal.throwIfAborted();
     const { response, attempt } = await requestWithRetry(context, item.url, 'acquire');
-    const bytes = await collectBody(response, context.signal, this.#maximumBytes);
-    const sha256 = sha256Hex(bytes);
-    if (sha256 !== this.#options.expectedSha256) {
-      throw sourceError('SCHEMA_DRIFT', 'CA SOS bulk artifact SHA-256 mismatch', 'acquire', {
-        expectedSha256: this.#options.expectedSha256,
-        actualSha256: sha256,
-      });
-    }
     const responseType = header(response.headers, 'content-type');
     const mediaType = responseType?.split(';', 1)[0]?.trim().toLowerCase();
     if (mediaType === undefined || !item.expectedMediaTypes.includes(mediaType)) {
@@ -797,28 +976,43 @@ class CaSosBusinessAdapter implements SourceAdapter<
         mediaType: responseType ?? null,
       });
     }
-    const extension = this.#options.encoding === 'zip' ? 'zip' : 'csv';
-    const logicalKey = `raw/ca-sos-businesses/${plan.snapshotId}/${this.#options.sourceVersion}/${sha256}.${extension}`;
-    const storedArtifact = await context.artifactStore.putImmutable({
-      logicalKey,
-      mediaType,
-      body: bytes,
-      expectedSha256: sha256,
-      metadata: Object.freeze({
-        authority: CA_SOS_BUSINESS_DESCRIPTOR.authority.organization,
-        sourceUrl: item.url,
-        sourceVersion: this.#options.sourceVersion,
-        sourceAsOf: this.#options.sourceAsOf,
-        expectedRecordCount: String(this.#options.expectedRecordCount),
-        visibility: 'prohibited_public',
-      }),
-      ifAbsent: true,
-    });
+    const retrievedAt = context.clock.now();
+    const etag = header(response.headers, 'etag') ?? null;
+    const lastModified = parseHttpDate(header(response.headers, 'last-modified'));
+    let storedArtifact: StoredArtifact;
+    try {
+      storedArtifact = await persistAcquiredBody({
+        store: context.artifactStore,
+        logicalKey,
+        mediaType,
+        body: response.body,
+        expectedSha256: sha256,
+        maximumBytes: this.#maximumBytes,
+        metadata: Object.freeze({
+          authority: CA_SOS_BUSINESS_DESCRIPTOR.authority.organization,
+          sourceUrl: item.url,
+          sourceVersion: this.#options.sourceVersion,
+          sourceAsOf: this.#options.sourceAsOf,
+          expectedRecordCount: String(this.#options.expectedRecordCount),
+          retrievedAt,
+          attempt: String(attempt),
+          httpStatus: String(response.status),
+          etag: etag ?? '',
+          lastModified: lastModified ?? '',
+          visibility: 'prohibited_public',
+        }),
+        signal: context.signal,
+      });
+    } catch (error) {
+      if (context.signal.aborted) throw error;
+      throw sourceError('SCHEMA_DRIFT', 'CA SOS bulk artifact SHA-256 mismatch', 'acquire', {
+        cause: error instanceof Error ? error.message : String(error),
+      });
+    }
     assertStoredArtifactIntegrity(
-      { logicalKey, mediaType, byteSize: bytes.byteLength, sha256 },
+      { logicalKey, mediaType, byteSize: storedArtifact.byteSize, sha256 },
       storedArtifact,
     );
-    const retrievedAt = context.clock.now();
     const metadata = acquiredArtifactSchema.parse({
       artifactId: `sc:artifact:sha256:${sha256}`,
       sourceId: plan.sourceId,
@@ -835,13 +1029,13 @@ class CaSosBusinessAdapter implements SourceAdapter<
       },
       response: {
         httpStatus: response.status,
-        etag: header(response.headers, 'etag') ?? null,
-        lastModified: parseHttpDate(header(response.headers, 'last-modified')),
+        etag,
+        lastModified,
         finalUrl: item.url,
       },
       mediaType,
       encoding: this.#options.encoding,
-      byteSize: bytes.byteLength,
+      byteSize: storedArtifact.byteSize,
       sha256,
       schemaFingerprint: {
         algorithm: 'sha256',
@@ -853,7 +1047,7 @@ class CaSosBusinessAdapter implements SourceAdapter<
       licenseSnapshotRef: CA_SOS_BUSINESS_LICENSE_ID,
       visibility: 'prohibited_public',
     });
-    const artifact = createAcquiredByteArtifact(metadata, bytes);
+    const artifact = await createStreamingAcquiredArtifact(metadata, context.artifactStore);
     const sourceCheckpoint = createSourceCheckpoint(
       plan,
       artifact.metadata.artifactId,
@@ -878,8 +1072,8 @@ class CaSosBusinessAdapter implements SourceAdapter<
   }
 
   public async *decode(
-    artifact: AcquiredByteArtifact,
-    context: DecodeContext,
+    artifact: AcquiredArtifactSource,
+    context: StreamingDecodeContext,
   ): AsyncIterable<CaSosDecodedBusinessRecord> {
     context.signal.throwIfAborted();
     if (
@@ -889,41 +1083,56 @@ class CaSosBusinessAdapter implements SourceAdapter<
     ) {
       throw sourceError('SCHEMA_DRIFT', 'CA SOS artifact is not bound to this adapter', 'decode');
     }
-    const bytes = csvBytes(artifact, this.#options.encoding, this.#sourceLock, this.#maximumBytes);
-    let ordinal = 0;
-    for await (const row of csvRows(bytes, context.signal, this.#sourceLock.orderedHeader)) {
-      ordinal += 1;
-      const raw = mappedRow(row.header, row.values, this.#sourceLock);
-      const entityNumber = raw.ENTITY_NUMBER.trim().toUpperCase();
-      const sourceUpdated = raw.SOURCE_UPDATED_DATE.trim() || raw.INITIAL_FILING_DATE.trim();
-      const recordSha256 = sha256Hex(
-        TEXT_ENCODER.encode(canonicalJson(rawSourceRow(row.header, row.values))),
-      );
-      yield Object.freeze({
-        format: 'csv',
-        artifactId: artifact.metadata.artifactId,
-        ordinal,
-        visibility: artifact.metadata.visibility,
-        header: row.header,
-        values: row.values,
-        snapshotId: artifact.metadata.snapshotId,
-        sourceAsOf: artifact.metadata.sourceAsOf,
-        retrievedAt: artifact.metadata.retrievedAt,
-        sourceVersion: this.#options.sourceVersion,
-        recordKey: `${entityNumber || 'missing'}:${sourceUpdated || 'unknown'}:${recordSha256}`,
-        recordSha256,
-      });
+    if (artifact.content === undefined) {
+      throw sourceError('SCHEMA_DRIFT', 'CA SOS production decode requires streaming v2', 'decode');
     }
-    if (ordinal !== this.#options.expectedRecordCount) {
-      throw sourceError(
-        'SCHEMA_DRIFT',
-        'CA SOS bulk record count does not match source lock',
-        'decode',
-        {
-          expected: this.#options.expectedRecordCount,
-          actual: ordinal,
-        },
-      );
+    const spool =
+      this.#options.encoding === 'zip'
+        ? await spoolSelectedCsv(artifact, this.#sourceLock, this.#maximumBytes, context.signal)
+        : undefined;
+    try {
+      if (spool !== undefined) await verifySpool(spool, context.signal);
+      const body: AsyncIterable<Uint8Array> =
+        spool === undefined
+          ? artifact.content.read({ maxChunkBytes: CSV_CHUNK_BYTES })
+          : createReadStream(spool.path, { highWaterMark: CSV_CHUNK_BYTES });
+      let ordinal = 0;
+      for await (const row of csvRows(body, context.signal, this.#sourceLock.orderedHeader)) {
+        ordinal += 1;
+        const raw = mappedRow(row.header, row.values, this.#sourceLock);
+        const entityNumber = raw.ENTITY_NUMBER.trim().toUpperCase();
+        const sourceUpdated = raw.SOURCE_UPDATED_DATE.trim() || raw.INITIAL_FILING_DATE.trim();
+        const recordSha256 = sha256Hex(
+          TEXT_ENCODER.encode(canonicalJson(rawSourceRow(row.header, row.values))),
+        );
+        yield Object.freeze({
+          format: 'csv',
+          artifactId: artifact.metadata.artifactId,
+          ordinal,
+          visibility: artifact.metadata.visibility,
+          header: row.header,
+          values: row.values,
+          snapshotId: artifact.metadata.snapshotId,
+          sourceAsOf: artifact.metadata.sourceAsOf,
+          retrievedAt: artifact.metadata.retrievedAt,
+          sourceVersion: this.#options.sourceVersion,
+          recordKey: `${entityNumber || 'missing'}:${sourceUpdated || 'unknown'}:${recordSha256}`,
+          recordSha256,
+        });
+      }
+      if (ordinal !== this.#options.expectedRecordCount) {
+        throw sourceError(
+          'SCHEMA_DRIFT',
+          'CA SOS bulk record count does not match source lock',
+          'decode',
+          {
+            expected: this.#options.expectedRecordCount,
+            actual: ordinal,
+          },
+        );
+      }
+    } finally {
+      if (spool !== undefined) await rm(spool.directory, { recursive: true, force: true });
     }
   }
 
@@ -1121,13 +1330,29 @@ class CaSosBusinessAdapter implements SourceAdapter<
     }
   }
 
-  public summarize(run: SourceRunObservation, context: SummaryContext): SourceRunSummary {
+  public async summarize(
+    run: SourceRunObservationV2,
+    context: SummaryContext,
+  ): Promise<SourceRunSummary> {
     context.signal.throwIfAborted();
     if (run.decodedRecords !== this.#options.expectedRecordCount) {
       throw sourceError('SCHEMA_DRIFT', 'CA SOS summary count drift', 'summarize');
     }
-    const errors = run.validationIssues.filter((item) => item.severity !== 'warning').length;
-    const warnings = run.validationIssues.filter((item) => item.severity === 'warning').length;
+    let errors = 0;
+    let warnings = 0;
+    for await (const item of run.validationIssues.read()) {
+      if (item.severity === 'warning') warnings += 1;
+      else errors += 1;
+    }
+    const visibilityCounts: Record<Visibility, number> = {
+      public: 0,
+      authenticated: 0,
+      restricted: 0,
+      prohibited_public: 0,
+    };
+    for await (const mutation of run.mutations.read()) {
+      visibilityCounts[mutation.visibility] += 1;
+    }
     return sourceRunSummarySchema.parse({
       sourceId: run.descriptor.sourceId,
       snapshotId: run.request.snapshotId,
@@ -1145,8 +1370,8 @@ class CaSosBusinessAdapter implements SourceAdapter<
       decodedRecords: run.decodedRecords,
       acceptedRecords: run.acceptedRecords,
       rejectedRecords: run.rejectedRecords,
-      normalizedMutations: run.mutations.length,
-      visibilityCounts: visibilityCounts(run.mutations),
+      normalizedMutations: run.mutations.count,
+      visibilityCounts,
       warningCount: warnings,
       errorCount: errors,
       finalCheckpoint: run.finalCheckpoint,
@@ -1156,6 +1381,6 @@ class CaSosBusinessAdapter implements SourceAdapter<
 
 export function createCaSosBusinessAdapter(
   options: CaSosBusinessAdapterOptions,
-): SourceAdapter<CaSosDecodedBusinessRecord, CaSosValidatedBusinessRecord> {
+): StreamingSourceAdapter<CaSosDecodedBusinessRecord, CaSosValidatedBusinessRecord> {
   return new CaSosBusinessAdapter(options);
 }

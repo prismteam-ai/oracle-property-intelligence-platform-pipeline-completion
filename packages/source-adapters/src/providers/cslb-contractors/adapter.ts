@@ -21,6 +21,7 @@ import {
   schemaFingerprintValueSchema,
 } from '@oracle/contracts/ids';
 import {
+  acquiredArtifactSchema,
   acquisitionPlanSchema,
   sourceCheckpointSchema,
   sourceDescriptorSchema,
@@ -37,22 +38,23 @@ import {
 import { parse } from 'csv-parse';
 
 import {
-  type AcquisitionContext,
-  type DecodeContext,
+  type StreamingAcquisitionContext,
+  type StreamingDecodeContext,
   type DiscoveryContext,
   type DiscoveryResult,
   type NormalizationContext,
   type PlanningContext,
   type RecordValidation,
-  type SourceAdapter,
-  type SourceRunObservation,
+  type SourceRunObservationV2,
+  type StreamingSourceAdapter,
   type SummaryContext,
   type ValidationContext,
 } from '../../spi/adapter.js';
 import {
-  createAcquiredByteArtifact,
-  type AcquiredByteArtifact,
+  createStreamingAcquiredArtifact,
+  type AcquiredArtifactSource,
 } from '../../spi/acquired-artifact.js';
+import { persistAcquiredBody } from '../../spi/acquisition.js';
 import { sha256Hex } from '../../spi/bytes.js';
 import type { HttpHeaders, HttpRequest, HttpResponse } from '../../spi/http.js';
 import {
@@ -74,11 +76,12 @@ import type {
   CslbValidatedContractorRecord,
 } from './types.js';
 
-const CONTRACT_VERSION = '1.0.0';
+const CONTRACT_VERSION = '2.0.0';
 const TRANSFORM_VERSION = '1.0.0';
 const PORTAL_MAXIMUM_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAXIMUM_ARTIFACT_BYTES = 512 * 1024 * 1024;
 const STREAM_CHUNK_BYTES = 64 * 1024;
+const MAXIMUM_CSV_RECORD_BYTES = 1024 * 1024;
 const SCHEMA_FINGERPRINT = schemaFingerprintValueSchema.parse(CSLB_MASTER_SCHEMA_FINGERPRINT);
 const contractorIdSchema = entityIdSchemaFor('contractor');
 
@@ -190,6 +193,10 @@ function headerValue(headers: HttpHeaders, name: string): string | undefined {
   return Object.entries(headers).find(([key]) => key.toLowerCase() === expected)?.[1];
 }
 
+function optionalMetadata(value: string | undefined): string | null {
+  return value === undefined || value.length === 0 ? null : value;
+}
+
 function httpDateToIso(value: string | undefined): string | null {
   if (value === undefined) return null;
   const timestamp = Date.parse(value);
@@ -222,7 +229,7 @@ function deterministicBackoff(
 }
 
 async function sendWithRetry(
-  context: DiscoveryContext | AcquisitionContext,
+  context: DiscoveryContext | StreamingAcquisitionContext,
   requestKey: string,
   request: HttpRequest,
   phase: 'discover' | 'acquire',
@@ -275,28 +282,22 @@ async function sendWithRetry(
   throw new Error('Unreachable retry loop');
 }
 
-async function collectBody(
+async function collectSmallBody(
   response: HttpResponse,
   signal: AbortSignal,
   maximumBytes: number,
 ): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
+  const bytes = new Uint8Array(maximumBytes);
   let total = 0;
   for await (const chunk of response.body) {
     signal.throwIfAborted();
-    total += chunk.byteLength;
-    if (total > maximumBytes) {
+    if (chunk.byteLength > maximumBytes - total) {
       throw oracleError('SCHEMA_DRIFT', `Response exceeded ${maximumBytes} bytes`, 'acquire');
     }
-    chunks.push(Uint8Array.from(chunk));
+    bytes.set(chunk, total);
+    total += chunk.byteLength;
   }
-  const bytes = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
+  return bytes.slice(0, total);
 }
 
 function decodeHtmlAttribute(value: string): string {
@@ -359,7 +360,7 @@ function requestHeaders(cookie?: string): HttpHeaders {
 }
 
 async function openPortal(
-  context: DiscoveryContext | AcquisitionContext,
+  context: DiscoveryContext | StreamingAcquisitionContext,
   phase: 'discover' | 'acquire',
 ): Promise<PortalState> {
   const opened = await sendWithRetry(
@@ -368,7 +369,7 @@ async function openPortal(
     { method: 'GET', url: CSLB_PORTAL_URL, headers: requestHeaders() },
     phase,
   );
-  const bytes = await collectBody(opened.response, context.signal, PORTAL_MAXIMUM_BYTES);
+  const bytes = await collectSmallBody(opened.response, context.signal, PORTAL_MAXIMUM_BYTES);
   let html: string;
   try {
     html = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
@@ -384,7 +385,7 @@ async function openPortal(
 }
 
 async function selectMaster(
-  context: DiscoveryContext | AcquisitionContext,
+  context: DiscoveryContext | StreamingAcquisitionContext,
   portal: PortalState,
   phase: 'discover' | 'acquire',
 ): Promise<PortalState> {
@@ -403,7 +404,7 @@ async function selectMaster(
     },
     phase,
   );
-  const bytes = await collectBody(selected.response, context.signal, PORTAL_MAXIMUM_BYTES);
+  const bytes = await collectSmallBody(selected.response, context.signal, PORTAL_MAXIMUM_BYTES);
   const html = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
   if (
     !html.includes(CSLB_MASTER_DOWNLOAD_EVENT) ||
@@ -465,11 +466,22 @@ function checkpointForPlan(
   const parsed = sourceCheckpointSchema.safeParse(value);
   if (!parsed.success) throw oracleError('SCHEMA_DRIFT', `Invalid ${origin} checkpoint`, 'acquire');
   const checkpoint = parsed.data;
+  const isInitial =
+    checkpoint.nextSequence === 0 &&
+    checkpoint.completedRequestKeys.length === 0 &&
+    checkpoint.acquiredArtifactIds.length === 0 &&
+    !checkpoint.complete;
+  const isComplete =
+    checkpoint.nextSequence === 1 &&
+    checkpoint.completedRequestKeys.length === 1 &&
+    checkpoint.completedRequestKeys[0] === CSLB_MASTER_REQUEST_KEY &&
+    checkpoint.acquiredArtifactIds.length === 1 &&
+    checkpoint.complete;
   if (
     checkpoint.sourceId !== plan.sourceId ||
     checkpoint.snapshotId !== plan.snapshotId ||
     checkpoint.contractVersion !== plan.contractVersion ||
-    checkpoint.nextSequence > plan.items.length
+    (!isInitial && !isComplete)
   ) {
     throw oracleError('SCHEMA_DRIFT', `${origin} checkpoint does not belong to plan`, 'acquire');
   }
@@ -510,24 +522,43 @@ function assertHeader(header: readonly string[]): void {
   }
 }
 
-async function* csvRows(bytes: Uint8Array, signal: AbortSignal): AsyncIterable<CsvRow> {
-  const input = Readable.from(
-    (function* chunks(): Iterable<Uint8Array> {
-      for (let offset = 0; offset < bytes.byteLength; offset += STREAM_CHUNK_BYTES) {
-        signal.throwIfAborted();
-        yield bytes.slice(offset, Math.min(bytes.byteLength, offset + STREAM_CHUNK_BYTES));
-      }
-    })(),
-  );
+async function* strictUtf8(
+  body: AsyncIterable<Uint8Array>,
+  signal: AbortSignal,
+): AsyncIterable<string> {
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  try {
+    for await (const chunk of body) {
+      signal.throwIfAborted();
+      const value = decoder.decode(chunk, { stream: true });
+      if (value.length > 0) yield value;
+    }
+    const final = decoder.decode();
+    if (final.length > 0) yield final;
+  } catch (error) {
+    if (error instanceof TypeError) {
+      throw oracleError('RECORD_QUALITY', 'CSLB master is not valid UTF-8', 'decode');
+    }
+    throw error;
+  }
+}
+
+async function* csvRows(
+  body: AsyncIterable<Uint8Array>,
+  signal: AbortSignal,
+): AsyncIterable<CsvRow> {
+  const input = Readable.from(strictUtf8(body, signal));
   const parser = input.pipe(
     parse({
       bom: true,
       columns: false,
       encoding: 'utf8',
+      max_record_size: MAXIMUM_CSV_RECORD_BYTES,
       relax_column_count: false,
       skip_empty_lines: true,
     }),
   );
+  input.on('error', (error: Error) => parser.destroy(error));
   let header: readonly string[] | undefined;
   try {
     for await (const candidate of parser) {
@@ -807,7 +838,7 @@ function createMutations(
   return Object.freeze(mutations);
 }
 
-export class CslbContractorAdapter implements SourceAdapter<
+export class CslbContractorAdapter implements StreamingSourceAdapter<
   CslbDecodedContractorRecord,
   CslbValidatedContractorRecord
 > {
@@ -895,8 +926,8 @@ export class CslbContractorAdapter implements SourceAdapter<
   public async *acquire(
     plan: AcquisitionPlan,
     checkpoint: SourceCheckpoint | undefined,
-    context: AcquisitionContext,
-  ): AsyncIterable<AcquiredByteArtifact> {
+    context: StreamingAcquisitionContext,
+  ): AsyncIterable<AcquiredArtifactSource> {
     if (plan.sourceId !== CSLB_CONTRACTOR_SOURCE_ID || plan.items.length !== 1) {
       throw oracleError('SCHEMA_DRIFT', 'CSLB acquisition plan mismatch', 'acquire');
     }
@@ -916,11 +947,98 @@ export class CslbContractorAdapter implements SourceAdapter<
       throw oracleError('RECONCILIATION', 'Caller and stored checkpoints disagree', 'acquire');
     }
     const resume = storedCheckpoint ?? callerCheckpoint;
+    const logicalKey = `raw/cslb-contractors/${plan.snapshotId}/license-master.csv`;
+    const existing = await context.artifactStore.headByLogicalKey(logicalKey);
+    if (existing !== undefined) {
+      let sourceAsOf: SourceAsOf;
+      try {
+        sourceAsOf = JSON.parse(existing.metadata.sourceAsOf ?? '') as SourceAsOf;
+      } catch {
+        throw oracleError('RECONCILIATION', 'CSLB orphan metadata is invalid', 'acquire');
+      }
+      const existingMetadata = acquiredArtifactSchema.parse({
+        artifactId: `sc:artifact:sha256:${existing.sha256}`,
+        sourceId: CSLB_CONTRACTOR_SOURCE_ID,
+        snapshotId: plan.snapshotId,
+        retrievedAt: existing.metadata.retrievedAt,
+        sourceAsOf,
+        request: {
+          requestKey: CSLB_MASTER_REQUEST_KEY,
+          method: 'POST',
+          url: CSLB_PORTAL_URL,
+          headers: [
+            { name: 'accept', valueSha256: sha256Hex(new TextEncoder().encode('text/csv')) },
+            {
+              name: 'content-type',
+              valueSha256: sha256Hex(new TextEncoder().encode('application/x-www-form-urlencoded')),
+            },
+          ],
+          bodySha256: existing.metadata.requestBodySha256,
+          attempt: Number(existing.metadata.attempt),
+        },
+        response: {
+          httpStatus: Number(existing.metadata.httpStatus),
+          etag: optionalMetadata(existing.metadata.etag),
+          lastModified: optionalMetadata(existing.metadata.lastModified),
+          finalUrl: CSLB_PORTAL_URL,
+        },
+        mediaType: existing.mediaType,
+        encoding: 'csv',
+        byteSize: existing.byteSize,
+        sha256: existing.sha256,
+        schemaFingerprint: {
+          algorithm: 'sha256',
+          value: SCHEMA_FINGERPRINT,
+          schemaName: 'cslb-license-master-csv-2026-07',
+          canonicalizationVersion: CONTRACT_VERSION,
+        },
+        rawUri: existing.uri,
+        licenseSnapshotRef: CSLB_CONTRACTOR_LICENSE_ID,
+        visibility: 'authenticated',
+      });
+      const adopted = await createStreamingAcquiredArtifact(
+        existingMetadata,
+        context.artifactStore,
+      );
+      if (
+        resume?.complete === true &&
+        resume.acquiredArtifactIds[0] !== adopted.metadata.artifactId
+      ) {
+        throw oracleError(
+          'RECONCILIATION',
+          'CSLB checkpoint artifact ID does not match its immutable logical-key artifact',
+          'acquire',
+        );
+      }
+      if (resume?.complete !== true) {
+        const adoptedCheckpoint = createSourceCheckpoint(
+          plan,
+          [adopted.metadata.artifactId],
+          context.clock.now(),
+        );
+        const adoptedEnvelope = createCheckpointEnvelope({
+          scope,
+          previousRevision: storedEnvelope?.revision ?? null,
+          writtenAt: adoptedCheckpoint.updatedAt,
+          payload: checkpointPayload(adoptedCheckpoint),
+        });
+        const adoptedCommit = await context.checkpointStore.commit({
+          expectedRevision: storedEnvelope?.revision ?? null,
+          checkpoint: adoptedEnvelope,
+        });
+        if (adoptedCommit.status === 'conflict') {
+          throw oracleError('RECONCILIATION', 'CSLB orphan checkpoint conflict', 'acquire');
+        }
+      }
+      yield adopted;
+      return;
+    }
     if (
       resume?.complete === true ||
       resume?.completedRequestKeys.includes(CSLB_MASTER_REQUEST_KEY) === true
-    )
-      return;
+    ) {
+      throw oracleError('RECONCILIATION', 'CSLB checkpoint artifact is missing', 'acquire');
+    }
 
     const portal = await openPortal(context, 'acquire');
     const selected = await selectMaster(context, portal, 'acquire');
@@ -947,38 +1065,48 @@ export class CslbContractorAdapter implements SourceAdapter<
         'acquire',
       );
     }
-    const bytes = await collectBody(
-      downloaded.response,
-      context.signal,
-      this.#options.maximumArtifactBytes ?? DEFAULT_MAXIMUM_ARTIFACT_BYTES,
-    );
-    const sha256 = sha256Hex(bytes);
-    const logicalKey = `raw/cslb-contractors/${plan.snapshotId}/${sha256}.csv`;
-    const stored = await context.artifactStore.putImmutable({
+    const sourceAsOf = portalSourceAsOf(selected.html);
+    const retrievedAt = context.clock.now();
+    const etag = headerValue(downloaded.response.headers, 'etag') ?? null;
+    const lastModified = httpDateToIso(headerValue(downloaded.response.headers, 'last-modified'));
+    const requestBodySha256 = sha256Hex(body);
+    const stored = await persistAcquiredBody({
+      store: context.artifactStore,
       logicalKey,
       mediaType,
-      body: bytes,
-      expectedSha256: sha256,
+      body: downloaded.response.body,
+      maximumBytes: this.#options.maximumArtifactBytes ?? DEFAULT_MAXIMUM_ARTIFACT_BYTES,
       metadata: Object.freeze({
         authority: DESCRIPTOR.authority.organization,
         sourceUrl: CSLB_PORTAL_URL,
         snapshotId: plan.snapshotId,
-        sourceAsOf: canonicalJson(portalSourceAsOf(selected.html)),
+        sourceAsOf: canonicalJson(sourceAsOf),
+        retrievedAt,
+        requestBodySha256,
+        attempt: String(downloaded.attempt),
+        httpStatus: String(downloaded.response.status),
+        etag: etag ?? '',
+        lastModified: lastModified ?? '',
         visibility: 'authenticated',
       }),
-      ifAbsent: true,
+      signal: context.signal,
     });
     assertStoredArtifactIntegrity(
-      { logicalKey, mediaType, byteSize: bytes.byteLength, sha256 },
+      {
+        logicalKey,
+        mediaType,
+        byteSize: stored.byteSize,
+        sha256: stored.sha256,
+      },
       stored,
     );
-    const retrievedAt = context.clock.now();
+    const sha256 = stored.sha256;
     const metadata: AcquiredArtifact = {
       artifactId: artifactIdSchema.parse(`sc:artifact:sha256:${sha256}`),
       sourceId: CSLB_CONTRACTOR_SOURCE_ID,
       snapshotId: plan.snapshotId,
       retrievedAt,
-      sourceAsOf: portalSourceAsOf(selected.html),
+      sourceAsOf,
       request: {
         requestKey: CSLB_MASTER_REQUEST_KEY,
         method: 'POST',
@@ -990,18 +1118,18 @@ export class CslbContractorAdapter implements SourceAdapter<
             valueSha256: sha256Hex(new TextEncoder().encode('application/x-www-form-urlencoded')),
           },
         ],
-        bodySha256: sha256Hex(body),
+        bodySha256: requestBodySha256,
         attempt: downloaded.attempt,
       },
       response: {
         httpStatus: downloaded.response.status,
-        etag: headerValue(downloaded.response.headers, 'etag') ?? null,
-        lastModified: httpDateToIso(headerValue(downloaded.response.headers, 'last-modified')),
+        etag,
+        lastModified,
         finalUrl: CSLB_PORTAL_URL,
       },
       mediaType,
       encoding: 'csv',
-      byteSize: bytes.byteLength,
+      byteSize: stored.byteSize,
       sha256,
       schemaFingerprint: {
         algorithm: 'sha256',
@@ -1013,7 +1141,7 @@ export class CslbContractorAdapter implements SourceAdapter<
       licenseSnapshotRef: CSLB_CONTRACTOR_LICENSE_ID,
       visibility: 'authenticated',
     };
-    const artifact = createAcquiredByteArtifact(metadata, bytes);
+    const artifact = await createStreamingAcquiredArtifact(metadata, context.artifactStore);
     const nextCheckpoint = createSourceCheckpoint(
       plan,
       [artifact.metadata.artifactId],
@@ -1036,8 +1164,8 @@ export class CslbContractorAdapter implements SourceAdapter<
   }
 
   public async *decode(
-    artifact: AcquiredByteArtifact,
-    context: DecodeContext,
+    artifact: AcquiredArtifactSource,
+    context: StreamingDecodeContext,
   ): AsyncIterable<CslbDecodedContractorRecord> {
     context.signal.throwIfAborted();
     if (
@@ -1046,15 +1174,15 @@ export class CslbContractorAdapter implements SourceAdapter<
     ) {
       throw oracleError('SCHEMA_DRIFT', 'Not a CSLB master CSV artifact', 'decode');
     }
-    const bytes = artifact.bytes.copy();
-    try {
-      new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    } catch {
-      throw oracleError('RECORD_QUALITY', 'CSLB master is not valid UTF-8', 'decode');
+    if (artifact.content === undefined) {
+      throw oracleError('SCHEMA_DRIFT', 'CSLB production decode requires streaming v2', 'decode');
     }
     if (this.#options.expectedRecordCount !== undefined) {
       let observed = 0;
-      for await (const row of csvRows(bytes, context.signal)) {
+      for await (const row of csvRows(
+        artifact.content.read({ maxChunkBytes: STREAM_CHUNK_BYTES }),
+        context.signal,
+      )) {
         void row;
         observed += 1;
       }
@@ -1067,7 +1195,10 @@ export class CslbContractorAdapter implements SourceAdapter<
       }
     }
     let ordinal = 0;
-    for await (const row of csvRows(bytes, context.signal)) {
+    for await (const row of csvRows(
+      artifact.content.read({ maxChunkBytes: STREAM_CHUNK_BYTES }),
+      context.signal,
+    )) {
       ordinal += 1;
       const raw = rowObject(row.values);
       const license = raw.LicenseNo.trim();
@@ -1240,13 +1371,22 @@ export class CslbContractorAdapter implements SourceAdapter<
     }
   }
 
-  public summarize(run: SourceRunObservation, context: SummaryContext): SourceRunSummary {
+  public async summarize(
+    run: SourceRunObservationV2,
+    context: SummaryContext,
+  ): Promise<SourceRunSummary> {
     context.signal.throwIfAborted();
     if (run.decodedRecords !== run.acceptedRecords + run.rejectedRecords) {
       throw oracleError('RECORD_QUALITY', 'CSLB summary accounting does not balance', 'summarize');
     }
     const visibilityCounts = { public: 0, authenticated: 0, restricted: 0, prohibited_public: 0 };
-    for (const mutation of run.mutations) visibilityCounts[mutation.visibility] += 1;
+    for await (const mutation of run.mutations.read()) visibilityCounts[mutation.visibility] += 1;
+    let warningCount = 0;
+    let errorCount = 0;
+    for await (const item of run.validationIssues.read()) {
+      if (item.severity === 'warning') warningCount += 1;
+      else errorCount += 1;
+    }
     const complete =
       run.artifacts.length === 1 &&
       run.artifacts[0]?.request.requestKey === CSLB_MASTER_REQUEST_KEY &&
@@ -1269,10 +1409,10 @@ export class CslbContractorAdapter implements SourceAdapter<
       decodedRecords: run.decodedRecords,
       acceptedRecords: run.acceptedRecords,
       rejectedRecords: run.rejectedRecords,
-      normalizedMutations: run.mutations.length,
+      normalizedMutations: run.mutations.count,
       visibilityCounts,
-      warningCount: run.validationIssues.filter((item) => item.severity === 'warning').length,
-      errorCount: run.validationIssues.filter((item) => item.severity !== 'warning').length,
+      warningCount,
+      errorCount,
       finalCheckpoint: run.finalCheckpoint,
     });
   }
@@ -1280,7 +1420,7 @@ export class CslbContractorAdapter implements SourceAdapter<
 
 export function createCslbContractorAdapter(
   options: CslbContractorAdapterOptions,
-): SourceAdapter<CslbDecodedContractorRecord, CslbValidatedContractorRecord> {
+): StreamingSourceAdapter<CslbDecodedContractorRecord, CslbValidatedContractorRecord> {
   return new CslbContractorAdapter(options);
 }
 

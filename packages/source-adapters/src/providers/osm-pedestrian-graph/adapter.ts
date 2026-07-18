@@ -26,19 +26,20 @@ import {
 } from '@oracle/contracts/source';
 
 import {
-  createAcquiredByteArtifact,
-  type AcquiredByteArtifact,
+  createStreamingAcquiredArtifact,
+  type AcquiredArtifactSource,
 } from '../../spi/acquired-artifact.js';
+import { persistAcquiredBody } from '../../spi/acquisition.js';
 import type {
-  AcquisitionContext,
-  DecodeContext,
   DiscoveryContext,
   DiscoveryResult,
   NormalizationContext,
   PlanningContext,
   RecordValidation,
-  SourceAdapter,
-  SourceRunObservation,
+  SourceRunObservationV2,
+  StreamingAcquisitionContext,
+  StreamingDecodeContext,
+  StreamingSourceAdapter,
   SummaryContext,
   ValidationContext,
 } from '../../spi/adapter.js';
@@ -66,6 +67,17 @@ import type {
 
 const ACCEPT = 'application/vnd.openstreetmap.data.pbf, application/octet-stream';
 const CHECKPOINT_SCOPE_PREFIX = 'source/osm-pedestrian-graph';
+const PBF_DECODE_LIMITS = Object.freeze({
+  maximumBlobBytes: 32 * 1024 * 1024,
+  maximumTagsPerElement: 4_096,
+  maximumWayNodeRefs: 65_536,
+  maximumRelationMembers: 65_536,
+});
+const OSM_ELEMENT_RANK: Readonly<Record<string, number>> = Object.freeze({
+  node: 0,
+  way: 1,
+  relation: 2,
+});
 
 export interface OsmPedestrianGraphAdapterOptions {
   readonly extract: PinnedOsmExtract;
@@ -109,6 +121,10 @@ function header(headers: HttpHeaders, name: string): string | undefined {
   return Object.entries(headers).find(([key]) => key.toLowerCase() === target)?.[1];
 }
 
+function optionalMetadata(value: string | undefined): string | null {
+  return value === undefined || value.length === 0 ? null : value;
+}
+
 function parseHttpDate(value: string | undefined): string | null {
   if (value === undefined) return null;
   const milliseconds = Date.parse(value);
@@ -128,15 +144,35 @@ function isTransient(status: number): boolean {
 async function requestWithRetry(
   method: 'GET' | 'HEAD',
   url: string,
-  context: DiscoveryContext | AcquisitionContext,
+  context: DiscoveryContext | StreamingAcquisitionContext,
 ): Promise<Readonly<{ response: HttpResponse; attempt: number }>> {
   const policy = context.ratePolicy;
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
     context.signal.throwIfAborted();
-    const response = await context.http.send(
-      { method, url, headers: { accept: ACCEPT } },
-      context.signal,
-    );
+    let response: HttpResponse;
+    try {
+      response = await context.http.send(
+        { method, url, headers: { accept: ACCEPT } },
+        context.signal,
+      );
+    } catch (error) {
+      if (
+        context.signal.aborted ||
+        (error instanceof DOMException && error.name === 'AbortError')
+      ) {
+        throw error;
+      }
+      if (attempt === policy.maxAttempts) {
+        throw providerError(
+          'TRANSIENT_SOURCE',
+          `Pinned OSM extract transport failed after ${attempt} attempts`,
+          method === 'HEAD' ? 'discover' : 'acquire',
+        );
+      }
+      const backoff = Math.min(policy.initialBackoffMs * 2 ** (attempt - 1), policy.maxBackoffMs);
+      await context.delay.wait(backoff, context.signal);
+      continue;
+    }
     if (response.status >= 200 && response.status < 300) {
       return Object.freeze({ response, attempt });
     }
@@ -162,25 +198,6 @@ async function requestWithRetry(
     await context.delay.wait(retryAfter ?? backoff, context.signal);
   }
   throw new Error('Unreachable OSM retry loop');
-}
-
-async function collectBody(response: HttpResponse, signal: AbortSignal): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
-  let byteLength = 0;
-  for await (const chunk of response.body) {
-    signal.throwIfAborted();
-    const copy = Uint8Array.from(chunk);
-    chunks.push(copy);
-    byteLength += copy.byteLength;
-  }
-  signal.throwIfAborted();
-  const bytes = new Uint8Array(byteLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
 }
 
 function validateExtract(extract: PinnedOsmExtract): void {
@@ -298,10 +315,49 @@ function completedCheckpoint(
     cursor: 'sequence:1',
     nextSequence: 1,
     completedRequestKeys: [plan.items[0]?.requestKey],
-    acquiredArtifactIds: [...(previous?.acquiredArtifactIds ?? []), artifactId],
+    acquiredArtifactIds: [...new Set([...(previous?.acquiredArtifactIds ?? []), artifactId])],
     updatedAt,
     complete: true,
   });
+}
+
+function checkpointForPlan(
+  candidate: unknown,
+  plan: AcquisitionPlan,
+  expectedArtifactId: string,
+  origin: 'caller' | 'stored',
+): SourceCheckpoint {
+  const parsed = sourceCheckpointSchema.safeParse(candidate);
+  if (!parsed.success) {
+    throw providerError('RECONCILIATION', `OSM ${origin} checkpoint is invalid`, 'acquire');
+  }
+  const checkpoint = parsed.data;
+  const requestKey = plan.items[0]?.requestKey;
+  const isInitial =
+    checkpoint.nextSequence === 0 &&
+    checkpoint.completedRequestKeys.length === 0 &&
+    checkpoint.acquiredArtifactIds.length === 0 &&
+    !checkpoint.complete;
+  const isComplete =
+    checkpoint.nextSequence === 1 &&
+    checkpoint.completedRequestKeys.length === 1 &&
+    checkpoint.completedRequestKeys[0] === requestKey &&
+    checkpoint.acquiredArtifactIds.length === 1 &&
+    checkpoint.acquiredArtifactIds[0] === expectedArtifactId &&
+    checkpoint.complete;
+  if (
+    checkpoint.sourceId !== plan.sourceId ||
+    checkpoint.snapshotId !== plan.snapshotId ||
+    checkpoint.contractVersion !== plan.contractVersion ||
+    (!isInitial && !isComplete)
+  ) {
+    throw providerError(
+      'RECONCILIATION',
+      `OSM ${origin} checkpoint is not an exact prefix of the frozen one-item plan`,
+      'acquire',
+    );
+  }
+  return checkpoint;
 }
 
 function parsePositiveId(value: unknown): string | null {
@@ -499,7 +555,44 @@ function validateElement(
   });
 }
 
-export class OsmPedestrianGraphAdapter implements SourceAdapter<
+function decodedOrder(element: OsmDecodedElement): readonly [number, bigint] | null {
+  const id = parsePositiveId(element.id);
+  if (id === null) return null;
+  const rank = OSM_ELEMENT_RANK[element.type];
+  if (rank === undefined) return null;
+  return [rank, BigInt(id)];
+}
+
+function assertDecodedElementLimits(element: OsmDecodedElement): void {
+  if (
+    typeof element.tags === 'object' &&
+    element.tags !== null &&
+    !Array.isArray(element.tags) &&
+    Object.keys(element.tags).length > PBF_DECODE_LIMITS.maximumTagsPerElement
+  ) {
+    throw providerError('RECORD_QUALITY', 'OSM element exceeds the tag-count ceiling', 'decode');
+  }
+  if (
+    element.type === 'way' &&
+    Array.isArray(element.nodeRefs) &&
+    element.nodeRefs.length > PBF_DECODE_LIMITS.maximumWayNodeRefs
+  ) {
+    throw providerError('RECORD_QUALITY', 'OSM way exceeds the node-reference ceiling', 'decode');
+  }
+  if (
+    element.type === 'relation' &&
+    Array.isArray(element.members) &&
+    element.members.length > PBF_DECODE_LIMITS.maximumRelationMembers
+  ) {
+    throw providerError(
+      'RECORD_QUALITY',
+      'OSM relation exceeds the member-count ceiling',
+      'decode',
+    );
+  }
+}
+
+export class OsmPedestrianGraphAdapter implements StreamingSourceAdapter<
   OsmPedestrianDecodedRecord,
   ValidatedOsmPedestrianRecord
 > {
@@ -587,52 +680,174 @@ export class OsmPedestrianGraphAdapter implements SourceAdapter<
   public async *acquire(
     plan: AcquisitionPlan,
     checkpoint: SourceCheckpoint | undefined,
-    context: AcquisitionContext,
-  ): AsyncIterable<AcquiredByteArtifact> {
+    context: StreamingAcquisitionContext,
+  ): AsyncIterable<AcquiredArtifactSource> {
     context.signal.throwIfAborted();
     if (plan.sourceId !== OSM_PEDESTRIAN_GRAPH_SOURCE_ID || plan.items.length !== 1) {
       throw providerError('RECORD_QUALITY', 'Unexpected OSM acquisition plan', 'acquire');
     }
+    const scope = checkpointScope(plan);
+    const sha256 = this.#extract.expectedSha256;
+    const expectedArtifactId = `sc:artifact:sha256:${sha256}`;
+    const current = await context.checkpointStore.load(scope);
+    const persistedCheckpoint =
+      current === undefined
+        ? undefined
+        : checkpointForPlan(current.payload, plan, expectedArtifactId, 'stored');
+    const callerCheckpoint =
+      checkpoint === undefined
+        ? undefined
+        : checkpointForPlan(checkpoint, plan, expectedArtifactId, 'caller');
     if (
-      checkpoint?.complete === true ||
-      checkpoint?.completedRequestKeys.includes(this.#extract.extractId)
+      callerCheckpoint !== undefined &&
+      persistedCheckpoint !== undefined &&
+      stableJson(callerCheckpoint) !== stableJson(persistedCheckpoint)
     ) {
+      throw providerError(
+        'RECONCILIATION',
+        'OSM caller and stored checkpoints disagree',
+        'acquire',
+      );
+    }
+    const resume = persistedCheckpoint ?? callerCheckpoint;
+    const logicalKey = `raw/osm-pedestrian-graph/${plan.snapshotId}/${sha256}.osm.pbf`;
+    const existing = await context.artifactStore.headByLogicalKey(logicalKey);
+    if (existing !== undefined) {
+      if (
+        existing.sha256 !== sha256 ||
+        existing.byteSize !== this.#extract.expectedByteSize ||
+        existing.mediaType !== 'application/vnd.openstreetmap.data.pbf'
+      ) {
+        throw providerError(
+          'RECONCILIATION',
+          'OSM orphan artifact does not match source lock',
+          'acquire',
+        );
+      }
+      const existingMetadata = acquiredArtifactSchema.parse({
+        artifactId: `sc:artifact:sha256:${sha256}`,
+        sourceId: OSM_PEDESTRIAN_GRAPH_SOURCE_ID,
+        snapshotId: plan.snapshotId,
+        retrievedAt: existing.metadata.retrievedAt,
+        sourceAsOf: { state: 'reported', at: this.#extract.extractTimestamp },
+        request: {
+          requestKey: this.#extract.extractId,
+          method: 'GET',
+          url: this.#extract.url,
+          headers: [{ name: 'accept', valueSha256: sha256Hex(new TextEncoder().encode(ACCEPT)) }],
+          bodySha256: null,
+          attempt: Number(existing.metadata.attempt),
+        },
+        response: {
+          httpStatus: Number(existing.metadata.httpStatus),
+          etag: optionalMetadata(existing.metadata.etag),
+          lastModified: optionalMetadata(existing.metadata.lastModified),
+          finalUrl: this.#extract.url,
+        },
+        mediaType: existing.mediaType,
+        encoding: 'pbf',
+        byteSize: existing.byteSize,
+        sha256,
+        schemaFingerprint: {
+          algorithm: 'sha256',
+          value: OSM_DECODED_SCHEMA_FINGERPRINT,
+          schemaName: 'osm-pbf-decoded-element-v1',
+          canonicalizationVersion: '1.0.0',
+        },
+        rawUri: existing.uri,
+        licenseSnapshotRef: OSM_LICENSE_SNAPSHOT_ID,
+        visibility: 'public',
+      });
+      const adopted = await createStreamingAcquiredArtifact(
+        existingMetadata,
+        context.artifactStore,
+      );
+      if (resume?.complete !== true) {
+        const nextCheckpoint = completedCheckpoint(
+          plan,
+          resume,
+          adopted.metadata.artifactId,
+          context.clock.now(),
+        );
+        const envelope = createCheckpointEnvelope({
+          scope,
+          previousRevision: current?.revision ?? null,
+          writtenAt: nextCheckpoint.updatedAt,
+          payload: nextCheckpoint,
+        });
+        const commit = await context.checkpointStore.commit({
+          expectedRevision: current?.revision ?? null,
+          checkpoint: envelope,
+        });
+        if (commit.status !== 'committed') {
+          throw providerError(
+            'RECONCILIATION',
+            'OSM orphan checkpoint revision conflict',
+            'acquire',
+          );
+        }
+      }
+      yield adopted;
       return;
     }
+    if (resume?.complete === true) {
+      throw providerError('RECONCILIATION', 'OSM checkpoint artifact is missing', 'acquire');
+    }
     const { response, attempt } = await requestWithRetry('GET', this.#extract.url, context);
-    const bytes = await collectBody(response, context.signal);
-    const sha256 = sha256Hex(bytes);
+    const responseType = header(response.headers, 'content-type')
+      ?.split(';', 1)[0]
+      ?.trim()
+      .toLowerCase();
     if (
-      bytes.byteLength !== this.#extract.expectedByteSize ||
-      sha256 !== this.#extract.expectedSha256
+      responseType !== 'application/vnd.openstreetmap.data.pbf' &&
+      responseType !== 'application/octet-stream'
     ) {
-      throw providerError('SCHEMA_DRIFT', 'Pinned OSM PBF byte integrity mismatch', 'acquire', {
-        expectedByteSize: this.#extract.expectedByteSize,
-        actualByteSize: bytes.byteLength,
-        expectedSha256: this.#extract.expectedSha256,
-        actualSha256: sha256,
+      throw providerError('SCHEMA_DRIFT', 'Pinned OSM extract media type changed', 'acquire', {
+        mediaType: responseType ?? null,
       });
     }
-    const stored = await context.artifactStore.putImmutable({
-      logicalKey: `raw/osm-pedestrian-graph/${plan.snapshotId}/${sha256}.osm.pbf`,
-      mediaType: 'application/vnd.openstreetmap.data.pbf',
-      body: bytes,
-      expectedSha256: sha256,
-      metadata: Object.freeze({
-        extractId: this.#extract.extractId,
-        distributor: this.#extract.distributor,
-        extractTimestamp: this.#extract.extractTimestamp,
-        distributorChecksumAlgorithm: this.#extract.distributorChecksum.algorithm,
-        distributorChecksum: this.#extract.distributorChecksum.value,
-        attribution: OSM_ATTRIBUTION,
-        license: 'ODbL-1.0',
-      }),
-      ifAbsent: true,
-    });
-    if (stored.byteSize !== bytes.byteLength || stored.sha256 !== sha256) {
-      throw providerError('RECORD_QUALITY', 'Artifact store changed pinned OSM bytes', 'acquire');
-    }
     const retrievedAt = context.clock.now();
+    const etag = header(response.headers, 'etag') ?? null;
+    const lastModified = parseHttpDate(header(response.headers, 'last-modified'));
+    let stored;
+    try {
+      stored = await persistAcquiredBody({
+        store: context.artifactStore,
+        logicalKey,
+        mediaType: 'application/vnd.openstreetmap.data.pbf',
+        body: response.body,
+        expectedSha256: sha256,
+        maximumBytes: this.#extract.expectedByteSize,
+        metadata: Object.freeze({
+          extractId: this.#extract.extractId,
+          distributor: this.#extract.distributor,
+          extractTimestamp: this.#extract.extractTimestamp,
+          distributorChecksumAlgorithm: this.#extract.distributorChecksum.algorithm,
+          distributorChecksum: this.#extract.distributorChecksum.value,
+          attribution: OSM_ATTRIBUTION,
+          license: 'ODbL-1.0',
+          retrievedAt,
+          attempt: String(attempt),
+          httpStatus: String(response.status),
+          etag: etag ?? '',
+          lastModified: lastModified ?? '',
+        }),
+        signal: context.signal,
+      });
+    } catch (error) {
+      if (context.signal.aborted) throw error;
+      throw providerError('SCHEMA_DRIFT', 'Pinned OSM PBF byte integrity mismatch', 'acquire', {
+        cause: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (stored.byteSize !== this.#extract.expectedByteSize || stored.sha256 !== sha256) {
+      throw providerError('SCHEMA_DRIFT', 'Pinned OSM PBF byte integrity mismatch', 'acquire', {
+        expectedByteSize: this.#extract.expectedByteSize,
+        actualByteSize: stored.byteSize,
+        expectedSha256: this.#extract.expectedSha256,
+        actualSha256: stored.sha256,
+      });
+    }
     const metadata = acquiredArtifactSchema.parse({
       artifactId: `sc:artifact:sha256:${sha256}`,
       sourceId: OSM_PEDESTRIAN_GRAPH_SOURCE_ID,
@@ -649,13 +864,13 @@ export class OsmPedestrianGraphAdapter implements SourceAdapter<
       },
       response: {
         httpStatus: response.status,
-        etag: header(response.headers, 'etag') ?? null,
-        lastModified: parseHttpDate(header(response.headers, 'last-modified')),
+        etag,
+        lastModified,
         finalUrl: this.#extract.url,
       },
       mediaType: 'application/vnd.openstreetmap.data.pbf',
       encoding: 'pbf',
-      byteSize: bytes.byteLength,
+      byteSize: stored.byteSize,
       sha256,
       schemaFingerprint: {
         algorithm: 'sha256',
@@ -668,8 +883,6 @@ export class OsmPedestrianGraphAdapter implements SourceAdapter<
       visibility: 'public',
     });
     const nextCheckpoint = completedCheckpoint(plan, checkpoint, metadata.artifactId, retrievedAt);
-    const scope = checkpointScope(plan);
-    const current = await context.checkpointStore.load(scope);
     const envelope = createCheckpointEnvelope({
       scope,
       previousRevision: current?.revision ?? null,
@@ -683,12 +896,12 @@ export class OsmPedestrianGraphAdapter implements SourceAdapter<
     if (commit.status !== 'committed') {
       throw providerError('RECONCILIATION', 'OSM checkpoint revision conflict', 'acquire');
     }
-    yield createAcquiredByteArtifact(metadata, bytes);
+    yield await createStreamingAcquiredArtifact(metadata, context.artifactStore);
   }
 
   public async *decode(
-    artifact: AcquiredByteArtifact,
-    context: DecodeContext,
+    artifact: AcquiredArtifactSource,
+    context: StreamingDecodeContext,
   ): AsyncIterable<OsmPedestrianDecodedRecord> {
     context.signal.throwIfAborted();
     if (
@@ -703,14 +916,42 @@ export class OsmPedestrianGraphAdapter implements SourceAdapter<
         'decode',
       );
     }
-    const seen = new Map<string, string>();
+    if (artifact.content === undefined) {
+      throw providerError('SCHEMA_DRIFT', 'OSM production decode requires streaming v2', 'decode');
+    }
+    let previousKey: string | undefined;
+    let previousSha256: string | undefined;
+    let previousOrder: readonly [number, bigint] | null = null;
     let ordinal = 0;
-    for await (const element of this.#decoder.decode(artifact.bytes.copy(), context.signal)) {
+    for await (const element of this.#decoder.decode(
+      artifact.content,
+      context.signal,
+      PBF_DECODE_LIMITS,
+    )) {
       context.signal.throwIfAborted();
+      const order = decodedOrder(element);
+      if (order === null) {
+        throw providerError(
+          'SCHEMA_DRIFT',
+          'OSM decoder emitted an unsupported element type or non-positive element ID',
+          'decode',
+        );
+      }
+      assertDecodedElementLimits(element);
       const recordSha256 = digest(stableJson(element));
       const key = `${element.type}/${String(element.id)}`;
-      const previousSha256 = seen.get(key);
-      if (previousSha256 !== undefined) {
+      if (
+        previousOrder !== null &&
+        (order[0] < previousOrder[0] ||
+          (order[0] === previousOrder[0] && order[1] < previousOrder[1]))
+      ) {
+        throw providerError(
+          'SCHEMA_DRIFT',
+          `OSM decoder emitted out-of-order element ${key}`,
+          'decode',
+        );
+      }
+      if (previousKey === key && previousSha256 !== undefined) {
         if (previousSha256 !== recordSha256) {
           throw providerError(
             'SCHEMA_DRIFT',
@@ -720,7 +961,9 @@ export class OsmPedestrianGraphAdapter implements SourceAdapter<
         }
         continue;
       }
-      seen.set(key, recordSha256);
+      previousKey = key;
+      previousSha256 = recordSha256;
+      previousOrder = order;
       yield Object.freeze({
         format: 'pbf',
         artifactId: artifact.metadata.artifactId,
@@ -800,7 +1043,10 @@ export class OsmPedestrianGraphAdapter implements SourceAdapter<
     });
   }
 
-  public summarize(run: SourceRunObservation, context: SummaryContext): SourceRunSummary {
+  public async summarize(
+    run: SourceRunObservationV2,
+    context: SummaryContext,
+  ): Promise<SourceRunSummary> {
     context.signal.throwIfAborted();
     if (
       run.descriptor.sourceId !== OSM_PEDESTRIAN_GRAPH_SOURCE_ID ||
@@ -809,13 +1055,21 @@ export class OsmPedestrianGraphAdapter implements SourceAdapter<
     ) {
       throw providerError('RECORD_QUALITY', 'OSM source-run accounting mismatch', 'summarize');
     }
-    const warningCount = run.validationIssues.filter(
-      (issue) => issue.severity === 'warning',
-    ).length;
-    const errorCount = run.validationIssues.filter((issue) => issue.severity !== 'warning').length;
-    const publicMutations = run.mutations.filter(
-      (mutation) => mutation.visibility === 'public',
-    ).length;
+    let warningCount = 0;
+    let errorCount = 0;
+    for await (const issue of run.validationIssues.read()) {
+      if (issue.severity === 'warning') warningCount += 1;
+      else errorCount += 1;
+    }
+    const visibilityCounts = {
+      public: 0,
+      authenticated: 0,
+      restricted: 0,
+      prohibited_public: 0,
+    };
+    for await (const mutation of run.mutations.read()) {
+      visibilityCounts[mutation.visibility] += 1;
+    }
     return sourceRunSummarySchema.parse({
       sourceId: OSM_PEDESTRIAN_GRAPH_SOURCE_ID,
       snapshotId: run.request.snapshotId,
@@ -833,16 +1087,8 @@ export class OsmPedestrianGraphAdapter implements SourceAdapter<
       decodedRecords: run.decodedRecords,
       acceptedRecords: run.acceptedRecords,
       rejectedRecords: run.rejectedRecords,
-      normalizedMutations: run.mutations.length,
-      visibilityCounts: {
-        public: publicMutations,
-        authenticated: run.mutations.filter((mutation) => mutation.visibility === 'authenticated')
-          .length,
-        restricted: run.mutations.filter((mutation) => mutation.visibility === 'restricted').length,
-        prohibited_public: run.mutations.filter(
-          (mutation) => mutation.visibility === 'prohibited_public',
-        ).length,
-      },
+      normalizedMutations: run.mutations.count,
+      visibilityCounts,
       warningCount,
       errorCount,
       finalCheckpoint: run.finalCheckpoint,

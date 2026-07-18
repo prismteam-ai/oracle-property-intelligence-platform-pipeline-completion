@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { createCheckpointEnvelope } from '@oracle/artifacts/checkpoint-store';
-import { assertStoredArtifactIntegrity } from '@oracle/artifacts/artifact-store';
+import type { StoredArtifact } from '@oracle/artifacts/artifact-store';
 import {
   canonicalMutationSchema,
   type CanonicalMutation,
@@ -21,25 +21,27 @@ import {
 } from '@oracle/contracts/source';
 
 import type {
-  AcquisitionContext,
-  DecodeContext,
   DiscoveryContext,
   DiscoveryResult,
   NormalizationContext,
   PlanningContext,
   RecordValidation,
-  SourceAdapter,
-  SourceRunObservation,
+  SourceRunObservationV2,
+  StreamingAcquisitionContext,
+  StreamingDecodeContext,
+  StreamingSourceAdapter,
   SummaryContext,
   ValidationContext,
 } from '../../spi/adapter.js';
 import {
-  createAcquiredByteArtifact,
-  type AcquiredByteArtifact,
+  createStreamingAcquiredArtifact,
+  type AcquiredArtifactSource,
+  type StreamingAcquiredArtifact,
 } from '../../spi/acquired-artifact.js';
+import { persistAcquiredBody } from '../../spi/acquisition.js';
+import { sha256Hex } from '../../spi/bytes.js';
 import type { GeoJsonDecodedRecord, GeoTiffDecodedRecord } from '../../spi/decode.js';
 import type { HttpResponse } from '../../spi/http.js';
-import { sha256Hex } from '../../spi/bytes.js';
 import {
   NOAA_CUSP_SHORELINE,
   USGS_3DEP_ELEVATION,
@@ -56,9 +58,9 @@ import {
   type Wgs84Bounds,
 } from './geometry.js';
 import {
-  decodeElevationGeoTiff,
-  decodeHydroFeatureCollection,
-  decodeNoaaShorelineArchive,
+  decodeElevationGeoTiffTiles,
+  decodeHydroFeatureCollectionStream,
+  decodeNoaaShorelineArchiveStream,
   summarizeNoDataWindow,
 } from './formats.js';
 
@@ -212,21 +214,22 @@ export function classifyHttpStatus(status: number): HttpFailure | null {
   });
 }
 
-async function collectBody(response: HttpResponse, signal: AbortSignal): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
+async function readBoundedResponse(
+  response: HttpResponse,
+  signal: AbortSignal,
+  maximumBytes = 64 * 1024,
+): Promise<Uint8Array> {
+  const bytes = new Uint8Array(maximumBytes);
   let byteLength = 0;
   for await (const chunk of response.body) {
     signal.throwIfAborted();
-    chunks.push(Uint8Array.from(chunk));
+    if (byteLength + chunk.byteLength > maximumBytes) {
+      throw new Error(`SCHEMA_DRIFT: Response exceeds ${maximumBytes} bytes`);
+    }
+    bytes.set(chunk, byteLength);
     byteLength += chunk.byteLength;
   }
-  const bytes = new Uint8Array(byteLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
+  return bytes.slice(0, byteLength);
 }
 
 function queryUrl(base: string, parameters: Readonly<Record<string, string>>): string {
@@ -298,7 +301,7 @@ function elevationUrl(bounds: Wgs84Bounds, size: readonly [number, number]): str
 async function sendWithRetry(
   url: string,
   method: 'GET' | 'HEAD',
-  context: Pick<AcquisitionContext, 'delay' | 'http' | 'ratePolicy' | 'signal'>,
+  context: Pick<StreamingAcquisitionContext, 'delay' | 'http' | 'ratePolicy' | 'signal'>,
 ): Promise<SentResponse> {
   for (let attempt = 1; attempt <= context.ratePolicy.maxAttempts; attempt += 1) {
     context.signal.throwIfAborted();
@@ -393,7 +396,60 @@ function issue(
   return Object.freeze({ code, severity, message, recordKey: null, fieldPath: null });
 }
 
-class WaterElevationAdapter implements SourceAdapter<
+async function* artifactChunks(artifact: AcquiredArtifactSource): AsyncIterable<Uint8Array> {
+  if (artifact.bytes !== undefined) {
+    yield artifact.bytes.copy();
+    return;
+  }
+  yield* artifact.content.read({ maxChunkBytes: 64 * 1024 });
+}
+
+function orderedPlanItems(plan: AcquisitionPlan): readonly AcquisitionPlan['items'][number][] {
+  const ordered = [...plan.items].sort((left, right) => left.sequence - right.sequence);
+  if (
+    ordered.some((item, index) => item.sequence !== index) ||
+    new Set(ordered.map((item) => item.requestKey)).size !== ordered.length
+  ) {
+    throw new Error('Acquisition plan items are not an exact contiguous ordered sequence');
+  }
+  return Object.freeze(ordered);
+}
+
+function checkpointForPlan(
+  value: unknown,
+  plan: AcquisitionPlan,
+  orderedItems: readonly AcquisitionPlan['items'][number][],
+  label: 'caller' | 'persisted',
+): SourceCheckpoint {
+  const parsed = sourceCheckpointSchema.safeParse(value);
+  if (!parsed.success) throw new Error(`${label} provider checkpoint is invalid`);
+  const checkpoint = parsed.data;
+  const expectedKeys = orderedItems
+    .slice(0, checkpoint.nextSequence)
+    .map((item) => item.requestKey);
+  if (
+    checkpoint.sourceId !== plan.sourceId ||
+    checkpoint.snapshotId !== plan.snapshotId ||
+    checkpoint.contractVersion !== plan.contractVersion ||
+    checkpoint.nextSequence > orderedItems.length ||
+    checkpoint.completedRequestKeys.length !== checkpoint.nextSequence ||
+    checkpoint.completedRequestKeys.some((key, index) => key !== expectedKeys[index]) ||
+    checkpoint.acquiredArtifactIds.length > checkpoint.nextSequence ||
+    (checkpoint.nextSequence > 0 && checkpoint.acquiredArtifactIds.length === 0) ||
+    checkpoint.complete !== (checkpoint.nextSequence === orderedItems.length) ||
+    (checkpoint.nextSequence > 0 &&
+      checkpoint.cursor !== orderedItems[checkpoint.nextSequence - 1]?.requestKey)
+  ) {
+    throw new Error(`${label} provider checkpoint is not an exact contiguous acquisition prefix`);
+  }
+  return checkpoint;
+}
+
+function waterLogicalKey(plan: AcquisitionPlan, item: AcquisitionPlan['items'][number]): string {
+  return `raw/${plan.sourceId}/${plan.snapshotId}/${item.sequence}-${item.requestKey}`;
+}
+
+class WaterElevationAdapter implements StreamingSourceAdapter<
   WaterElevationDecodedRecord,
   WaterElevationValidatedRecord
 > {
@@ -452,7 +508,7 @@ class WaterElevationAdapter implements SourceAdapter<
           'GET',
           context,
         );
-        const count = parseCount(await collectBody(countResponse.response, context.signal));
+        const count = parseCount(await readBoundedResponse(countResponse.response, context.signal));
         const pages = Math.ceil(count / this.#hydroPageSize);
         for (let page = 0; page < pages; page += 1) {
           const requestKey = `layer-${layer}-page-${page}`;
@@ -552,58 +608,69 @@ class WaterElevationAdapter implements SourceAdapter<
   public async *acquire(
     plan: AcquisitionPlan,
     checkpoint: SourceCheckpoint | undefined,
-    context: AcquisitionContext,
-  ): AsyncIterable<AcquiredByteArtifact> {
+    context: StreamingAcquisitionContext,
+  ): AsyncIterable<StreamingAcquiredArtifact> {
     if (plan.sourceId !== this.#product.descriptor.sourceId) {
       throw new TypeError('Acquisition plan source does not match adapter');
     }
+    const orderedItems = orderedPlanItems(plan);
+    const scope = `${plan.sourceId}/${plan.snapshotId}`;
+    let storedCheckpointEnvelope = await context.checkpointStore.load(scope);
+    const callerCheckpoint =
+      checkpoint === undefined
+        ? undefined
+        : checkpointForPlan(checkpoint, plan, orderedItems, 'caller');
+    const persistedCheckpoint =
+      storedCheckpointEnvelope === undefined
+        ? undefined
+        : checkpointForPlan(storedCheckpointEnvelope.payload, plan, orderedItems, 'persisted');
     if (
-      checkpoint !== undefined &&
-      (checkpoint.sourceId !== plan.sourceId ||
-        checkpoint.snapshotId !== plan.snapshotId ||
-        checkpoint.contractVersion !== plan.contractVersion)
+      callerCheckpoint !== undefined &&
+      persistedCheckpoint !== undefined &&
+      stableJson(callerCheckpoint) !== stableJson(persistedCheckpoint)
     ) {
-      throw new TypeError('Checkpoint ownership does not match acquisition plan');
+      throw new Error('Caller and persisted provider checkpoints disagree');
     }
-    let completedRequestKeys = [...(checkpoint?.completedRequestKeys ?? [])];
-    let acquiredArtifactIds = [...(checkpoint?.acquiredArtifactIds ?? [])];
-    const completed = new Set(completedRequestKeys);
-    for (const item of [...plan.items].sort((left, right) => left.sequence - right.sequence)) {
-      context.signal.throwIfAborted();
-      if (completed.has(item.requestKey) || item.sequence < (checkpoint?.nextSequence ?? 0)) {
-        continue;
-      }
+    const currentCheckpoint = persistedCheckpoint ?? callerCheckpoint;
+    const maximumBytes =
+      this.#product.frozenArtifact?.byteSize ??
+      (this.#product.kind === 'hydrography'
+        ? 64 * 1024 * 1024
+        : Math.max(
+            16 * 1024 * 1024,
+            this.#elevationSize[0] * this.#elevationSize[1] * 8 + 1024 * 1024,
+          ));
+    const openStored = async (
+      item: AcquisitionPlan['items'][number],
+      stored: StoredArtifact,
+    ): Promise<StreamingAcquiredArtifact> => {
       if (item.method !== 'GET') {
         throw new TypeError(`Unsupported provider acquisition method ${item.method}`);
       }
-      const sent = await sendWithRetry(item.url, item.method, context);
-      const bytes = await collectBody(sent.response, context.signal);
-      if (bytes.byteLength === 0) {
+      if (
+        stored.metadata.requestKey !== item.requestKey ||
+        stored.metadata.sourceId !== plan.sourceId ||
+        stored.metadata.snapshotId !== plan.snapshotId ||
+        stored.byteSize < 1 ||
+        stored.byteSize > maximumBytes ||
+        !item.expectedMediaTypes.includes(stored.mediaType)
+      ) {
+        throw new Error(
+          `INTEGRITY: Stored source artifact metadata drifted for ${item.requestKey}`,
+        );
+      }
+      if (stored.byteSize < 1) {
         throw new Error(`RECORD_QUALITY: Empty source response for ${item.requestKey}`);
       }
-      const sha256 = sha256Hex(bytes);
-      assertFrozenArtifactIdentity(this.#product, sent.response, bytes);
-      const mediaType =
-        header(sent.response.headers, 'content-type') ??
-        item.expectedMediaTypes[0] ??
-        'application/octet-stream';
-      const logicalKey = `${plan.sourceId}/${plan.snapshotId}/${item.sequence}-${sha256}`;
-      const stored = await context.artifactStore.putImmutable({
-        logicalKey,
-        mediaType,
-        body: bytes,
-        expectedSha256: sha256,
-        metadata: Object.freeze({
-          requestKey: item.requestKey,
-          sourceId: plan.sourceId,
-          snapshotId: plan.snapshotId,
-        }),
-        ifAbsent: true,
-      });
-      assertStoredArtifactIntegrity(
-        { logicalKey, mediaType, byteSize: bytes.byteLength, sha256 },
-        stored,
-      );
+      if (
+        this.#product.frozenArtifact !== null &&
+        (stored.byteSize !== this.#product.frozenArtifact.byteSize ||
+          stored.sha256 !== this.#product.frozenArtifact.sha256)
+      ) {
+        throw new Error(`INTEGRITY: Frozen ${this.#product.productName} bytes drifted`);
+      }
+      const sha256 = stored.sha256;
+      const mediaType = stored.mediaType;
       const artifactId = `sc:artifact:sha256:${sha256}`;
       const sourceAsOfValue =
         this.#resourceSourceAsOf.get(item.requestKey) ?? sourceAsOf(this.#product);
@@ -611,7 +678,7 @@ class WaterElevationAdapter implements SourceAdapter<
         artifactId,
         sourceId: plan.sourceId,
         snapshotId: plan.snapshotId,
-        retrievedAt: context.clock.now(),
+        retrievedAt: stored.metadata.retrievedAt ?? context.clock.now(),
         sourceAsOf: sourceAsOfValue,
         request: {
           requestKey: item.requestKey,
@@ -619,17 +686,20 @@ class WaterElevationAdapter implements SourceAdapter<
           url: item.url,
           headers: [],
           bodySha256: null,
-          attempt: sent.attempt,
+          attempt: Number(stored.metadata.attempt),
         },
         response: {
-          httpStatus: sent.response.status,
-          etag: header(sent.response.headers, 'etag') ?? null,
-          lastModified: httpDateToIso(header(sent.response.headers, 'last-modified')),
+          httpStatus: Number(stored.metadata.responseStatus),
+          etag: stored.metadata.responseEtag === '' ? null : (stored.metadata.responseEtag ?? null),
+          lastModified:
+            stored.metadata.responseLastModified === ''
+              ? null
+              : (stored.metadata.responseLastModified ?? null),
           finalUrl: item.url,
         },
         mediaType,
         encoding: item.encoding,
-        byteSize: bytes.byteLength,
+        byteSize: stored.byteSize,
         sha256,
         schemaFingerprint: {
           algorithm: 'sha256',
@@ -643,9 +713,91 @@ class WaterElevationAdapter implements SourceAdapter<
         licenseSnapshotRef: this.#product.descriptor.license.licenseSnapshotId,
         visibility: this.#product.descriptor.defaultVisibility,
       });
+      return createStreamingAcquiredArtifact(metadata, context.artifactStore);
+    };
+
+    const recovered: StreamingAcquiredArtifact[] = [];
+    const recoveredArtifactIds: string[] = [];
+    const recoveredArtifactIdSet = new Set<string>();
+    for (const item of orderedItems.slice(0, currentCheckpoint?.nextSequence ?? 0)) {
+      context.signal.throwIfAborted();
+      const stored = await context.artifactStore.headByLogicalKey(waterLogicalKey(plan, item));
+      if (stored === undefined) {
+        throw new Error(`Committed provider checkpoint is missing raw artifact ${item.requestKey}`);
+      }
+      const artifact = await openStored(item, stored);
+      recovered.push(artifact);
+      if (!recoveredArtifactIdSet.has(artifact.metadata.artifactId)) {
+        recoveredArtifactIdSet.add(artifact.metadata.artifactId);
+        recoveredArtifactIds.push(artifact.metadata.artifactId);
+      }
+    }
+    if (
+      currentCheckpoint !== undefined &&
+      (recoveredArtifactIds.length !== currentCheckpoint.acquiredArtifactIds.length ||
+        currentCheckpoint.acquiredArtifactIds.some(
+          (id, index) => recoveredArtifactIds[index] !== id,
+        ))
+    ) {
+      throw Object.assign(
+        new Error(
+          'Committed provider checkpoint artifact IDs do not exactly match its ordered raw prefix',
+        ),
+        { code: 'SCHEMA_DRIFT', retryable: false, phase: 'acquire' },
+      );
+    }
+    for (const artifact of recovered) yield artifact;
+
+    let completedRequestKeys = [...(currentCheckpoint?.completedRequestKeys ?? [])];
+    let acquiredArtifactIds = [...(currentCheckpoint?.acquiredArtifactIds ?? [])];
+    for (const item of orderedItems.slice(currentCheckpoint?.nextSequence ?? 0)) {
+      context.signal.throwIfAborted();
+      if (item.method !== 'GET') {
+        throw new TypeError(`Unsupported provider acquisition method ${item.method}`);
+      }
+      const logicalKey = waterLogicalKey(plan, item);
+      let stored = await context.artifactStore.headByLogicalKey(logicalKey);
+      if (stored === undefined) {
+        const sent = await sendWithRetry(item.url, item.method, context);
+        assertFrozenArtifactIdentity(this.#product, sent.response);
+        const mediaType =
+          header(sent.response.headers, 'content-type')?.split(';', 1)[0]?.trim() ??
+          item.expectedMediaTypes[0] ??
+          'application/octet-stream';
+        if (!item.expectedMediaTypes.includes(mediaType)) {
+          throw new Error(
+            `SCHEMA_DRIFT: Unexpected media type ${mediaType} for ${item.requestKey}`,
+          );
+        }
+        const retrievedAt = context.clock.now();
+        stored = await persistAcquiredBody({
+          store: context.artifactStore,
+          logicalKey,
+          mediaType,
+          body: sent.response.body,
+          maximumBytes,
+          ...(this.#product.frozenArtifact === null
+            ? {}
+            : { expectedSha256: this.#product.frozenArtifact.sha256 }),
+          metadata: Object.freeze({
+            requestKey: item.requestKey,
+            sourceId: plan.sourceId,
+            snapshotId: plan.snapshotId,
+            retrievedAt,
+            responseStatus: String(sent.response.status),
+            responseEtag: header(sent.response.headers, 'etag') ?? '',
+            responseLastModified:
+              httpDateToIso(header(sent.response.headers, 'last-modified')) ?? '',
+            attempt: String(sent.attempt),
+          }),
+          signal: context.signal,
+        });
+      }
+      const artifact = await openStored(item, stored);
       completedRequestKeys = [...completedRequestKeys, item.requestKey];
-      acquiredArtifactIds = [...acquiredArtifactIds, metadata.artifactId];
-      completed.add(item.requestKey);
+      if (!acquiredArtifactIds.includes(artifact.metadata.artifactId)) {
+        acquiredArtifactIds = [...acquiredArtifactIds, artifact.metadata.artifactId];
+      }
       const nextCheckpoint = sourceCheckpointSchema.parse({
         sourceId: plan.sourceId,
         snapshotId: plan.snapshotId,
@@ -657,28 +809,27 @@ class WaterElevationAdapter implements SourceAdapter<
         updatedAt: context.clock.now(),
         complete: item.sequence + 1 >= plan.items.length,
       });
-      const scope = `${plan.sourceId}/${plan.snapshotId}`;
-      const current = await context.checkpointStore.load(scope);
       const envelope = createCheckpointEnvelope({
         scope,
-        previousRevision: current?.revision ?? null,
+        previousRevision: storedCheckpointEnvelope?.revision ?? null,
         writtenAt: nextCheckpoint.updatedAt,
         payload: nextCheckpoint,
       });
       const committed = await context.checkpointStore.commit({
-        expectedRevision: current?.revision ?? null,
+        expectedRevision: storedCheckpointEnvelope?.revision ?? null,
         checkpoint: envelope,
       });
       if (committed.status !== 'committed') {
         throw new Error(`Checkpoint conflict for ${scope}`);
       }
-      yield createAcquiredByteArtifact(metadata, bytes);
+      storedCheckpointEnvelope = committed.checkpoint;
+      yield artifact;
     }
   }
 
   public async *decode(
-    artifact: AcquiredByteArtifact,
-    context: DecodeContext,
+    artifact: AcquiredArtifactSource,
+    context: StreamingDecodeContext,
   ): AsyncIterable<WaterElevationDecodedRecord> {
     context.signal.throwIfAborted();
     const common = {
@@ -695,41 +846,52 @@ class WaterElevationAdapter implements SourceAdapter<
       limitations: this.#product.limitations,
     } as const;
     if (this.#product.kind === 'elevation') {
-      const image = await decodeElevationGeoTiff(artifact.bytes.copy());
-      yield Object.freeze({
-        ...common,
-        productKind: 'elevation' as const,
-        recordKey: 'image-0',
-        artifactId: artifact.metadata.artifactId,
-        ordinal: 0,
-        visibility: artifact.metadata.visibility,
-        format: 'geotiff',
-        imageIndex: 0,
-        tile: Object.freeze({ x: 0, y: 0, width: image.width, height: image.height }),
-        bands: image.bands,
-        samples: image.samples,
-        noDataValue: image.noDataValue,
-        bounds: image.bounds,
-        resolutionDegrees: image.resolutionDegrees,
-        horizontalCrs: this.#product.horizontalCrs,
-        horizontalUnits: this.#product.horizontalUnits,
-        verticalCrs: this.#product.verticalCrs ?? 'unknown',
-        verticalUnits: this.#product.verticalUnits ?? 'unknown',
-      });
+      let ordinal = 0;
+      for await (const image of decodeElevationGeoTiffTiles(
+        artifactChunks(artifact),
+        artifact.metadata.byteSize,
+        context.signal,
+      )) {
+        yield Object.freeze({
+          ...common,
+          productKind: 'elevation' as const,
+          recordKey: `image-0-tile-${image.x}-${image.y}`,
+          artifactId: artifact.metadata.artifactId,
+          ordinal: ordinal++,
+          visibility: artifact.metadata.visibility,
+          format: 'geotiff',
+          imageIndex: 0,
+          tile: Object.freeze({ x: image.x, y: image.y, width: image.width, height: image.height }),
+          bands: image.bands,
+          samples: image.samples,
+          noDataValue: image.noDataValue,
+          bounds: image.bounds,
+          resolutionDegrees: image.resolutionDegrees,
+          horizontalCrs: this.#product.horizontalCrs,
+          horizontalUnits: this.#product.horizontalUnits,
+          verticalCrs: this.#product.verticalCrs ?? 'unknown',
+          verticalUnits: this.#product.verticalUnits ?? 'unknown',
+        });
+      }
       return;
     }
     const features =
       this.#product.kind === 'shoreline'
-        ? decodeNoaaShorelineArchive(artifact.bytes.copy(), this.#bounds)
-        : decodeHydroFeatureCollection(artifact.bytes.copy(), this.#bounds);
-    for (const [ordinal, feature] of features.entries()) {
+        ? decodeNoaaShorelineArchiveStream(artifactChunks(artifact), this.#bounds, context.signal)
+        : decodeHydroFeatureCollectionStream(
+            artifactChunks(artifact),
+            this.#bounds,
+            context.signal,
+          );
+    let ordinal = 0;
+    for await (const feature of features) {
       context.signal.throwIfAborted();
       yield Object.freeze({
         ...common,
         productKind: this.#product.kind,
         recordKey: feature.recordKey,
         artifactId: artifact.metadata.artifactId,
-        ordinal,
+        ordinal: ordinal++,
         visibility: artifact.metadata.visibility,
         format: 'geojson',
         featureType: 'Feature',
@@ -884,23 +1046,26 @@ class WaterElevationAdapter implements SourceAdapter<
     });
   }
 
-  public summarize(run: SourceRunObservation, context: SummaryContext): SourceRunSummary {
+  public async summarize(
+    run: SourceRunObservationV2,
+    context: SummaryContext,
+  ): Promise<SourceRunSummary> {
     context.signal.throwIfAborted();
     if (run.acceptedRecords + run.rejectedRecords !== run.decodedRecords) {
       throw new TypeError('Run accounting mismatch: accepted plus rejected must equal decoded');
     }
-    const visibilityCounts = {
-      public: run.mutations.filter((mutation) => mutation.visibility === 'public').length,
-      authenticated: run.mutations.filter((mutation) => mutation.visibility === 'authenticated')
-        .length,
-      restricted: run.mutations.filter((mutation) => mutation.visibility === 'restricted').length,
-      prohibited_public: run.mutations.filter(
-        (mutation) => mutation.visibility === 'prohibited_public',
-      ).length,
-    };
-    const errorCount = run.validationIssues.filter(
-      (current) => current.severity !== 'warning',
-    ).length;
+    const visibilityCounts = { public: 0, authenticated: 0, restricted: 0, prohibited_public: 0 };
+    for await (const mutation of run.mutations.read()) {
+      context.signal.throwIfAborted();
+      visibilityCounts[mutation.visibility] += 1;
+    }
+    let warningCount = 0;
+    let errorCount = 0;
+    for await (const current of run.validationIssues.read()) {
+      context.signal.throwIfAborted();
+      if (current.severity === 'warning') warningCount += 1;
+      else errorCount += 1;
+    }
     return sourceRunSummarySchema.parse({
       sourceId: run.descriptor.sourceId,
       snapshotId: run.plan.snapshotId,
@@ -919,9 +1084,9 @@ class WaterElevationAdapter implements SourceAdapter<
       decodedRecords: run.decodedRecords,
       acceptedRecords: run.acceptedRecords,
       rejectedRecords: run.rejectedRecords,
-      normalizedMutations: run.mutations.length,
+      normalizedMutations: run.mutations.count,
       visibilityCounts,
-      warningCount: run.validationIssues.filter((current) => current.severity === 'warning').length,
+      warningCount,
       errorCount,
       finalCheckpoint: run.finalCheckpoint,
     });
@@ -949,7 +1114,7 @@ function featureType(
 
 export function createNoaaUsgsWaterElevationAdapters(
   options: WaterElevationAdapterOptions = {},
-): readonly SourceAdapter<WaterElevationDecodedRecord, WaterElevationValidatedRecord>[] {
+): readonly StreamingSourceAdapter<WaterElevationDecodedRecord, WaterElevationValidatedRecord>[] {
   const products = options.products ?? WATER_ELEVATION_PRODUCTS;
   return Object.freeze(
     products.map(
@@ -965,7 +1130,7 @@ export function createNoaaUsgsWaterElevationAdapters(
 
 export function createNoaaCuspShorelineAdapter(
   options: WaterElevationAdapterOptions = {},
-): SourceAdapter<WaterElevationDecodedRecord, WaterElevationValidatedRecord> {
+): StreamingSourceAdapter<WaterElevationDecodedRecord, WaterElevationValidatedRecord> {
   const [adapter] = createNoaaUsgsWaterElevationAdapters({
     ...options,
     products: [NOAA_CUSP_SHORELINE],
@@ -976,7 +1141,7 @@ export function createNoaaCuspShorelineAdapter(
 
 export function createUsgs3dhpHydrographyAdapter(
   options: WaterElevationAdapterOptions = {},
-): SourceAdapter<WaterElevationDecodedRecord, WaterElevationValidatedRecord> {
+): StreamingSourceAdapter<WaterElevationDecodedRecord, WaterElevationValidatedRecord> {
   const [adapter] = createNoaaUsgsWaterElevationAdapters({
     ...options,
     products: [USGS_3DHP_HYDROGRAPHY],
@@ -987,7 +1152,7 @@ export function createUsgs3dhpHydrographyAdapter(
 
 export function createUsgs3depElevationAdapter(
   options: WaterElevationAdapterOptions = {},
-): SourceAdapter<WaterElevationDecodedRecord, WaterElevationValidatedRecord> {
+): StreamingSourceAdapter<WaterElevationDecodedRecord, WaterElevationValidatedRecord> {
   const [adapter] = createNoaaUsgsWaterElevationAdapters({
     ...options,
     products: [USGS_3DEP_ELEVATION],

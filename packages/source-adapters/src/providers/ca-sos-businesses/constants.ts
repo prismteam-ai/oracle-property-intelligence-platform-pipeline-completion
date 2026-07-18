@@ -13,7 +13,7 @@ export const CA_SOS_BUSINESS_LICENSE_ID = licenseSnapshotIdSchema.parse(
   'sc:license:ca-sos-businesses:112766f8e79387c920de93678f2b1f92dd196358acf9ee2d156242f7fbf6e86e',
 );
 
-export const CA_SOS_CONTRACT_VERSION = '1.0.0';
+export const CA_SOS_CONTRACT_VERSION = '2.0.0';
 export const CA_SOS_TRANSFORM_VERSION = '1.0.0';
 
 /**

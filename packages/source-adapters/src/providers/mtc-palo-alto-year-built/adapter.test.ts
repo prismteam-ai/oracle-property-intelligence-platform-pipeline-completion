@@ -3,16 +3,18 @@ import { readFile } from 'node:fs/promises';
 
 import type {
   ArtifactByteRange,
-  ArtifactStore,
   ImmutableArtifactWrite,
+  RecoverableArtifactStore,
+  StreamingImmutableArtifactWrite,
   StoredArtifact,
 } from '@oracle/artifacts/artifact-store';
-import type {
-  CheckpointCommit,
-  CheckpointCommitResult,
-  CheckpointEnvelope,
-  CheckpointStore,
-  CheckpointValue,
+import {
+  createCheckpointEnvelope,
+  type CheckpointCommit,
+  type CheckpointCommitResult,
+  type CheckpointEnvelope,
+  type CheckpointStore,
+  type CheckpointValue,
 } from '@oracle/artifacts/checkpoint-store';
 import {
   canonicalMutationSchema,
@@ -29,17 +31,20 @@ import { describe, expect, it } from 'vitest';
 
 import {
   createAcquiredByteArtifact,
+  type AcquiredArtifactSource,
   type AcquiredByteArtifact,
 } from '../../spi/acquired-artifact.js';
 import type {
-  AcquisitionContext,
-  DecodeContext,
   DiscoveryContext,
   PlanningContext,
-  SourceRunObservation,
+  RepeatableObservationValues,
+  SourceRunObservationV2,
+  StreamingAcquisitionContext,
+  StreamingDecodeContext,
 } from '../../spi/adapter.js';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../../spi/http.js';
 import { sha256Hex } from '../../spi/bytes.js';
+import { createSharedRecordBudget } from '../../spi/record-budget.js';
 import { createMtcPaloAltoYearBuiltAdapter, normalizeMtcPaloAltoApn } from './adapter.js';
 import {
   MTC_PALO_ALTO_LICENSE_SNAPSHOT_ID,
@@ -114,7 +119,7 @@ class ScriptedHttp implements HttpTransport {
   }
 }
 
-class TestArtifactStore implements ArtifactStore {
+class TestArtifactStore implements RecoverableArtifactStore {
   readonly stored = new Map<string, Readonly<{ descriptor: StoredArtifact; bytes: Uint8Array }>>();
   readonly #corruptReturn: boolean;
 
@@ -145,6 +150,28 @@ class TestArtifactStore implements ArtifactStore {
     return this.#corruptReturn
       ? Object.freeze({ ...descriptor, byteSize: descriptor.byteSize + 1 })
       : descriptor;
+  }
+
+  public async putImmutableStreaming(
+    request: StreamingImmutableArtifactWrite,
+  ): Promise<StoredArtifact> {
+    const chunks: Uint8Array[] = [];
+    if (request.body instanceof Uint8Array) chunks.push(request.body);
+    else for await (const chunk of request.body) chunks.push(chunk);
+    const bytes = Buffer.concat(chunks);
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    return this.putImmutable({
+      ...request,
+      body: bytes,
+      expectedSha256: request.expectedSha256 ?? sha256,
+    });
+  }
+
+  public headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined> {
+    return Promise.resolve(
+      [...this.stored.values()].find(({ descriptor }) => descriptor.logicalKey === logicalKey)
+        ?.descriptor,
+    );
   }
 
   public head(uri: string): Promise<StoredArtifact | undefined> {
@@ -209,10 +236,10 @@ function planningContext(signal = new AbortController().signal): PlanningContext
 
 function acquisitionContext(
   http: HttpTransport,
-  artifactStore: ArtifactStore,
+  artifactStore: RecoverableArtifactStore,
   checkpointStore: CheckpointStore,
   signal = new AbortController().signal,
-): AcquisitionContext {
+): StreamingAcquisitionContext {
   return {
     ...discoveryContext(http, signal),
     artifactStore,
@@ -220,12 +247,24 @@ function acquisitionContext(
   };
 }
 
-function phaseContext(signal = new AbortController().signal): DecodeContext {
+function phaseContext(signal = new AbortController().signal): StreamingDecodeContext {
   return {
     clock,
     signal,
-    artifactStore: {} as ArtifactStore,
-    analyticalRuntime: {} as DecodeContext['analyticalRuntime'],
+    artifactStore: new TestArtifactStore(),
+    analyticalRuntime: {} as StreamingDecodeContext['analyticalRuntime'],
+    recordBudget: createSharedRecordBudget(1),
+  };
+}
+
+function repeatable<T>(values: readonly T[]): RepeatableObservationValues<T> {
+  return {
+    count: values.length,
+    logicalSha256: sha256Hex(new TextEncoder().encode(JSON.stringify(values))),
+    read: async function* () {
+      await Promise.resolve();
+      for (const value of values) yield value;
+    },
   };
 }
 
@@ -296,7 +335,7 @@ function acquiredArtifact(
   );
 }
 
-async function decodeAll(artifact: AcquiredByteArtifact): Promise<MtcPaloAltoDecodedRecord[]> {
+async function decodeAll(artifact: AcquiredArtifactSource): Promise<MtcPaloAltoDecodedRecord[]> {
   const adapter = createMtcPaloAltoYearBuiltAdapter();
   const decoded: MtcPaloAltoDecodedRecord[] = [];
   for await (const record of adapter.decode(artifact, phaseContext())) decoded.push(record);
@@ -412,7 +451,7 @@ describe('MTC Palo Alto year-built adapter', () => {
     expect(failFast.requests).toHaveLength(1);
   });
 
-  it('retries transient acquisition, checkpoints each page, and resumes without replay', async () => {
+  it('retries, then re-emits the committed prefix before later pages and on zero-network restart', async () => {
     delayCalls.length = 0;
     const rows = await officialRows();
     const metadata = await fixture('official-metadata-excerpt.json');
@@ -421,7 +460,7 @@ describe('MTC Palo Alto year-built adapter', () => {
       discoveryContext(
         new ScriptedHttp([
           response(metadata),
-          response(new TextEncoder().encode('[{"count":"2"}]')),
+          response(new TextEncoder().encode('[{"count":"3"}]')),
         ]),
       ),
     );
@@ -448,8 +487,10 @@ describe('MTC Palo Alto year-built adapter', () => {
     const checkpoint = sourceCheckpointSchema.parse(storedCheckpoint?.payload);
     expect(checkpoint).toMatchObject({ nextSequence: 1, complete: false });
 
-    const resumed: AcquiredByteArtifact[] = [];
+    const resumed: AcquiredArtifactSource[] = [];
     const secondHttp = new ScriptedHttp([
+      // Identical page content hashes are legal even when logical page keys differ.
+      response(new TextEncoder().encode(JSON.stringify([rows[0]]))),
       response(new TextEncoder().encode(JSON.stringify([rows[1]]))),
     ]);
     const freshAdapter = createMtcPaloAltoYearBuiltAdapter({ pageSize: 1 });
@@ -460,16 +501,62 @@ describe('MTC Palo Alto year-built adapter', () => {
     )) {
       resumed.push(artifact);
     }
-    expect(resumed).toHaveLength(1);
-    expect(secondHttp.requests).toHaveLength(1);
-    expect([...checkpoints.values.values()][0]?.payload).toMatchObject({
-      nextSequence: 2,
+    expect(resumed).toHaveLength(3);
+    expect(secondHttp.requests).toHaveLength(2);
+    expect(resumed.map((item) => item.metadata.request.requestKey)).toEqual(
+      plan.items.map((item) => item.requestKey),
+    );
+    expect(resumed[0]?.metadata.artifactId).toBe(resumed[1]?.metadata.artifactId);
+    expect(resumed[2]?.metadata.artifactId).not.toBe(resumed[0]?.metadata.artifactId);
+    const finalEnvelope = [...checkpoints.values.values()][0];
+    expect(finalEnvelope?.payload).toMatchObject({
+      nextSequence: 3,
       complete: true,
+      acquiredArtifactIds: [resumed[0]?.metadata.artifactId, resumed[2]?.metadata.artifactId],
     });
     expect(resumed[0]?.metadata).toMatchObject({
       visibility: 'prohibited_public',
       licenseSnapshotRef: MTC_PALO_ALTO_LICENSE_SNAPSHOT_ID,
     });
+
+    const zeroNetwork: AcquiredArtifactSource[] = [];
+    const noHttp = new ScriptedHttp([]);
+    for await (const artifact of freshAdapter.acquire(
+      plan,
+      undefined,
+      acquisitionContext(noHttp, artifacts, checkpoints),
+    )) {
+      zeroNetwork.push(artifact);
+    }
+    expect(noHttp.requests).toHaveLength(0);
+    expect(zeroNetwork.map((item) => item.metadata)).toEqual(resumed.map((item) => item.metadata));
+
+    const reversedCheckpointStore = new TestCheckpointStore();
+    const finalCheckpoint = sourceCheckpointSchema.parse(finalEnvelope?.payload);
+    const reversedCheckpoint = sourceCheckpointSchema.parse({
+      ...finalCheckpoint,
+      acquiredArtifactIds: [...finalCheckpoint.acquiredArtifactIds].reverse(),
+    });
+    await reversedCheckpointStore.commit({
+      expectedRevision: null,
+      checkpoint: createCheckpointEnvelope({
+        scope: finalEnvelope?.scope ?? 'missing-scope',
+        previousRevision: null,
+        writtenAt: reversedCheckpoint.updatedAt,
+        payload: reversedCheckpoint,
+      }),
+    });
+    const reversedHttp = new ScriptedHttp([]);
+    await expect(async () => {
+      for await (const artifact of freshAdapter.acquire(
+        plan,
+        undefined,
+        acquisitionContext(reversedHttp, artifacts, reversedCheckpointStore),
+      )) {
+        void artifact;
+      }
+    }).rejects.toMatchObject({ code: 'QUERY_REGRESSION' });
+    expect(reversedHttp.requests).toHaveLength(0);
 
     const conflictingCheckpoint = sourceCheckpointSchema.parse({
       ...checkpoint,
@@ -548,6 +635,38 @@ describe('MTC Palo Alto year-built adapter', () => {
         void artifact;
       }
     }).rejects.toThrow('integrity mismatch');
+  });
+
+  it('enforces a hard byte ceiling while streaming a production page to storage', async () => {
+    const rows = await officialRows();
+    const metadata = await fixture('official-metadata-excerpt.json');
+    const pageBytes = new TextEncoder().encode(JSON.stringify(rows));
+    const adapter = createMtcPaloAltoYearBuiltAdapter({
+      pageSize: 2,
+      maximumResponseBytes: pageBytes.byteLength - 1,
+    });
+    const discovery = await adapter.discover(
+      discoveryContext(
+        new ScriptedHttp([
+          response(metadata),
+          response(new TextEncoder().encode('[{"count":"2"}]')),
+        ]),
+      ),
+    );
+    const plan = await adapter.plan(request(), discovery, planningContext());
+    const consume = async (): Promise<void> => {
+      for await (const artifact of adapter.acquire(
+        plan,
+        undefined,
+        acquisitionContext(
+          new ScriptedHttp([response(pageBytes)]),
+          new TestArtifactStore(),
+          new TestCheckpointStore(),
+        ),
+      ))
+        void artifact;
+    };
+    await expect(consume()).rejects.toMatchObject({ code: 'ACQUISITION_BYTE_LIMIT' });
   });
 
   it('detects page-count and artifact-schema mismatches before normalization', async () => {
@@ -715,7 +834,7 @@ describe('MTC Palo Alto year-built adapter', () => {
     const finalCheckpoint: SourceCheckpoint = {
       sourceId: MTC_PALO_ALTO_SOURCE_ID,
       snapshotId: request().snapshotId,
-      contractVersion: '1.0.0',
+      contractVersion: '2.0.0',
       cursor: 'sequence:1',
       nextSequence: 1,
       completedRequestKeys: [required(plan.items[0], 'first plan item').requestKey],
@@ -723,7 +842,7 @@ describe('MTC Palo Alto year-built adapter', () => {
       updatedAt: AT,
       complete: true,
     };
-    const run: SourceRunObservation = {
+    const run: SourceRunObservationV2 = {
       descriptor: adapter.describe(),
       runId: RUN_ID,
       request: request(),
@@ -735,11 +854,11 @@ describe('MTC Palo Alto year-built adapter', () => {
       decodedRecords: 2,
       acceptedRecords: 2,
       rejectedRecords: 0,
-      mutations,
-      validationIssues: [],
+      mutations: repeatable(mutations),
+      validationIssues: repeatable([]),
       aborted: false,
     };
-    const summary = adapter.summarize(run, phaseContext());
+    const summary = await adapter.summarize(run, phaseContext());
     expect(summary).toMatchObject({
       status: 'succeeded',
       decodedRecords: 2,
@@ -747,6 +866,8 @@ describe('MTC Palo Alto year-built adapter', () => {
       rejectedRecords: 0,
       visibilityCounts: { prohibited_public: mutations.length },
     });
-    expect(() => adapter.summarize({ ...run, decodedRecords: 1 }, phaseContext())).toThrow();
+    await expect(
+      adapter.summarize({ ...run, decodedRecords: 1 }, phaseContext()),
+    ).rejects.toThrow();
   });
 });

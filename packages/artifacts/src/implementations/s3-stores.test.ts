@@ -140,6 +140,7 @@ describe('S3ArtifactStore with injected fake', () => {
     };
     const stored = await store.putImmutable(request);
     expect(await store.head(stored.uri)).toEqual(stored);
+    expect(await store.headByLogicalKey(request.logicalKey)).toEqual(stored);
     expect((await collect(store.read(stored.uri, { start: 3, endInclusive: 6 }))).toString()).toBe(
       'defg',
     );
@@ -150,6 +151,7 @@ describe('S3ArtifactStore with injected fake', () => {
     const persisted = fake.objects.get('bucket/artifacts/release/data.csv');
     if (persisted === undefined) throw new Error('fake object was not persisted');
     persisted.body = Buffer.from('abcdefghix');
+    await expect(store.headByLogicalKey(request.logicalKey)).rejects.toThrow('SHA-256 mismatch');
     await expect(collect(store.read(stored.uri))).rejects.toThrow('SHA-256 mismatch');
   });
 

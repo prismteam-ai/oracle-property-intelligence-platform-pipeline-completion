@@ -9,7 +9,7 @@ import {
 export const OSM_PEDESTRIAN_GRAPH_SOURCE_ID = sourceIdSchema.parse(
   'sc:source:osm-pedestrian-graph',
 );
-export const OSM_PEDESTRIAN_GRAPH_CONTRACT_VERSION = '1.0.0' as const;
+export const OSM_PEDESTRIAN_GRAPH_CONTRACT_VERSION = '2.0.0' as const;
 export const OSM_PEDESTRIAN_GRAPH_PROFILE_VERSION = '1.0.0' as const;
 
 export const OSM_ATTRIBUTION = '© OpenStreetMap contributors';

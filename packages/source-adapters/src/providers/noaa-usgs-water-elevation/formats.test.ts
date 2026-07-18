@@ -24,7 +24,9 @@ import {
 import {
   decodeElevationGeoTiff,
   decodeHydroFeatureCollection,
+  decodeHydroFeatureCollectionStream,
   decodeNoaaShorelineArchive,
+  decodeNoaaShorelineArchiveStream,
   summarizeNoDataWindow,
 } from './formats.js';
 
@@ -196,6 +198,40 @@ describe('NOAA/USGS water and elevation formats', () => {
     ).toThrow(expect.objectContaining({ code: 'SCHEMA_DRIFT', retryable: false, phase: 'decode' }));
   });
 
+  it('rejects shoreline ZIP metadata bombs before allocating member bodies', async () => {
+    const entryBomb = zipSync(
+      Object.fromEntries(
+        Array.from({ length: 4097 }, (_, index) => [`ignored-${index}.bin`, new Uint8Array()]),
+      ),
+      { level: 0 },
+    );
+    const signal = new AbortController().signal;
+    const entryDecode = decodeNoaaShorelineArchiveStream(
+      (async function* () {
+        await Promise.resolve();
+        yield entryBomb;
+      })(),
+      SANTA_CLARA_WATER_TERRAIN_BOUNDS,
+      signal,
+    );
+    await expect(entryDecode[Symbol.asyncIterator]().next()).rejects.toThrow(
+      /ZIP metadata exceeds/u,
+    );
+
+    const nameBomb = zipSync({ [`${'x'.repeat(1025)}.bin`]: new Uint8Array() }, { level: 0 });
+    const nameDecode = decodeNoaaShorelineArchiveStream(
+      (async function* () {
+        await Promise.resolve();
+        yield nameBomb;
+      })(),
+      SANTA_CLARA_WATER_TERRAIN_BOUNDS,
+      signal,
+    );
+    await expect(nameDecode[Symbol.asyncIterator]().next()).rejects.toThrow(
+      /ZIP metadata exceeds/u,
+    );
+  });
+
   it('decodes the pinned current 3DHP GeoJSON and rejects duplicate IDs/schema drift', async () => {
     const bytes = await fixture('usgs-3dhp-flowline-11jsf.geojson');
     const records = decodeHydroFeatureCollection(bytes, SANTA_CLARA_WATER_TERRAIN_BOUNDS);
@@ -221,6 +257,45 @@ describe('NOAA/USGS water and elevation formats', () => {
         SANTA_CLARA_WATER_TERRAIN_BOUNDS,
       ),
     ).toThrow(/missing id3dhp/u);
+  });
+
+  it('streams 3DHP features with disk-backed duplicate detection and bounded envelope state', async () => {
+    const bytes = await fixture('usgs-3dhp-flowline-11jsf.geojson');
+    const duplicate = JSON.parse(bytes.toString('utf8')) as { features: unknown[] };
+    duplicate.features.push(duplicate.features[0]);
+    const duplicateDecode = decodeHydroFeatureCollectionStream(
+      (async function* () {
+        await Promise.resolve();
+        const encoded = new TextEncoder().encode(JSON.stringify(duplicate));
+        for (let offset = 0; offset < encoded.byteLength; offset += 17) {
+          yield encoded.subarray(offset, Math.min(encoded.byteLength, offset + 17));
+        }
+      })(),
+      SANTA_CLARA_WATER_TERRAIN_BOUNDS,
+      new AbortController().signal,
+    );
+    const duplicateIterator = duplicateDecode[Symbol.asyncIterator]();
+    await expect(duplicateIterator.next()).resolves.toMatchObject({ done: false });
+    await expect(duplicateIterator.next()).rejects.toThrow(/Duplicate.*11JSF/u);
+
+    const skeletonBomb = new TextEncoder().encode(
+      JSON.stringify({
+        type: 'FeatureCollection',
+        padding: 'x'.repeat(257 * 1024),
+        features: [],
+      }),
+    );
+    const envelopeDecode = decodeHydroFeatureCollectionStream(
+      (async function* () {
+        await Promise.resolve();
+        yield skeletonBomb;
+      })(),
+      SANTA_CLARA_WATER_TERRAIN_BOUNDS,
+      new AbortController().signal,
+    );
+    await expect(envelopeDecode[Symbol.asyncIterator]().next()).rejects.toThrow(
+      /prefix exceeds its reviewed bound/u,
+    );
   });
 
   it('decodes real official GeoTIFF bytes with CRS, bounds, raster metadata, and samples', async () => {

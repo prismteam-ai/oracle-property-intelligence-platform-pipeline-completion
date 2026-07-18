@@ -52,6 +52,7 @@ WHERE bbox.xmin BETWEEN ? AND ?
     OR lower(names.primary) LIKE ?
     OR lower(brand.names.primary) LIKE ?
   )
+  AND id > ?
 ORDER BY id`;
 
 export const OVERTURE_STARBUCKS_QUERY_SHA256 = createHash('sha256')
@@ -94,7 +95,7 @@ export const OVERTURE_STARBUCKS_LICENSE_SNAPSHOT_ID =
 
 export const OVERTURE_STARBUCKS_DESCRIPTOR = sourceDescriptorSchema.parse({
   sourceId: OVERTURE_STARBUCKS_SOURCE_ID,
-  contractVersion: '1.0.0',
+  contractVersion: '2.0.0',
   name: 'Overture Places — Santa Clara Starbucks candidates',
   authority: {
     authorityType: 'recognized_distributor',

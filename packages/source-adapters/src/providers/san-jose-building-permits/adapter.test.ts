@@ -3,16 +3,18 @@ import { readFile } from 'node:fs/promises';
 
 import type {
   ArtifactBody,
-  ArtifactStore,
   ImmutableArtifactWrite,
+  RecoverableArtifactStore,
+  StreamingImmutableArtifactWrite,
   StoredArtifact,
 } from '@oracle/artifacts/artifact-store';
-import type {
-  CheckpointCommit,
-  CheckpointCommitResult,
-  CheckpointEnvelope,
-  CheckpointStore,
-  CheckpointValue,
+import {
+  createCheckpointEnvelope,
+  type CheckpointCommit,
+  type CheckpointCommitResult,
+  type CheckpointEnvelope,
+  type CheckpointStore,
+  type CheckpointValue,
 } from '@oracle/artifacts/checkpoint-store';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
 import {
@@ -27,6 +29,7 @@ import {
   acquisitionPlanSchema,
   acquisitionRequestSchema,
   sourceCheckpointSchema,
+  type AcquiredArtifact,
   type AcquisitionPlan,
   type SourceCheckpoint,
 } from '@oracle/contracts/source';
@@ -38,20 +41,23 @@ import type {
 import { describe, expect, it } from 'vitest';
 
 import type {
-  AcquisitionContext,
   Clock,
-  DecodeContext,
   Delay,
   DiscoveryContext,
   NormalizationContext,
-  SourceRunObservation,
+  RepeatableObservationValues,
+  SourceRunObservationV2,
+  StreamingAcquisitionContext,
+  StreamingDecodeContext,
   ValidationContext,
 } from '../../spi/adapter.js';
 import {
   createAcquiredByteArtifact,
+  type AcquiredArtifactSource,
   type AcquiredByteArtifact,
 } from '../../spi/acquired-artifact.js';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../../spi/http.js';
+import { createSharedRecordBudget } from '../../spi/record-budget.js';
 import { createSanJoseBuildingPermitAdapter, summarizeSanJoseBuildingPermits } from './adapter.js';
 import {
   SAN_JOSE_BUILDING_PERMIT_LICENSE_ID,
@@ -119,9 +125,10 @@ async function collectBody(body: ArtifactBody): Promise<Uint8Array> {
   return bytes;
 }
 
-class MemoryArtifactStore implements ArtifactStore {
-  public readonly writes: ImmutableArtifactWrite[] = [];
+class MemoryArtifactStore implements RecoverableArtifactStore {
+  public readonly writes: (ImmutableArtifactWrite | StreamingImmutableArtifactWrite)[] = [];
   readonly #bytes = new Map<string, Uint8Array>();
+  readonly #descriptors = new Map<string, StoredArtifact>();
   readonly #corruption: 'none' | 'sha256' | 'size';
 
   public constructor(corruption: 'none' | 'sha256' | 'size' = 'none') {
@@ -133,7 +140,7 @@ class MemoryArtifactStore implements ArtifactStore {
     this.writes.push(request);
     const uri = `s3://oracle-fixtures/${encodeURIComponent(request.logicalKey)}`;
     this.#bytes.set(uri, bytes);
-    return Object.freeze({
+    const descriptor = Object.freeze({
       logicalKey: request.logicalKey,
       uri,
       mediaType: request.mediaType,
@@ -145,23 +152,43 @@ class MemoryArtifactStore implements ArtifactStore {
       storedAt: NOW,
       metadata: request.metadata,
     });
+    this.#descriptors.set(uri, descriptor);
+    return descriptor;
+  }
+
+  public async putImmutableStreaming(
+    request: StreamingImmutableArtifactWrite,
+  ): Promise<StoredArtifact> {
+    const bytes = await collectBody(request.body);
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    this.writes.push(request);
+    const uri = `s3://oracle-fixtures/${encodeURIComponent(request.logicalKey)}`;
+    this.#bytes.set(uri, bytes);
+    const descriptor = Object.freeze({
+      logicalKey: request.logicalKey,
+      uri,
+      mediaType: request.mediaType,
+      byteSize: bytes.byteLength,
+      sha256,
+      storedAt: NOW,
+      metadata: request.metadata,
+    });
+    this.#descriptors.set(uri, descriptor);
+    if (this.#corruption === 'size')
+      return Object.freeze({ ...descriptor, byteSize: descriptor.byteSize + 1 });
+    if (this.#corruption === 'sha256')
+      return Object.freeze({ ...descriptor, sha256: '0'.repeat(64) });
+    return descriptor;
+  }
+
+  public headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined> {
+    return Promise.resolve(
+      [...this.#descriptors.values()].find((descriptor) => descriptor.logicalKey === logicalKey),
+    );
   }
 
   public head(uri: string): Promise<StoredArtifact | undefined> {
-    const bytes = this.#bytes.get(uri);
-    return Promise.resolve(
-      bytes === undefined
-        ? undefined
-        : Object.freeze({
-            logicalKey: uri,
-            uri,
-            mediaType: 'text/csv',
-            byteSize: bytes.byteLength,
-            sha256: createHash('sha256').update(bytes).digest('hex'),
-            storedAt: NOW,
-            metadata: Object.freeze({}),
-          }),
-    );
+    return Promise.resolve(this.#descriptors.get(uri));
   }
 
   public async *read(uri: string): AsyncIterable<Uint8Array> {
@@ -235,11 +262,15 @@ class ScriptedTransport implements HttpTransport {
   }
 }
 
-function adapter(expectedRecordCounts?: Readonly<Partial<Record<SanJosePermitFeed, number>>>) {
+function adapter(
+  expectedRecordCounts?: Readonly<Partial<Record<SanJosePermitFeed, number>>>,
+  maximumRecordBytes?: number,
+) {
   return createSanJoseBuildingPermitAdapter({
     runId: RUN_ID,
     normalizationTimestamp: NOW,
     ...(expectedRecordCounts === undefined ? {} : { expectedRecordCounts }),
+    ...(maximumRecordBytes === undefined ? {} : { maximumRecordBytes }),
   });
 }
 
@@ -250,12 +281,24 @@ function abortSignal(): AbortSignal {
 const ANALYTICAL_RUNTIME = new UnusedAnalyticalRuntime();
 const ARTIFACT_STORE = new MemoryArtifactStore();
 
-function decodeContext(signal = abortSignal()): DecodeContext {
+function decodeContext(signal = abortSignal()): StreamingDecodeContext {
   return {
     clock: new FixedClock(),
     signal,
     artifactStore: ARTIFACT_STORE,
     analyticalRuntime: ANALYTICAL_RUNTIME,
+    recordBudget: createSharedRecordBudget(1),
+  };
+}
+
+function repeatable<T>(values: readonly T[]): RepeatableObservationValues<T> {
+  return {
+    count: values.length,
+    logicalSha256: createHash('sha256').update(JSON.stringify(values)).digest('hex'),
+    read: async function* () {
+      await Promise.resolve();
+      for (const value of values) yield value;
+    },
   };
 }
 
@@ -276,9 +319,9 @@ async function fixtureBytes(feed: SanJosePermitFeed): Promise<Uint8Array> {
   );
 }
 
-function acquiredArtifact(feed: SanJosePermitFeed, bytes: Uint8Array): AcquiredByteArtifact {
+function acquiredMetadata(feed: SanJosePermitFeed, bytes: Uint8Array): AcquiredArtifact {
   const sha256 = createHash('sha256').update(bytes).digest('hex');
-  const metadata = acquiredArtifactSchema.parse({
+  return acquiredArtifactSchema.parse({
     artifactId: artifactIdSchema.parse(`sc:artifact:sha256:${sha256}`),
     sourceId: SAN_JOSE_BUILDING_PERMIT_SOURCE_ID,
     snapshotId: SNAPSHOT_ID,
@@ -312,7 +355,35 @@ function acquiredArtifact(feed: SanJosePermitFeed, bytes: Uint8Array): AcquiredB
     licenseSnapshotRef: SAN_JOSE_BUILDING_PERMIT_LICENSE_ID,
     visibility: 'public',
   });
-  return createAcquiredByteArtifact(metadata, bytes);
+}
+
+function acquiredArtifact(feed: SanJosePermitFeed, bytes: Uint8Array): AcquiredByteArtifact {
+  return createAcquiredByteArtifact(acquiredMetadata(feed, bytes), bytes);
+}
+
+function streamingArtifact(
+  feed: SanJosePermitFeed,
+  bytes: Uint8Array,
+  chunkBytes: number,
+): AcquiredArtifactSource {
+  const metadata = acquiredMetadata(feed, bytes);
+  return Object.freeze({
+    metadata,
+    content: Object.freeze({
+      formatVersion: '2.0.0' as const,
+      byteLength: bytes.byteLength,
+      sha256: metadata.sha256,
+      rawUri: metadata.rawUri,
+      read: (options: Readonly<{ maxChunkBytes?: number }> = {}) =>
+        (async function* read(): AsyncIterable<Uint8Array> {
+          const maximum = Math.min(options.maxChunkBytes ?? chunkBytes, chunkBytes);
+          for (let offset = 0; offset < bytes.byteLength; offset += maximum) {
+            await Promise.resolve();
+            yield bytes.slice(offset, Math.min(bytes.byteLength, offset + maximum));
+          }
+        })(),
+    }),
+  });
 }
 
 async function decodeOne(
@@ -398,10 +469,10 @@ function plan(): AcquisitionPlan {
 function acquisitionContext(
   transport: HttpTransport,
   checkpointStore: CheckpointStore,
-  artifactStore: ArtifactStore,
+  artifactStore: RecoverableArtifactStore,
   delay: Delay,
   signal = abortSignal(),
-): AcquisitionContext {
+): StreamingAcquisitionContext {
   return {
     clock: new FixedClock(),
     signal,
@@ -502,7 +573,7 @@ describe('San Jose building permit source family', () => {
     const checkpoints = new MemoryCheckpointStore();
     const artifacts = new MemoryArtifactStore();
     const delay = new RecordingDelay();
-    const acquired: AcquiredByteArtifact[] = [];
+    const acquired: AcquiredArtifactSource[] = [];
     for await (const artifact of adapter().acquire(
       plan(),
       undefined,
@@ -517,12 +588,46 @@ describe('San Jose building permit source family', () => {
     expect(checkpoints.commits).toHaveLength(3);
     expect(artifacts.writes).toHaveLength(3);
     expect(delay.waits[0]).toBe(0);
-    expect(acquired.every((artifact) => artifact.bytes.sha256 === artifact.metadata.sha256)).toBe(
-      true,
-    );
+    expect(
+      acquired.every((artifact) => artifact.content?.sha256 === artifact.metadata.sha256),
+    ).toBe(true);
+
+    const finalEnvelope = checkpoints.commits.at(-1);
+    const finalCheckpoint = sourceCheckpointSchema.parse(finalEnvelope?.payload);
+    expect(finalCheckpoint.acquiredArtifactIds.length).toBeGreaterThan(1);
+    const reversedCheckpoint = sourceCheckpointSchema.parse({
+      ...finalCheckpoint,
+      acquiredArtifactIds: [...finalCheckpoint.acquiredArtifactIds].reverse(),
+    });
+    const reversedCheckpointStore = new MemoryCheckpointStore();
+    await reversedCheckpointStore.commit({
+      expectedRevision: null,
+      checkpoint: createCheckpointEnvelope({
+        scope: finalEnvelope?.scope ?? 'missing-scope',
+        previousRevision: null,
+        writtenAt: reversedCheckpoint.updatedAt,
+        payload: reversedCheckpoint,
+      }),
+    });
+    const reversedTransport = new ScriptedTransport([]);
+    await expect(async () => {
+      for await (const artifact of adapter().acquire(
+        plan(),
+        undefined,
+        acquisitionContext(
+          reversedTransport,
+          reversedCheckpointStore,
+          artifacts,
+          new RecordingDelay(),
+        ),
+      )) {
+        void artifact;
+      }
+    }).rejects.toMatchObject({ code: 'RECONCILIATION' });
+    expect(reversedTransport.requests).toHaveLength(0);
   });
 
-  it('resumes after a committed feed without reacquiring it', async () => {
+  it('fails closed when a supplied checkpoint references a missing immutable feed', async () => {
     const activeArtifact = acquiredArtifact('active', await fixtureBytes('active'));
     const checkpoint: SourceCheckpoint = sourceCheckpointSchema.parse({
       sourceId: SAN_JOSE_BUILDING_PERMIT_SOURCE_ID,
@@ -535,27 +640,20 @@ describe('San Jose building permit source family', () => {
       updatedAt: NOW,
       complete: false,
     });
-    const transport = new ScriptedTransport([
-      csvResponse(await fixtureBytes('expired')),
-      csvResponse(await fixtureBytes('under_inspection')),
-    ]);
-    const resumed: string[] = [];
-    for await (const artifact of adapter().acquire(
-      plan(),
-      checkpoint,
-      acquisitionContext(
-        transport,
-        new MemoryCheckpointStore(),
-        new MemoryArtifactStore(),
-        new RecordingDelay(),
-      ),
-    )) {
-      resumed.push(artifact.metadata.request.requestKey);
-    }
-    expect(resumed).toEqual(['expired', 'under_inspection']);
-    expect(transport.requests.some((request) => request.url === sanJoseCsvUrl('active'))).toBe(
-      false,
-    );
+    const consume = async (): Promise<void> => {
+      for await (const artifact of adapter().acquire(
+        plan(),
+        checkpoint,
+        acquisitionContext(
+          new ScriptedTransport([]),
+          new MemoryCheckpointStore(),
+          new MemoryArtifactStore(),
+          new RecordingDelay(),
+        ),
+      ))
+        void artifact;
+    };
+    await expect(consume()).rejects.toMatchObject({ code: 'RECONCILIATION' });
   });
 
   it('resumes a fresh adapter from checkpoint-store state alone and rejects caller disagreement', async () => {
@@ -595,9 +693,11 @@ describe('San Jose building permit source family', () => {
     };
     await expect(consumeDisagreement()).rejects.toMatchObject({ code: 'RECONCILIATION' });
 
+    const activeBytes = await fixtureBytes('active');
     const resumedTransport = new ScriptedTransport([
-      csvResponse(await fixtureBytes('expired')),
-      csvResponse(await fixtureBytes('under_inspection')),
+      // Identical bytes/hashes across distinct feed logical keys are permitted.
+      csvResponse(activeBytes),
+      csvResponse(activeBytes),
     ]);
     const resumed: string[] = [];
     for await (const acquired of adapter().acquire(
@@ -607,17 +707,36 @@ describe('San Jose building permit source family', () => {
     )) {
       resumed.push(acquired.metadata.request.requestKey);
     }
-    expect(resumed).toEqual(['expired', 'under_inspection']);
+    expect(resumed).toEqual(['active', 'expired', 'under_inspection']);
     expect(
       resumedTransport.requests.some((request) => request.url === sanJoseCsvUrl('active')),
     ).toBe(false);
+    expect(resumedTransport.requests).toHaveLength(2);
+    const persisted = sourceCheckpointSchema.parse(checkpoints.commits.at(-1)?.payload);
+    expect(persisted.acquiredArtifactIds).toEqual([
+      artifactIdSchema.parse(
+        `sc:artifact:sha256:${createHash('sha256').update(activeBytes).digest('hex')}`,
+      ),
+    ]);
+
+    const zeroNetwork = new ScriptedTransport([]);
+    const restarted: AcquiredArtifactSource[] = [];
+    for await (const acquired of adapter().acquire(
+      plan(),
+      undefined,
+      acquisitionContext(zeroNetwork, checkpoints, artifacts, new RecordingDelay()),
+    ))
+      restarted.push(acquired);
+    expect(zeroNetwork.requests).toHaveLength(0);
+    expect(restarted.map((item) => item.metadata.request.requestKey)).toEqual(SAN_JOSE_FEEDS);
+    expect(restarted[1]?.metadata.artifactId).toBe(restarted[2]?.metadata.artifactId);
   });
 
   it('fails closed on missing Content-Type and incorrect immutable-store size or SHA-256', async () => {
     const active = await fixtureBytes('active');
     const consume = async (
       transport: HttpTransport,
-      artifactStore: ArtifactStore,
+      artifactStore: RecoverableArtifactStore,
     ): Promise<void> => {
       for await (const acquired of adapter().acquire(
         plan(),
@@ -649,8 +768,31 @@ describe('San Jose building permit source family', () => {
     for (const corruption of ['size', 'sha256'] as const) {
       await expect(
         consume(new ScriptedTransport([csvResponse(active)]), new MemoryArtifactStore(corruption)),
-      ).rejects.toThrow('Immutable store verification failed for active');
+      ).rejects.toThrow('Acquired artifact store integrity mismatch');
     }
+  });
+
+  it('enforces the configured byte ceiling while streaming a production CSV response', async () => {
+    const active = await fixtureBytes('active');
+    const selected = createSanJoseBuildingPermitAdapter({
+      runId: RUN_ID,
+      normalizationTimestamp: NOW,
+      maximumResponseBytes: active.byteLength - 1,
+    });
+    const consume = async (): Promise<void> => {
+      for await (const artifact of selected.acquire(
+        plan(),
+        undefined,
+        acquisitionContext(
+          new ScriptedTransport([csvResponse(active)]),
+          new MemoryCheckpointStore(),
+          new MemoryArtifactStore(),
+          new RecordingDelay(),
+        ),
+      ))
+        void artifact;
+    };
+    await expect(consume()).rejects.toMatchObject({ code: 'ACQUISITION_BYTE_LIMIT' });
   });
 
   it('propagates abort without transport or artifact side effects', async () => {
@@ -749,6 +891,27 @@ describe('San Jose building permit source family', () => {
     expect(records[0]?.values[SAN_JOSE_CSV_HEADER.indexOf('WORKDESCRIPTION')]).toBe(
       'Line one, exact\nLine two — retained',
     );
+  });
+
+  it('enforces the default 1 MiB record ceiling across adversarial stream splits and cleans up for reuse', async () => {
+    const quote = (value: string): string => `"${value.replaceAll('"', '""')}"`;
+    const values = SAN_JOSE_CSV_HEADER.map(() => '');
+    values[SAN_JOSE_CSV_HEADER.indexOf('Status')] = 'Active';
+    values[SAN_JOSE_CSV_HEADER.indexOf('FOLDERRSN')] = 'oversized-row';
+    values[SAN_JOSE_CSV_HEADER.indexOf('WORKDESCRIPTION')] = `line-one\n${'x'.repeat(1024 * 1024)}`;
+    const csv = `${SAN_JOSE_CSV_HEADER.map(quote).join(',')}\n${values.map(quote).join(',')}\n`;
+    const selectedAdapter = adapter();
+    const consume = async (artifact: AcquiredArtifactSource): Promise<void> => {
+      for await (const record of selectedAdapter.decode(artifact, decodeContext())) void record;
+    };
+    await expect(
+      consume(streamingArtifact('active', new TextEncoder().encode(csv), 997)),
+    ).rejects.toMatchObject({
+      code: 'RECORD_QUALITY',
+    });
+    await expect(
+      consume(acquiredArtifact('active', await fixtureBytes('active'))),
+    ).resolves.toBeUndefined();
   });
 
   it('rejects invalid UTF-8, malformed CSV, schema drift, and locked count mismatch', async () => {
@@ -877,7 +1040,7 @@ describe('San Jose building permit source family', () => {
     const finalCheckpoint = sourceCheckpointSchema.parse({
       sourceId: SAN_JOSE_BUILDING_PERMIT_SOURCE_ID,
       snapshotId: SNAPSHOT_ID,
-      contractVersion: '1.0.0',
+      contractVersion: '2.0.0',
       cursor: 'sequence:3',
       nextSequence: 3,
       completedRequestKeys: SAN_JOSE_FEEDS,
@@ -885,7 +1048,7 @@ describe('San Jose building permit source family', () => {
       updatedAt: NOW,
       complete: true,
     });
-    const run: SourceRunObservation = {
+    const run: SourceRunObservationV2 = {
       descriptor: selectedAdapter.describe(),
       runId: RUN_ID,
       request: acquisitionRequestSchema.parse({
@@ -903,15 +1066,15 @@ describe('San Jose building permit source family', () => {
       decodedRecords: 3,
       acceptedRecords: 3,
       rejectedRecords: 0,
-      mutations,
-      validationIssues: [],
+      mutations: repeatable(mutations),
+      validationIssues: repeatable([]),
       aborted: false,
     };
-    const source = selectedAdapter.summarize(run, {
+    const source = await selectedAdapter.summarize(run, {
       clock: new FixedClock(),
       signal: abortSignal(),
     });
-    const summary = summarizeSanJoseBuildingPermits(run, source);
+    const summary = await summarizeSanJoseBuildingPermits(run, source);
     expect(source.status).toBe('succeeded');
     expect(source.decodedRecords).toBe(3);
     expect(source.acceptedRecords + source.rejectedRecords).toBe(source.decodedRecords);
@@ -928,23 +1091,27 @@ describe('San Jose building permit source family', () => {
       complete: false,
     });
     expect(
-      selectedAdapter.summarize(
-        { ...run, finalCheckpoint: incompleteCheckpoint },
-        { clock: new FixedClock(), signal: abortSignal() },
+      (
+        await selectedAdapter.summarize(
+          { ...run, finalCheckpoint: incompleteCheckpoint },
+          { clock: new FixedClock(), signal: abortSignal() },
+        )
       ).status,
     ).toBe('partial');
     expect(
-      selectedAdapter.summarize(
-        { ...run, artifacts: artifacts.slice(0, 2) },
-        { clock: new FixedClock(), signal: abortSignal() },
+      (
+        await selectedAdapter.summarize(
+          { ...run, artifacts: artifacts.slice(0, 2) },
+          { clock: new FixedClock(), signal: abortSignal() },
+        )
       ).status,
     ).toBe('partial');
-    expect(() =>
+    await expect(
       selectedAdapter.summarize(
         { ...run, decodedRecords: 4 },
         { clock: new FixedClock(), signal: abortSignal() },
       ),
-    ).toThrow(
+    ).rejects.toThrow(
       expect.objectContaining({
         code: 'RECORD_QUALITY',
         phase: 'summarize',

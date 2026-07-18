@@ -1,5 +1,10 @@
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { mkdir, mkdtemp, open as openFile, readFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import type { RecoverableArtifactStore, StoredArtifact } from '@oracle/artifacts/artifact-store';
 
 import type {
   CheckpointCommit,
@@ -17,18 +22,26 @@ import {
   type RunId,
 } from '@oracle/contracts/ids';
 import { licenseSnapshotSchema, type SourceCheckpoint } from '@oracle/contracts/source';
+import { DuckDBAnalyticalRuntime } from '@oracle/data-runtime/duckdb/duckdb-analytical-runtime';
 import { zipSync } from 'fflate';
 import { describe, expect, it } from 'vitest';
 
-import { createAcquiredByteArtifact } from '../../spi/acquired-artifact.js';
+import {
+  createAcquiredByteArtifact,
+  createStreamingAcquiredArtifact,
+  durableAcquiredArtifactReference,
+  openDurableAcquiredArtifactReference,
+  parseAnalyticalSnapshotManifest,
+} from '../../spi/acquired-artifact.js';
 import { sha256Hex } from '../../spi/bytes.js';
+import { createSharedRecordBudget } from '../../spi/record-budget.js';
 import { createStaticGtfsAdapter } from './adapter.js';
 import {
   compareTransitSnapshots,
   selectTransitSnapshot,
   validateTransitFeedFamilyConfig,
 } from './family.js';
-import { decodeGtfsZip } from './gtfs.js';
+import { decodeGtfsZip, decodeGtfsZipStream, gtfsDerivedManifestLogicalKey } from './gtfs.js';
 import { createCanonicalTransitMutations, normalizeTransitSnapshot } from './normalize.js';
 import { CALTRAIN_2026_06_10_SNAPSHOT, VTA_2026_07_15_SNAPSHOT } from './snapshots.js';
 import type {
@@ -169,6 +182,8 @@ class ScriptedTransport {
 }
 
 class FileArtifactStore {
+  readonly #stored = new Map<string, Readonly<{ metadata: StoredArtifact; bytes: Uint8Array }>>();
+
   public async putImmutable(request: {
     logicalKey: string;
     mediaType: string;
@@ -176,25 +191,195 @@ class FileArtifactStore {
     expectedSha256: string;
     metadata: Readonly<Record<string, string>>;
   }) {
-    const bytes = request.body instanceof Uint8Array ? request.body : new Uint8Array();
-    expect(sha256Hex(bytes)).toBe(request.expectedSha256);
-    return Promise.resolve({
+    return this.putImmutableStreaming(request);
+  }
+  public async putImmutableStreaming(request: {
+    logicalKey: string;
+    mediaType: string;
+    body: Uint8Array | AsyncIterable<Uint8Array>;
+    expectedSha256?: string;
+    metadata: Readonly<Record<string, string>>;
+  }) {
+    const chunks: Uint8Array[] = [];
+    let length = 0;
+    if (request.body instanceof Uint8Array) {
+      chunks.push(request.body);
+      length = request.body.byteLength;
+    } else {
+      for await (const chunk of request.body) {
+        chunks.push(Uint8Array.from(chunk));
+        length += chunk.byteLength;
+      }
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const sha256 = sha256Hex(bytes);
+    if (request.expectedSha256 !== undefined && sha256 !== request.expectedSha256) {
+      throw Object.assign(new Error('GTFS test artifact SHA mismatch'), { code: 'SCHEMA_DRIFT' });
+    }
+    const stored = Object.freeze({
       logicalKey: request.logicalKey,
       uri: `file://test-artifacts/${encodeURIComponent(request.logicalKey)}`,
       mediaType: request.mediaType,
       byteSize: bytes.byteLength,
-      sha256: request.expectedSha256,
+      sha256,
       storedAt: '2026-07-17T13:00:00.000Z',
       metadata: request.metadata,
     });
+    this.#stored.set(stored.uri, Object.freeze({ metadata: stored, bytes }));
+    return stored;
   }
-  public async head() {
-    return Promise.resolve(undefined);
+  public async head(uri: string) {
+    return Promise.resolve(this.#stored.get(uri)?.metadata);
   }
-  public async *read(): AsyncIterable<Uint8Array> {
+  public async headByLogicalKey(logicalKey: string) {
+    const stored = [...this.#stored.values()].find(
+      ({ metadata }) => metadata.logicalKey === logicalKey,
+    );
+    if (stored !== undefined && sha256Hex(stored.bytes) !== stored.metadata.sha256) {
+      throw new Error(`GTFS test artifact integrity mismatch: ${logicalKey}`);
+    }
+    return Promise.resolve(stored?.metadata);
+  }
+  public removeByLogicalKey(logicalKey: string): void {
+    for (const [uri, stored] of this.#stored) {
+      if (stored.metadata.logicalKey === logicalKey) this.#stored.delete(uri);
+    }
+  }
+  public corruptByLogicalKey(logicalKey: string): void {
+    for (const stored of this.#stored.values()) {
+      if (stored.metadata.logicalKey !== logicalKey || stored.bytes.byteLength === 0) continue;
+      stored.bytes[0] = (stored.bytes[0] ?? 0) ^ 1;
+    }
+  }
+  public tamperMetadataByLogicalKey(
+    logicalKey: string,
+    metadata: Readonly<Record<string, string>>,
+  ): void {
+    for (const [uri, stored] of this.#stored) {
+      if (stored.metadata.logicalKey !== logicalKey) continue;
+      this.#stored.set(
+        uri,
+        Object.freeze({
+          ...stored,
+          metadata: Object.freeze({
+            ...stored.metadata,
+            metadata: Object.freeze({ ...stored.metadata.metadata, ...metadata }),
+          }),
+        }),
+      );
+    }
+  }
+  public async *read(
+    uri: string,
+    range?: { start: number; endInclusive: number },
+  ): AsyncIterable<Uint8Array> {
     await Promise.resolve();
-    yield new Uint8Array();
+    const stored = this.#stored.get(uri);
+    if (stored === undefined) throw new Error('missing GTFS test artifact');
+    yield range === undefined
+      ? Uint8Array.from(stored.bytes)
+      : stored.bytes.slice(range.start, range.endInclusive + 1);
   }
+}
+
+class DiskArtifactStore {
+  readonly #byLogicalKey = new Map<string, StoredArtifact>();
+  readonly #byUri = new Map<string, StoredArtifact>();
+
+  public constructor(readonly root: string) {}
+
+  public async putImmutable(request: {
+    logicalKey: string;
+    mediaType: string;
+    body: Uint8Array | AsyncIterable<Uint8Array>;
+    expectedSha256: string;
+    metadata: Readonly<Record<string, string>>;
+  }) {
+    return this.putImmutableStreaming(request);
+  }
+
+  public async putImmutableStreaming(request: {
+    logicalKey: string;
+    mediaType: string;
+    body: Uint8Array | AsyncIterable<Uint8Array>;
+    expectedSha256?: string;
+    metadata: Readonly<Record<string, string>>;
+  }) {
+    const existing = this.#byLogicalKey.get(request.logicalKey);
+    if (existing !== undefined) return existing;
+    await mkdir(this.root, { recursive: true });
+    const uri = join(this.root, createHash('sha256').update(request.logicalKey).digest('hex'));
+    const file = await openFile(uri, 'wx');
+    const hash = createHash('sha256');
+    let byteSize = 0;
+    try {
+      let body: AsyncIterable<Uint8Array>;
+      if (request.body instanceof Uint8Array) {
+        const bytes = request.body;
+        body = (async function* () {
+          await Promise.resolve();
+          yield bytes;
+        })();
+      } else {
+        body = request.body;
+      }
+      for await (const chunk of body) {
+        hash.update(chunk);
+        byteSize += chunk.byteLength;
+        await file.write(chunk);
+      }
+    } finally {
+      await file.close();
+    }
+    const sha256 = hash.digest('hex');
+    if (request.expectedSha256 !== undefined && sha256 !== request.expectedSha256) {
+      throw new Error('GTFS disk test artifact SHA mismatch');
+    }
+    const stored = Object.freeze({
+      logicalKey: request.logicalKey,
+      uri,
+      mediaType: request.mediaType,
+      byteSize,
+      sha256,
+      storedAt: clock.now(),
+      metadata: request.metadata,
+    });
+    this.#byLogicalKey.set(request.logicalKey, stored);
+    this.#byUri.set(uri, stored);
+    return stored;
+  }
+
+  public async head(uri: string) {
+    return Promise.resolve(this.#byUri.get(uri));
+  }
+
+  public async headByLogicalKey(logicalKey: string) {
+    return Promise.resolve(this.#byLogicalKey.get(logicalKey));
+  }
+
+  public async *read(
+    uri: string,
+    range?: { start: number; endInclusive: number },
+  ): AsyncIterable<Uint8Array> {
+    const bytes = await readFile(uri);
+    yield range === undefined ? bytes : bytes.subarray(range.start, range.endInclusive + 1);
+  }
+}
+
+function repeatable<T>(values: readonly T[]) {
+  return Object.freeze({
+    count: values.length,
+    logicalSha256: '0'.repeat(64),
+    read: async function* () {
+      await Promise.resolve();
+      for (const value of values) yield value;
+    },
+  });
 }
 
 class MemoryCheckpointStore implements CheckpointStore {
@@ -424,6 +609,47 @@ describe('VTA/Caltrain direct GTFS adapter', () => {
     ).toThrow();
   });
 
+  it('rejects ZIP entry-count and entry-name metadata bombs before member validation', async () => {
+    const { bytes: fixtureBytes, config } = fixture('vta');
+    const baseMembers = officialExcerpts.vta.members;
+    const signal = new AbortController().signal;
+    const entryBomb = frozenZip({
+      ...baseMembers,
+      ...Object.fromEntries(
+        Array.from({ length: 4097 }, (_, index) => [`ignored-${index}.bin`, '']),
+      ),
+    });
+    await expect(
+      decodeGtfsZipStream(
+        artifactFor(fixtureBytes, config),
+        (async function* () {
+          await Promise.resolve();
+          yield entryBomb;
+        })(),
+        new FileArtifactStore(),
+        config.agencyId,
+        signal,
+      ),
+    ).rejects.toThrow(/ZIP metadata exceeds/u);
+
+    const longNameBomb = frozenZip({
+      ...baseMembers,
+      [`${'x'.repeat(1025)}.bin`]: '',
+    });
+    await expect(
+      decodeGtfsZipStream(
+        artifactFor(fixtureBytes, config),
+        (async function* () {
+          await Promise.resolve();
+          yield longNameBomb;
+        })(),
+        new FileArtifactStore(),
+        config.agencyId,
+        signal,
+      ),
+    ).rejects.toThrow(/ZIP metadata exceeds/u);
+  });
+
   it('ignores whitespace-only physical GTFS rows but rejects nonblank column drift', () => {
     const { config } = fixture('caltrain');
     const base = officialExcerpts.caltrain.members;
@@ -549,12 +775,13 @@ describe('VTA/Caltrain direct GTFS adapter', () => {
       chunks: [bytes.slice(0, 100), bytes.slice(100)],
     });
     const checkpoints = new MemoryCheckpointStore();
+    const artifactStore = new FileArtifactStore();
     const acquired = [];
     for await (const artifact of adapter.acquire(plan, undefined, {
       clock,
       signal: new AbortController().signal,
       http: transport,
-      artifactStore: new FileArtifactStore(),
+      artifactStore,
       checkpointStore: checkpoints,
       ratePolicy: config.ratePolicy,
       delay,
@@ -567,40 +794,309 @@ describe('VTA/Caltrain direct GTFS adapter', () => {
       visibility: config.visibility,
       response: { lastModified: '2026-07-15T18:03:46.000Z' },
     });
+    const streamed = acquired[0];
+    if (streamed === undefined) throw new Error('Expected acquired GTFS stream');
+    const decoded = [];
+    for await (const record of adapter.decode(streamed, {
+      clock,
+      signal: new AbortController().signal,
+      artifactStore,
+      analyticalRuntime,
+      recordBudget: createSharedRecordBudget(1),
+    }))
+      decoded.push(record);
+    expect(decoded).toHaveLength(1);
+    expect(decoded[0]?.members).toEqual({});
+    expect(decoded[0]?.streamingManifest).toMatchObject({
+      formatVersion: '1.0.0',
+      members: { 'stops.txt': { byteSize: expect.any(Number), sha256: expect.any(String) } },
+    });
+    const marker = decoded[0];
+    if (marker === undefined) throw new Error('Expected decoded GTFS marker');
+    await expect(
+      adapter.validate(marker, { clock, signal: new AbortController().signal }),
+    ).resolves.toMatchObject({ status: 'accepted' });
     expect(checkpoints.value?.payload).toMatchObject({ complete: true, nextSequence: 1 });
+  });
+
+  it('keeps canonical parity through bounded member artifacts and one-row DuckDB pages', async () => {
+    const { bytes, config } = fixture('vta');
+    const artifact = artifactFor(bytes, config);
+    const { record: legacyRecord } = await validatedFixture('vta');
+    const legacyAdapter = createStaticGtfsAdapter(config);
+    const legacy = [];
+    for await (const mutation of legacyAdapter.normalize(legacyRecord, {
+      clock,
+      signal: new AbortController().signal,
+      analyticalRuntime,
+    })) {
+      legacy.push(mutation);
+    }
+
+    const root = await mkdtemp(join(tmpdir(), 'oracle-gtfs-parity-'));
+    try {
+      const store = new DiskArtifactStore(root);
+      const adapter = createStaticGtfsAdapter(config);
+      const decoded = [];
+      for await (const marker of adapter.decode(artifact, {
+        clock,
+        signal: new AbortController().signal,
+        artifactStore: store,
+        analyticalRuntime,
+        recordBudget: createSharedRecordBudget(1),
+      })) {
+        decoded.push(marker);
+      }
+      const marker = decoded[0];
+      if (marker === undefined) throw new Error('Expected streaming GTFS marker');
+      const adopted = [];
+      const retryAdapter = createStaticGtfsAdapter(config);
+      for await (const retryMarker of retryAdapter.decode(artifact, {
+        clock,
+        signal: new AbortController().signal,
+        artifactStore: store,
+        analyticalRuntime,
+        recordBudget: createSharedRecordBudget(1),
+      })) {
+        adopted.push(retryMarker);
+      }
+      expect(adopted[0]?.streamingManifest).toEqual(marker.streamingManifest);
+      const validation = await adapter.validate(marker, {
+        clock,
+        signal: new AbortController().signal,
+      });
+      if (validation.status !== 'accepted') throw new Error(JSON.stringify(validation.issues));
+      const runtime = new DuckDBAnalyticalRuntime({
+        loadSnapshot: async (snapshot) => {
+          const manifestBytes = await readFile(snapshot.manifestUri);
+          const manifest = parseAnalyticalSnapshotManifest(
+            JSON.parse(new TextDecoder().decode(manifestBytes)),
+          );
+          return Object.freeze({
+            manifestBytes,
+            scanBytesByOperation: manifest.scanBytesByOperation,
+          });
+        },
+        nowMilliseconds: () => Date.now(),
+      });
+      const normalizedDuringRecord = [];
+      for await (const mutation of adapter.normalize(validation.record, {
+        clock,
+        signal: new AbortController().signal,
+        analyticalRuntime: runtime,
+        recordBudget: createSharedRecordBudget(1),
+      })) {
+        normalizedDuringRecord.push(mutation);
+      }
+      expect(normalizedDuringRecord).toHaveLength(0);
+      const storedRaw = await store.putImmutable({
+        logicalKey: `raw/${config.sourceId}/${artifact.metadata.snapshotId}/fixture.zip`,
+        mediaType: artifact.metadata.mediaType,
+        body: bytes,
+        expectedSha256: artifact.metadata.sha256,
+        metadata: Object.freeze({ fixture: 'true' }),
+      });
+      const rawUri = 'file://oracle-test/gtfs-fixture.zip';
+      const aliasedRaw = Object.freeze({ ...storedRaw, uri: rawUri });
+      const durableStore: RecoverableArtifactStore = {
+        putImmutable: (request) => store.putImmutable(request),
+        putImmutableStreaming: (request) => store.putImmutableStreaming(request),
+        head: (uri) => (uri === rawUri ? Promise.resolve(aliasedRaw) : store.head(uri)),
+        headByLogicalKey: (logicalKey) =>
+          logicalKey === storedRaw.logicalKey
+            ? Promise.resolve(aliasedRaw)
+            : store.headByLogicalKey(logicalKey),
+        read: async function* (uri, range) {
+          yield* store.read(uri === rawUri ? storedRaw.uri : uri, range);
+        },
+      };
+      const localManifest = marker.streamingManifest;
+      if (localManifest === undefined) throw new Error('Expected streaming GTFS manifest');
+      const durableArtifact = await createStreamingAcquiredArtifact(
+        { ...artifact.metadata, rawUri },
+        durableStore,
+        {
+          analyticalSnapshot: {
+            formatVersion: '1.0.0',
+            manifestUri: localManifest.uri,
+            manifestSha256: localManifest.sha256,
+            byteLength: localManifest.byteSize,
+          },
+        },
+      );
+      const reopened = await openDurableAcquiredArtifactReference(
+        durableAcquiredArtifactReference(durableArtifact),
+        durableStore,
+      );
+      const freshAdapter = createStaticGtfsAdapter(config);
+      const streamed = [];
+      for await (const mutation of freshAdapter.finalizeFromAcquiredArtifacts(
+        {
+          count: 1,
+          metadata: Object.freeze([reopened.metadata]),
+          read: async function* () {
+            await Promise.resolve();
+            yield reopened;
+          },
+        },
+        {
+          clock,
+          signal: new AbortController().signal,
+          analyticalRuntime: {
+            open: () => Promise.reject(new Error('durable finalization must be self-contained')),
+          },
+          recordBudget: createSharedRecordBudget(1),
+        },
+      )) {
+        streamed.push(mutation);
+      }
+      expect(streamed).toEqual(legacy);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 
   it('honors checkpoint resume, abort and exact ZIP integrity', async () => {
     const { bytes, config } = fixture('caltrain');
     const { adapter, plan } = await planFor(config);
-    const requestKey = plan.items[0]?.requestKey ?? '';
-    const complete: SourceCheckpoint = {
-      sourceId: config.sourceId,
-      snapshotId: plan.snapshotId,
-      contractVersion: '1.0.0',
-      cursor: 'complete',
-      nextSequence: 1,
-      completedRequestKeys: [requestKey],
-      acquiredArtifactIds: [
-        artifactIdSchema.parse(`sc:artifact:sha256:${config.expectedZipSha256}`),
-      ],
-      updatedAt: config.retrievedAt,
-      complete: true,
+    const seedReplay = async () => {
+      const artifactStore = new FileArtifactStore();
+      const checkpointStore = new MemoryCheckpointStore();
+      const transport = new ScriptedTransport({
+        status: 206,
+        headers: { 'content-type': 'application/zip' },
+        chunks: [bytes],
+      });
+      const acquired = [];
+      for await (const artifact of createStaticGtfsAdapter(config).acquire(plan, undefined, {
+        clock,
+        signal: new AbortController().signal,
+        http: transport,
+        artifactStore,
+        checkpointStore,
+        ratePolicy: config.ratePolicy,
+        delay,
+      })) {
+        acquired.push(artifact);
+      }
+      return { acquired, artifactStore, checkpointStore };
     };
+    const seeded = await seedReplay();
+    const complete = seeded.checkpointStore.value?.payload as SourceCheckpoint;
     const skippedTransport = new ScriptedTransport({ status: 200, headers: {}, chunks: [bytes] });
     const resumed = [];
-    for await (const artifact of adapter.acquire(plan, complete, {
+    for await (const artifact of createStaticGtfsAdapter(config).acquire(plan, undefined, {
       clock,
       signal: new AbortController().signal,
       http: skippedTransport,
-      artifactStore: new FileArtifactStore(),
-      checkpointStore: new MemoryCheckpointStore(),
+      artifactStore: seeded.artifactStore,
+      checkpointStore: seeded.checkpointStore,
       ratePolicy: config.ratePolicy,
       delay,
     }))
       resumed.push(artifact);
-    expect(resumed).toHaveLength(0);
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0]?.metadata).toEqual(seeded.acquired[0]?.metadata);
     expect(skippedTransport.requests).toHaveLength(0);
+
+    const mismatchTransport = new ScriptedTransport({ status: 200, headers: {}, chunks: [bytes] });
+    const mismatch = createStaticGtfsAdapter(config).acquire(
+      plan,
+      { ...complete, updatedAt: '2026-07-17T13:00:01.000Z' },
+      {
+        clock,
+        signal: new AbortController().signal,
+        http: mismatchTransport,
+        artifactStore: seeded.artifactStore,
+        checkpointStore: seeded.checkpointStore,
+        ratePolicy: config.ratePolicy,
+        delay,
+      },
+    );
+    await expect(mismatch[Symbol.asyncIterator]().next()).rejects.toThrow(/checkpoints disagree/u);
+    expect(mismatchTransport.requests).toHaveLength(0);
+
+    const missingTransport = new ScriptedTransport({ status: 200, headers: {}, chunks: [bytes] });
+    const missing = createStaticGtfsAdapter(config).acquire(plan, undefined, {
+      clock,
+      signal: new AbortController().signal,
+      http: missingTransport,
+      artifactStore: new FileArtifactStore(),
+      checkpointStore: seeded.checkpointStore,
+      ratePolicy: config.ratePolicy,
+      delay,
+    });
+    await expect(missing[Symbol.asyncIterator]().next()).rejects.toThrow(
+      /missing its immutable raw artifact/u,
+    );
+    expect(missingTransport.requests).toHaveLength(0);
+
+    const rawLogicalKey = `raw/${config.sourceId}/${plan.snapshotId}/${plan.items[0]?.requestKey}.zip`;
+    const corruptRaw = await seedReplay();
+    corruptRaw.artifactStore.corruptByLogicalKey(rawLogicalKey);
+    const corruptRawTransport = new ScriptedTransport({
+      status: 200,
+      headers: {},
+      chunks: [bytes],
+    });
+    const corruptRawRun = createStaticGtfsAdapter(config).acquire(plan, undefined, {
+      clock,
+      signal: new AbortController().signal,
+      http: corruptRawTransport,
+      artifactStore: corruptRaw.artifactStore,
+      checkpointStore: corruptRaw.checkpointStore,
+      ratePolicy: config.ratePolicy,
+      delay,
+    });
+    await expect(corruptRawRun[Symbol.asyncIterator]().next()).rejects.toThrow(
+      /artifact integrity mismatch/u,
+    );
+    expect(corruptRawTransport.requests).toHaveLength(0);
+
+    const manifestLogicalKey = gtfsDerivedManifestLogicalKey(config.sourceId, plan.snapshotId);
+    const missingManifest = await seedReplay();
+    missingManifest.artifactStore.removeByLogicalKey(manifestLogicalKey);
+    const missingManifestTransport = new ScriptedTransport({
+      status: 200,
+      headers: {},
+      chunks: [bytes],
+    });
+    const missingManifestRun = createStaticGtfsAdapter(config).acquire(plan, undefined, {
+      clock,
+      signal: new AbortController().signal,
+      http: missingManifestTransport,
+      artifactStore: missingManifest.artifactStore,
+      checkpointStore: missingManifest.checkpointStore,
+      ratePolicy: config.ratePolicy,
+      delay,
+    });
+    await expect(missingManifestRun[Symbol.asyncIterator]().next()).rejects.toThrow(
+      /missing its analytical manifest/u,
+    );
+    expect(missingManifestTransport.requests).toHaveLength(0);
+
+    const corruptManifest = await seedReplay();
+    corruptManifest.artifactStore.tamperMetadataByLogicalKey(manifestLogicalKey, {
+      parentArtifactId: `sc:artifact:sha256:${'f'.repeat(64)}`,
+    });
+    const corruptManifestTransport = new ScriptedTransport({
+      status: 200,
+      headers: {},
+      chunks: [bytes],
+    });
+    const corruptManifestRun = createStaticGtfsAdapter(config).acquire(plan, undefined, {
+      clock,
+      signal: new AbortController().signal,
+      http: corruptManifestTransport,
+      artifactStore: corruptManifest.artifactStore,
+      checkpointStore: corruptManifest.checkpointStore,
+      ratePolicy: config.ratePolicy,
+      delay,
+    });
+    await expect(corruptManifestRun[Symbol.asyncIterator]().next()).rejects.toThrow(
+      /manifest does not match its raw artifact/u,
+    );
+    expect(corruptManifestTransport.requests).toHaveLength(0);
 
     const controller = new AbortController();
     controller.abort();
@@ -685,7 +1181,7 @@ describe('direct-versus-511 reconciliation and summary accounting', () => {
     const checkpoint: SourceCheckpoint = {
       sourceId: config.sourceId,
       snapshotId: artifact.metadata.snapshotId,
-      contractVersion: '1.0.0',
+      contractVersion: '2.0.0',
       cursor: 'complete',
       nextSequence: 1,
       completedRequestKeys: ['caltrain-operator_primary-gtfs'],
@@ -693,7 +1189,7 @@ describe('direct-versus-511 reconciliation and summary accounting', () => {
       updatedAt: config.retrievedAt,
       complete: true,
     };
-    const summary = adapter.summarize(
+    const summary = await adapter.summarize(
       {
         descriptor: adapter.describe(),
         runId: `sc:run:${'1'.repeat(64)}` as RunId,
@@ -707,7 +1203,7 @@ describe('direct-versus-511 reconciliation and summary accounting', () => {
         plan: {
           sourceId: config.sourceId,
           snapshotId: artifact.metadata.snapshotId,
-          contractVersion: '1.0.0',
+          contractVersion: '2.0.0',
           plannedAt: config.retrievedAt,
           items: [
             {
@@ -727,8 +1223,8 @@ describe('direct-versus-511 reconciliation and summary accounting', () => {
         decodedRecords: 1,
         acceptedRecords: 1,
         rejectedRecords: 0,
-        mutations,
-        validationIssues: [],
+        mutations: repeatable(mutations),
+        validationIssues: repeatable([]),
         aborted: false,
       },
       { clock, signal: new AbortController().signal },

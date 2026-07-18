@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { createSharedRecordBudget } from '../../spi/record-budget.js';
 
 import { OvertureStarbucksAdapter } from './adapter.js';
 import { deduplicateStarbucksCandidates } from './deduplication.js';
@@ -35,6 +36,7 @@ async function records(): Promise<
     adapter.decode(await acquiredFixture(), {
       artifactStore: new TestArtifactStore(),
       analyticalRuntime: UNUSED_RUNTIME,
+      recordBudget: createSharedRecordBudget(1),
       clock: new TestClock(),
       signal: signal(),
     }),

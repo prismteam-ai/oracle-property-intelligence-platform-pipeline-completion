@@ -7,6 +7,7 @@ import {
   type CanonicalMutation,
 } from '@oracle/contracts/canonical/mutation';
 import type { TransitService } from '@oracle/contracts/canonical/geospatial';
+import type { StreamingNormalizationContext } from '../../spi/adapter.js';
 
 import type {
   GtfsRow,
@@ -360,4 +361,411 @@ export function createCanonicalTransitMutations(
   }
 
   return Object.freeze(mutations);
+}
+
+const GTFS_ANALYTICAL_OPERATION = 'decode_gtfs_bounded_finalize';
+const GTFS_QUERY_TIMEOUT_MS = 120_000;
+const MAX_SERVICE_PAIRS_PER_STOP = 4096;
+
+function csvSource(
+  uri: string | undefined,
+  columns: readonly string[],
+): Readonly<{
+  sql: string;
+  parameters: readonly string[];
+}> {
+  if (uri !== undefined) {
+    return Object.freeze({
+      sql: "read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__')",
+      parameters: Object.freeze([uri]),
+    });
+  }
+  return Object.freeze({
+    sql: `(SELECT ${columns.map((column) => `CAST(NULL AS VARCHAR) AS ${column}`).join(', ')} WHERE false)`,
+    parameters: Object.freeze([]),
+  });
+}
+
+function jsonRow(value: unknown, label: string): GtfsRow {
+  const parsed = typeof value === 'string' ? (JSON.parse(value) as unknown) : value;
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new TypeError(`GTFS analytical ${label} is not an object`);
+  }
+  const output: Record<string, string> = {};
+  for (const [key, item] of Object.entries(parsed)) {
+    if (item !== null && item !== undefined) output[key] = String(item);
+  }
+  return Object.freeze(output);
+}
+
+function nullableJsonRow(value: unknown, label: string): GtfsRow | undefined {
+  if (value === null || value === undefined) return undefined;
+  const row = jsonRow(value, label);
+  return Object.keys(row).length === 0 ? undefined : row;
+}
+
+function rowString(row: Readonly<Record<string, unknown>>, key: string): string {
+  const value = row[key];
+  if (typeof value !== 'string') throw new TypeError(`GTFS analytical row is missing ${key}`);
+  return value;
+}
+
+function rowBoolean(row: Readonly<Record<string, unknown>>, key: string): boolean {
+  const value = row[key];
+  if (typeof value !== 'boolean') throw new TypeError(`GTFS analytical row is missing ${key}`);
+  return value;
+}
+
+function streamingFeedBase(feed: ValidatedGtfsFeed): ValidatedGtfsFeed {
+  return Object.freeze({
+    ...feed,
+    agency: Object.freeze([]),
+    stops: Object.freeze([]),
+    routes: Object.freeze([]),
+    trips: Object.freeze([]),
+    calendars: Object.freeze([]),
+    calendarDates: Object.freeze([]),
+    stopTimes: Object.freeze([]),
+    transfers: Object.freeze([]),
+  });
+}
+
+/** Emits legacy-parity GTFS mutations from one-row analytical pages over immutable CSV members. */
+export async function* createStreamingCanonicalTransitMutations(
+  feed: ValidatedGtfsFeed,
+  config: TransitFeedSnapshotConfig,
+  context: StreamingNormalizationContext,
+): AsyncIterable<CanonicalMutation> {
+  const manifest = feed.streamingManifest;
+  if (manifest === undefined) throw new TypeError('Streaming GTFS finalize requires a manifest');
+  const memberUri = (name: string): string | undefined => manifest.members[name]?.uri;
+  const tripsUri = memberUri('trips.txt');
+  const routesUri = memberUri('routes.txt');
+  const stopsUri = memberUri('stops.txt');
+  const stopTimesUri = memberUri('stop_times.txt');
+  if (
+    tripsUri === undefined ||
+    routesUri === undefined ||
+    stopsUri === undefined ||
+    stopTimesUri === undefined
+  ) {
+    throw new TypeError('Streaming GTFS manifest is missing a required member');
+  }
+  const calendars = csvSource(memberUri('calendar.txt'), [
+    'service_id',
+    'monday',
+    'tuesday',
+    'wednesday',
+    'thursday',
+    'friday',
+    'saturday',
+    'sunday',
+    'start_date',
+    'end_date',
+  ]);
+  const calendarDates = csvSource(memberUri('calendar_dates.txt'), [
+    'service_id',
+    'date',
+    'exception_type',
+  ]);
+  const selectedCompactDate = compactGtfsDate(config.selectedServiceDate);
+  const parsedDate = new Date(`${config.selectedServiceDate}T00:00:00Z`);
+  const weekday = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'][
+    parsedDate.getUTCDay()
+  ];
+  if (weekday === undefined) throw new TypeError('GTFS selected service weekday is invalid');
+  const session = await context.analyticalRuntime.open(
+    {
+      releaseId: `${config.sourceId}:gtfs-derived-v1`,
+      manifestUri: manifest.uri,
+      manifestSha256: manifest.sha256,
+    },
+    context.signal,
+  );
+  const baseFeed = streamingFeedBase(feed);
+  const runId = `sc:run:${sha256(`${config.sourceId}|${feed.bytes.sha256}|${config.selectedServiceDate}`)}`;
+  const snapshotId = `sc:snapshot:${config.sourceId.replace('sc:source:', '')}:${feed.bytes.sha256}`;
+  let sequence = 0;
+  try {
+    const commonCtes = `
+      trips AS (SELECT * FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__')),
+      routes AS (SELECT * FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__')),
+      calendars AS (SELECT * FROM ${calendars.sql}),
+      calendar_dates AS (SELECT * FROM ${calendarDates.sql}),
+      active_services AS (
+        SELECT service_id FROM calendars
+        WHERE coalesce(${weekday}, '') = '1'
+          AND coalesce(start_date, '') <= ? AND coalesce(end_date, '') >= ?
+        UNION
+        SELECT service_id FROM calendar_dates WHERE date = ? AND exception_type = '1'
+        EXCEPT
+        SELECT service_id FROM calendar_dates WHERE date = ? AND exception_type = '2'
+      )`;
+    const commonParameters = Object.freeze([
+      tripsUri,
+      routesUri,
+      ...calendars.parameters,
+      ...calendarDates.parameters,
+      selectedCompactDate,
+      selectedCompactDate,
+      selectedCompactDate,
+      selectedCompactDate,
+    ]);
+    let lastTripId = '';
+    for (;;) {
+      context.signal.throwIfAborted();
+      const result = await session.execute({
+        operation: GTFS_ANALYTICAL_OPERATION,
+        statement: `WITH ${commonCtes},
+          ranked AS (
+            SELECT trip_id, row_number() OVER (
+              PARTITION BY route_id, service_id ORDER BY trip_id
+            ) AS occurrence
+            FROM trips WHERE service_id IN (SELECT service_id FROM active_services)
+          )
+          SELECT t.trip_id AS page_key, to_json(t) AS trip_json,
+                 to_json(r) AS route_json, to_json(c) AS calendar_json,
+                 to_json(d) AS addition_json
+          FROM ranked x
+          JOIN trips t ON t.trip_id = x.trip_id
+          JOIN routes r ON r.route_id = t.route_id
+          LEFT JOIN calendars c ON c.service_id = t.service_id
+          LEFT JOIN calendar_dates d ON d.service_id = t.service_id
+             AND d.date = ? AND d.exception_type = '1'
+          WHERE x.occurrence = 1 AND t.trip_id > ?
+            AND (c.service_id IS NOT NULL OR d.service_id IS NOT NULL)
+          ORDER BY t.trip_id`,
+        parameters: [...commonParameters, selectedCompactDate, lastTripId],
+        timeoutMs: GTFS_QUERY_TIMEOUT_MS,
+        maximumScanBytes: manifest.totalMemberBytes,
+        maximumRows: 1,
+        signal: context.signal,
+      });
+      const row = result.rows[0];
+      if (row === undefined) break;
+      const trip = jsonRow(row['trip_json'], 'trip');
+      const route = jsonRow(row['route_json'], 'route');
+      const calendar = nullableJsonRow(row['calendar_json'], 'calendar');
+      const selectedAddition = nullableJsonRow(row['addition_json'], 'calendar date');
+      const routeId = trip['route_id'] ?? '';
+      const gtfsServiceId = trip['service_id'] ?? '';
+      const key = `${routeId}|${gtfsServiceId}`;
+      const entityId = `sc:entity:transit-service:${sha256(`${config.agencyId}|${key}`)}`;
+      const core = {
+        agencyId: config.agencyId,
+        routeId,
+        mode: routeMode(route['route_type']),
+        serviceStartDate:
+          calendar === undefined
+            ? config.selectedServiceDate
+            : parseGtfsDate(calendar['start_date'] ?? ''),
+        serviceEndDate:
+          calendar === undefined
+            ? config.selectedServiceDate
+            : parseGtfsDate(calendar['end_date'] ?? ''),
+      };
+      const entity = {
+        id: entityId,
+        entityKind: 'transit-service' as const,
+        version: 1,
+        validFrom: config.retrievedAt,
+        validTo: null,
+        recordedAt: config.retrievedAt,
+        visibility: config.visibility,
+        sourceIds: [config.sourceId],
+        lineage: [
+          entityLineage(
+            baseFeed,
+            config,
+            `trips.txt:${trip['trip_id'] ?? ''}`,
+            { trip, calendar: calendar ?? null, selectedAddition: selectedAddition ?? null },
+            core,
+          ),
+        ],
+        ...core,
+      };
+      yield canonicalMutationSchema.parse({
+        kind: 'entity_upsert',
+        mutationId: `sc:mutation:${sha256(`${feed.artifactId}|service|${entityId}`)}`,
+        runId,
+        sourceId: config.sourceId,
+        snapshotId,
+        sequence: sequence++,
+        emittedAt: config.retrievedAt,
+        visibility: config.visibility,
+        entity,
+      });
+      lastTripId = rowString(row, 'page_key');
+      if (!result.truncated) break;
+    }
+
+    let lastStopId = '';
+    for (;;) {
+      context.signal.throwIfAborted();
+      const result = await session.execute({
+        operation: GTFS_ANALYTICAL_OPERATION,
+        statement: `WITH ${commonCtes},
+          active_trips AS (
+            SELECT * FROM trips WHERE service_id IN (SELECT service_id FROM active_services)
+          ),
+          stop_activity AS (
+            SELECT st.stop_id,
+                   count(*) > 0 AS active,
+                   bool_or(coalesce(st.pickup_type, '0') <> '1') AS pickup_allowed,
+                   bool_or(coalesce(st.drop_off_type, '0') <> '1') AS dropoff_allowed
+            FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__') st
+            JOIN active_trips t ON t.trip_id = st.trip_id
+            GROUP BY st.stop_id
+          )
+          SELECT s.stop_id AS page_key, to_json(s) AS stop_json,
+                 coalesce(a.active, false) AS active,
+                 coalesce(a.pickup_allowed, false) AS pickup_allowed,
+                 coalesce(a.dropoff_allowed, false) AS dropoff_allowed,
+                 CASE WHEN coalesce(s.parent_station, '') = '' THEN true
+                      ELSE EXISTS (
+                        SELECT 1 FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__') p
+                        WHERE p.stop_id = s.parent_station
+                      ) END AS parent_exists
+          FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__') s
+          LEFT JOIN stop_activity a ON a.stop_id = s.stop_id
+          WHERE s.stop_id > ? ORDER BY s.stop_id`,
+        parameters: [...commonParameters, stopTimesUri, stopsUri, stopsUri, lastStopId],
+        timeoutMs: GTFS_QUERY_TIMEOUT_MS,
+        maximumScanBytes: manifest.totalMemberBytes,
+        maximumRows: 1,
+        signal: context.signal,
+      });
+      const row = result.rows[0];
+      if (row === undefined) break;
+      const stopRow = jsonRow(row['stop_json'], 'stop');
+      const stopId = stopRow['stop_id'] ?? '';
+      const routeIds = new Set<string>();
+      const serviceIds = new Set<string>();
+      const canonicalServiceIds = new Set<string>();
+      let lastRouteId = '';
+      let lastServiceId = '';
+      let pairCount = 0;
+      for (;;) {
+        const pairs = await session.execute({
+          operation: GTFS_ANALYTICAL_OPERATION,
+          statement: `WITH ${commonCtes},
+            active_trips AS (
+              SELECT * FROM trips WHERE service_id IN (SELECT service_id FROM active_services)
+            )
+            SELECT DISTINCT t.route_id, t.service_id
+            FROM read_csv_auto(?, header = true, all_varchar = true, null_padding = true, nullstr = '__ORACLE_GTFS_NULL__') st
+            JOIN active_trips t ON t.trip_id = st.trip_id
+            WHERE st.stop_id = ?
+              AND (t.route_id > ? OR (t.route_id = ? AND t.service_id > ?))
+            ORDER BY t.route_id, t.service_id`,
+          parameters: [
+            ...commonParameters,
+            stopTimesUri,
+            stopId,
+            lastRouteId,
+            lastRouteId,
+            lastServiceId,
+          ],
+          timeoutMs: GTFS_QUERY_TIMEOUT_MS,
+          maximumScanBytes: manifest.totalMemberBytes,
+          maximumRows: 1,
+          signal: context.signal,
+        });
+        const pair = pairs.rows[0];
+        if (pair === undefined) break;
+        lastRouteId = rowString(pair, 'route_id');
+        lastServiceId = rowString(pair, 'service_id');
+        routeIds.add(lastRouteId);
+        serviceIds.add(lastServiceId);
+        canonicalServiceIds.add(
+          `sc:entity:transit-service:${sha256(`${config.agencyId}|${lastRouteId}|${lastServiceId}`)}`,
+        );
+        pairCount += 1;
+        if (pairCount > MAX_SERVICE_PAIRS_PER_STOP) {
+          throw new Error(
+            `GTFS stop ${stopId} exceeds ${MAX_SERVICE_PAIRS_PER_STOP} active service pairs`,
+          );
+        }
+        if (!pairs.truncated) break;
+      }
+      const locationType = Number(
+        stopRow['location_type'] === '' ? '0' : (stopRow['location_type'] ?? '0'),
+      );
+      const latitude = numberOrNull(stopRow['stop_lat'], -90, 90);
+      const longitude = numberOrNull(stopRow['stop_lon'], -180, 180);
+      const parent = stopRow['parent_station']?.trim() || null;
+      const locationBoardable = locationType === 0 || locationType === 4;
+      const active = rowBoolean(row, 'active');
+      const pickupAllowed = active && rowBoolean(row, 'pickup_allowed');
+      const dropOffAllowed = active && rowBoolean(row, 'dropoff_allowed');
+      const exclusions: string[] = [];
+      if (latitude === null || longitude === null)
+        exclusions.push('missing_or_invalid_coordinates');
+      if (!locationBoardable) exclusions.push('not_boardable_location_type');
+      if (!active) exclusions.push('inactive_on_selected_service_date');
+      if (active && !pickupAllowed) exclusions.push('pickup_forbidden');
+      if (parent !== null && !rowBoolean(row, 'parent_exists'))
+        exclusions.push('orphan_parent_station');
+      const normalizedStop: NormalizedTransitStop = Object.freeze({
+        stopId,
+        stopCode: stopRow['stop_code']?.trim() || stopId,
+        name: stopRow['stop_name']?.trim() || stopId,
+        latitude,
+        longitude,
+        locationType: Number.isInteger(locationType) ? locationType : -1,
+        parentStation: parent,
+        platformCode: stopRow['platform_code']?.trim() || null,
+        boardable: locationBoardable && pickupAllowed,
+        pickupAllowedOnSelectedDate: pickupAllowed,
+        dropOffAllowedOnSelectedDate: dropOffAllowed,
+        activeOnSelectedDate: active,
+        routeIds: Object.freeze([...routeIds].sort()),
+        serviceIds: Object.freeze([...serviceIds].sort()),
+        exclusionReasons: Object.freeze(exclusions.sort()),
+      });
+      if (latitude !== null && longitude !== null) {
+        const parentStopId =
+          parent === null
+            ? null
+            : `sc:entity:transit-stop:${sha256(`${config.agencyId}|${parent}`)}`;
+        const core = {
+          agencyId: config.agencyId,
+          stopCode: normalizedStop.stopCode,
+          name: normalizedStop.name,
+          location: { type: 'Point' as const, coordinates: [longitude, latitude] },
+          parentStopId,
+          boardable: normalizedStop.boardable,
+          serviceIds: Object.freeze([...canonicalServiceIds].sort()),
+        };
+        const entityId = `sc:entity:transit-stop:${sha256(`${config.agencyId}|${stopId}`)}`;
+        const entity = {
+          id: entityId,
+          entityKind: 'transit-stop' as const,
+          version: 1,
+          validFrom: config.retrievedAt,
+          validTo: null,
+          recordedAt: config.retrievedAt,
+          visibility: config.visibility,
+          sourceIds: [config.sourceId],
+          lineage: [entityLineage(baseFeed, config, `stops.txt:${stopId}`, normalizedStop, core)],
+          ...core,
+        };
+        yield canonicalMutationSchema.parse({
+          kind: 'entity_upsert',
+          mutationId: `sc:mutation:${sha256(`${feed.artifactId}|stop|${entityId}`)}`,
+          runId,
+          sourceId: config.sourceId,
+          snapshotId,
+          sequence: sequence++,
+          emittedAt: config.retrievedAt,
+          visibility: config.visibility,
+          entity,
+        });
+      }
+      lastStopId = rowString(row, 'page_key');
+      if (!result.truncated) break;
+    }
+  } finally {
+    await session[Symbol.asyncDispose]();
+  }
 }

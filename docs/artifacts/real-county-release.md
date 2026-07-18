@@ -214,9 +214,23 @@ out-of-memory condition near 4.14 GB. It therefore produced no accepted mart and
 checkpoint/artifact evidence remains under `.cache/oracle-real-county/f1/`.
 
 Do not relabel the pilot bundle as county completion. A blind larger-heap resume is not an accepted
-remedy because the current full path array-materializes acquired bytes and mutations; bounded-memory
-streaming or partitioned processing must be implemented and verified before retrying the uncapped
-profile.
+remedy. The incomplete v1 run now fails before reacquisition, and the v2 full profile stops before
+the still-unbounded reconciliation/feature/mart processor until a bounded replacement is composed
+and verified.
+
+The 2026-07-18 streaming foundation adds verified logical-key orphan recovery, bounded acquired
+artifact readers, per-yield durable acquisition replay, fresh-process finalization, one shared
+record/event permit budget, deterministic canonical chunk spill, and typed rejection of incomplete
+v1 checkpoints before reacquisition. Its full generated streaming-v2 runner stress completed
+1,000,000 decoded, normalized, and bounded-reconciliation-consumed mutations under a 512 MiB heap.
+The combined high-water equaled the configured 1,000 permits (active records 1, buffered events
+999), both current counters returned to zero, and peak V8 heap was 67,765,976 bytes. Its projected
+logical SHA-256 was `3c4381a7677cacc314aec5ab3ad489c46afd41cc5ff0365759d5d33cca195ffb`.
+This foundation does not alter, regenerate, or supersede p8. The accepted p8 manifest hashes,
+CID, row counts, privacy result, partial-pilot label, and no-county-completion result above remain
+exactly unchanged. The default county reconciliation/feature/mart processor is still guarded as
+small-run-only, so an uncapped full release remains blocked before that unbounded phase until a
+bounded streaming processor is composed and verified.
 
 ## Reproducible verification
 

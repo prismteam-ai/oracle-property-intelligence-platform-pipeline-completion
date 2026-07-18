@@ -106,7 +106,7 @@ For a protected 511 fallback URL, configure the frozen `feeds` contract and an `
 
 Every HTTP request carries the configured `runtime.requestTimeoutMs` abort bound (30 seconds by default). A timeout fails or partially completes only that source lane according to its durable progress; other source workers continue.
 
-CA SOS requires an operator-frozen bulk artifact URL, source-as-of instant, expected SHA-256, expected record count, source version, encoding, and source-lock contract. OSM requires a dated extract URL with exact SHA-256 and a workspace-relative decoder module exporting `decoder` or `createDecoder()`. Absolute decoder paths and relative paths that escape the resolved workspace are rejected before import.
+CA SOS requires an operator-frozen bulk artifact URL, source-as-of instant, expected SHA-256, expected record count, source version, encoding, and source-lock contract. OSM requires a dated extract URL with exact SHA-256 and a workspace-relative decoder module exporting `decoder` or `createDecoder()`. The module must also export the exact versioned `oracleBoundedOsmDecoderContract` attestation for streaming-v2 input, network prohibition, whole-copy prohibition, deterministic node/way/relation ordering, and enforced blob/tag/reference/member limits. Absolute decoder paths and relative paths that escape the resolved workspace are rejected before import.
 
 ## Identities, checkpoints, and release handoff
 
@@ -132,6 +132,65 @@ The accepted final-code bounded pilot is `p7` under `.cache/oracle-real-county/`
 `p5` is immutable but superseded because its 30-second live NOAA request timed out before acquisition. `p6` is immutable but superseded because its operator-supplied `requestedAt` was later than its wall-clock completion. `p7` used the same pilot item/record bounds with a secret-free 120-second request timeout. Its requested instant, `2026-07-17T21:29:36.037Z`, precedes its completion at `2026-07-17T21:30:33.928Z`. The NOAA lane completed with 50 accepted records and the same source aggregate hash proven in `p6`. The exact previously preserved NOAA archive also passed the corrected strict CRS decoder with 1,880 unique clipped features.
 
 The uncapped `f1` evidence remains the terminal full-run resource result: it ended before `build_marts` with a fatal Node heap OOM near 4.14 GB. It has no full mart, portable release, or county-completion claim.
+
+## Streaming recovery contract (implementation v2)
+
+The pipeline foundation now freezes source-adapter contract `2.0.0` for county-scale lanes. A v2
+adapter returns an acquired-artifact reference containing the exact byte length, SHA-256, raw URI,
+and a repeatable bounded async reader. HTTP bodies can be passed directly to
+`putImmutableStreaming`, which applies store backpressure while computing size and SHA-256 and
+enforcing the adapter's byte ceiling. `headByLogicalKey` verifies confined canonical metadata and
+the complete stored hash before a write-before-checkpoint orphan can be adopted; immutable write
+conflicts remain errors.
+
+Acquisition progress is committed after every yielded reference as a canonical chunk. On restart,
+`acquire()` re-emits the exact deterministic prefix; the runner verifies it byte-for-byte, skips
+network writes for that prefix, and appends only new references. Omitted, reordered, or changed
+prefixes fail with `ACQUISITION_REPLAY_INCOMPATIBLE`. Finalization receives only repeatable durable
+acquired-artifact sources, so a fresh process reconstructs output without adapter-local arrays.
+The fetch transport uses manual redirects and rejects every 3xx response instead of silently
+crossing an origin or media contract.
+
+Decode, validation, normalization fan-out, and retained canonical events use one process-wide
+`maxBufferedRecords` permit pool. An active decoded record holds one permit through validation,
+all normalization outputs, and `record_complete`; buffered events use permits from the same pool.
+On pressure a writer flushes its prefix, or immediately flushes an event under its active record's
+already-counted permit at the boundary of one. The manifest records PII-free active-record,
+buffered-event, and combined permit high-waters plus zero-at-completion counters.
+Canonical NDJSON chunks bind schema version, logical key, record interval/count, chunk SHA-256,
+ordered logical SHA-256, visibility, and license reference. Resume verifies every checkpointed
+chunk by logical key and hash, rejects missing/corrupt/duplicate/non-contiguous references, and
+adopts only a byte-identical orphan. Each normalization chunk reference atomically records the
+PII-free artifact/record/issue/mutation cursor, including a mid-record fan-out offset, so restart
+re-decodes only the interrupted logical record and skips already committed outputs. Incomplete
+orchestration-v1 checkpoints, including `f1`, fail
+with `LEGACY_INCOMPLETE_CHECKPOINT` before reacquisition. A finalized v1 manifest remains readable.
+The v1 whole-copy adapter path is retained only for fixtures and reviewed tiny or blocked
+capability lanes: each artifact is capped before copying at 1 MiB and each observation sequence at
+10,000 values. The nine county-scale production lanes use v2; an over-bound legacy lane fails
+without weakening those streaming contracts.
+
+Analytical decode never treats a raw Parquet or ZIP as snapshot-manifest bytes. Snapshot binding
+uses a separately stored, versioned derived JSON manifest capped at 1 MiB. The runtime preallocates
+only that verified length, validates its SHA-256 and operation scan budgets, and independently
+verifies every listed query-data artifact by URI, byte length, and SHA-256 before its confined
+physical URI is passed to DuckDB.
+
+The current default reducer/linker/feature/mart processor is explicitly marked
+`small_run_only_v1`. A `full` profile stops with `UNBOUNDED_COUNTY_PHASE` before reconciliation
+unless composition supplies a `bounded_streaming_v2` processor. This is a truthful safety gate, not
+a county-completion result. It preserves the existing pilot behavior while the partitioned
+reconciliation and downstream county processor are completed.
+
+The full generated streaming-v2 runner stress was run on 2026-07-18 with
+`node --max-old-space-size=512`. It completed 1,000,000 decoded records, 1,000,000 normalized
+mutations, and 1,000,000 mutations consumed by bounded reconciliation. The configured and combined
+permit high-water was 1,000; active-record high-water was 1, buffered-event high-water was 999,
+and both counters returned to zero. Peak observed V8 heap was 67,765,976 bytes. The projected
+logical SHA-256 was
+`3c4381a7677cacc314aec5ab3ad489c46afd41cc5ff0365759d5d33cca195ffb`; source terminal state was
+`complete` with coverage ratio 1. Metrics contain only counts, bounds, heap bytes, state, coverage,
+and hashes; no source row is logged.
 
 The accepted owner-free serving recovery is `p8-public-serving`. Its verification bundle proves 19
 real APN-grain properties, 114 evidence rows, all seven required public relations, zero prohibited

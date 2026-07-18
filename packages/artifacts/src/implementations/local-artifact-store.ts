@@ -9,8 +9,9 @@ import {
   assertArtifactByteRange,
   assertSha256,
   type ArtifactByteRange,
-  type ArtifactStore,
   type ImmutableArtifactWrite,
+  type RecoverableArtifactStore,
+  type StreamingImmutableArtifactWrite,
   type StoredArtifact,
 } from '../artifact-store.js';
 import {
@@ -24,7 +25,7 @@ import {
 
 type LocalRecord = StoredArtifact & Readonly<{ formatVersion: 1 }>;
 
-export class LocalArtifactStore implements ArtifactStore {
+export class LocalArtifactStore implements RecoverableArtifactStore {
   readonly #root: string;
   readonly #now: () => string;
 
@@ -34,8 +35,14 @@ export class LocalArtifactStore implements ArtifactStore {
   }
 
   public async putImmutable(request: ImmutableArtifactWrite): Promise<StoredArtifact> {
+    return this.putImmutableStreaming(request);
+  }
+
+  public async putImmutableStreaming(
+    request: StreamingImmutableArtifactWrite,
+  ): Promise<StoredArtifact> {
     assertLogicalKey(request.logicalKey);
-    assertSha256(request.expectedSha256);
+    if (request.expectedSha256 !== undefined) assertSha256(request.expectedSha256);
     if (request.mediaType.trim().length === 0)
       throw new TypeError('Artifact mediaType is required');
 
@@ -51,7 +58,7 @@ export class LocalArtifactStore implements ArtifactStore {
       });
       output.end();
       await finished(output);
-      if (measured.sha256 !== request.expectedSha256) {
+      if (request.expectedSha256 !== undefined && measured.sha256 !== request.expectedSha256) {
         throw new ArtifactIntegrityError(
           `Artifact SHA-256 mismatch: expected ${request.expectedSha256}, received ${measured.sha256}`,
         );
@@ -100,6 +107,21 @@ export class LocalArtifactStore implements ArtifactStore {
     const bodyStat = await stat(bodyPath);
     if (!bodyStat.isFile() || bodyStat.size !== record.byteSize) {
       throw new ArtifactIntegrityError(`Artifact content-length mismatch for ${uri}`);
+    }
+    return record;
+  }
+
+  public async headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined> {
+    assertLogicalKey(logicalKey);
+    const uri = pathToFileURL(join(this.#directoryFor(logicalKey), 'body')).href;
+    const record = await this.head(uri);
+    if (record === undefined) return undefined;
+    if (record.logicalKey !== logicalKey) {
+      throw new ArtifactIntegrityError(`Artifact logical-key metadata mismatch for ${logicalKey}`);
+    }
+    for await (const chunk of this.read(uri)) {
+      // A complete read performs byte-length and SHA-256 verification without retaining the body.
+      void chunk;
     }
     return record;
   }

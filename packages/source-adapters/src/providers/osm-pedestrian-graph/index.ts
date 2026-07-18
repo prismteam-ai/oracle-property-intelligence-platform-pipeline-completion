@@ -1,5 +1,6 @@
 export { createOsmPedestrianGraphAdapter, OsmPedestrianGraphAdapter } from './adapter.js';
 export type { OsmPedestrianGraphAdapterOptions } from './adapter.js';
+export { oracleBoundedOsmDecoderContract } from './types.js';
 export {
   GEOFABRIK_NORCAL_260715_DISTRIBUTOR_IDENTITY,
   OSM_ATTRIBUTION,
@@ -18,12 +19,15 @@ export {
   osmPedestrianSemantics,
 } from './graph.js';
 export type {
+  BoundedOsmDecoderContract,
   OsmDecodedElement,
   OsmDecodedNode,
   OsmDecodedRelation,
   OsmDecodedRelationMember,
   OsmDecodedWay,
   OsmPbfDecoder,
+  OsmPbfDecoderModule,
+  OsmPbfDecodeLimits,
   OsmPedestrianDecodedRecord,
   PedestrianAccess,
   PedestrianDirection,

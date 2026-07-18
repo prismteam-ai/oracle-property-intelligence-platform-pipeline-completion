@@ -10,7 +10,7 @@ import {
 
 const HASH = 'a'.repeat(64);
 
-function descriptor(slug: string, contractVersion = '1.0.0'): SourceDescriptor {
+function descriptor(slug: string, contractVersion = '2.0.0'): SourceDescriptor {
   return sourceDescriptorSchema.parse({
     sourceId: sourceIdSchema.parse(`sc:source:${slug}`),
     contractVersion,
@@ -87,8 +87,9 @@ describe('source adapter registry', () => {
   });
 
   it('rejects malformed and unsupported contract versions', () => {
-    const registry = new SourceAdapterRegistry();
-    expect(() => registry.register(registration(descriptor('parcels', '2.0.0')))).toThrow(
+    const registry = new SourceAdapterRegistry(['1.0.0', '2.0.0']);
+    expect(() => registry.register(registration(descriptor('streaming', '2.0.0')))).not.toThrow();
+    expect(() => registry.register(registration(descriptor('parcels', '3.0.0')))).toThrow(
       UnsupportedSourceContractVersionError,
     );
     const malformed: SourceDescriptor = {

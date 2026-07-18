@@ -16,8 +16,9 @@ import {
   assertArtifactByteRange,
   assertSha256,
   type ArtifactByteRange,
-  type ArtifactStore,
   type ImmutableArtifactWrite,
+  type RecoverableArtifactStore,
+  type StreamingImmutableArtifactWrite,
   type StoredArtifact,
 } from '../artifact-store.js';
 import {
@@ -34,7 +35,7 @@ const KEY_METADATA = 'oracle-logical-key';
 const USER_METADATA = 'oracle-user-metadata';
 const STORED_AT_METADATA = 'oracle-stored-at';
 
-export class S3ArtifactStore implements ArtifactStore {
+export class S3ArtifactStore implements RecoverableArtifactStore {
   readonly #client: S3Client;
   readonly #bucket: string;
   readonly #prefix: string;
@@ -60,9 +61,15 @@ export class S3ArtifactStore implements ArtifactStore {
   }
 
   public async putImmutable(request: ImmutableArtifactWrite): Promise<StoredArtifact> {
+    return this.putImmutableStreaming(request);
+  }
+
+  public async putImmutableStreaming(
+    request: StreamingImmutableArtifactWrite,
+  ): Promise<StoredArtifact> {
     this.#throwIfAborted();
     assertLogicalKey(request.logicalKey);
-    assertSha256(request.expectedSha256);
+    if (request.expectedSha256 !== undefined) assertSha256(request.expectedSha256);
     const metadata = cloneMetadata(request.metadata);
     await mkdir(this.#spool, { recursive: true });
     const temporaryDirectory = await mkdtemp(join(this.#spool, '.oracle-s3-'));
@@ -76,7 +83,7 @@ export class S3ArtifactStore implements ArtifactStore {
         position += chunk.byteLength;
       });
       await handle.sync();
-      if (measured.sha256 !== request.expectedSha256) {
+      if (request.expectedSha256 !== undefined && measured.sha256 !== request.expectedSha256) {
         throw new ArtifactIntegrityError(
           `Artifact SHA-256 mismatch: expected ${request.expectedSha256}, received ${measured.sha256}`,
         );
@@ -163,7 +170,7 @@ export class S3ArtifactStore implements ArtifactStore {
     ) {
       throw new ArtifactIntegrityError(`Invalid S3 user metadata for ${uri}`);
     }
-    return Object.freeze({
+    const record = Object.freeze({
       logicalKey,
       uri,
       mediaType: response.ContentType,
@@ -172,6 +179,23 @@ export class S3ArtifactStore implements ArtifactStore {
       storedAt,
       metadata: cloneMetadata(parsedMetadata as Record<string, string>),
     });
+    if (this.#key(record.logicalKey) !== key) {
+      throw new ArtifactIntegrityError(`S3 logical-key metadata mismatch for ${uri}`);
+    }
+    return record;
+  }
+
+  public async headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined> {
+    assertLogicalKey(logicalKey);
+    const key = this.#key(logicalKey);
+    const uri = `s3://${this.#bucket}/${key}`;
+    const record = await this.head(uri);
+    if (record === undefined) return undefined;
+    for await (const chunk of this.read(uri)) {
+      // A complete read performs byte-length and SHA-256 verification without retaining the body.
+      void chunk;
+    }
+    return record;
   }
 
   public async *read(uri: string, range?: ArtifactByteRange): AsyncIterable<Uint8Array> {
@@ -223,7 +247,12 @@ export class S3ArtifactStore implements ArtifactStore {
     if (url.protocol !== 's3:' || url.hostname !== this.#bucket)
       throw new TypeError('S3 URI does not belong to this store');
     const key = decodeURIComponent(url.pathname.slice(1));
-    if (this.#prefix.length > 0 && !key.startsWith(`${this.#prefix}/`))
+    if (
+      key.length === 0 ||
+      key.includes('\\') ||
+      key.split('/').some((part) => part.length === 0 || part === '.' || part === '..') ||
+      (this.#prefix.length > 0 && !key.startsWith(`${this.#prefix}/`))
+    )
       throw new TypeError('S3 URI escapes configured prefix');
     return key;
   }

@@ -4,8 +4,9 @@ import { readFile } from 'node:fs/promises';
 import type {
   ArtifactBody,
   ArtifactByteRange,
-  ArtifactStore,
   ImmutableArtifactWrite,
+  RecoverableArtifactStore,
+  StreamingImmutableArtifactWrite,
   StoredArtifact,
 } from '@oracle/artifacts/artifact-store';
 import type {
@@ -81,13 +82,21 @@ async function collect(body: ArtifactBody): Promise<Uint8Array> {
   return joined;
 }
 
-export class TestArtifactStore implements ArtifactStore {
+export class TestArtifactStore implements RecoverableArtifactStore {
   readonly #byUri = new Map<string, Readonly<{ stored: StoredArtifact; bytes: Uint8Array }>>();
 
   public async putImmutable(request: ImmutableArtifactWrite): Promise<StoredArtifact> {
+    return this.putImmutableStreaming(request);
+  }
+
+  public async putImmutableStreaming(
+    request: StreamingImmutableArtifactWrite,
+  ): Promise<StoredArtifact> {
     const bytes = await collect(request.body);
     const actual = createHash('sha256').update(bytes).digest('hex');
-    if (actual !== request.expectedSha256) throw new Error('test artifact SHA mismatch');
+    if (request.expectedSha256 !== undefined && actual !== request.expectedSha256) {
+      throw new Error('test artifact SHA mismatch');
+    }
     const uri = `file:///test-artifacts/${encodeURIComponent(request.logicalKey)}`;
     if (this.#byUri.has(uri)) throw new Error('immutable artifact conflict');
     const stored: StoredArtifact = Object.freeze({
@@ -106,6 +115,11 @@ export class TestArtifactStore implements ArtifactStore {
   public async head(uri: string): Promise<StoredArtifact | undefined> {
     await Promise.resolve();
     return this.#byUri.get(uri)?.stored;
+  }
+
+  public async headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined> {
+    await Promise.resolve();
+    return [...this.#byUri.values()].find(({ stored }) => stored.logicalKey === logicalKey)?.stored;
   }
 
   public async *read(uri: string, range?: ArtifactByteRange): AsyncIterable<Uint8Array> {
@@ -280,7 +294,7 @@ function sourceCheckpointShape(): SourceCheckpoint {
   return {
     sourceId: OVERTURE_STARBUCKS_DESCRIPTOR.sourceId,
     snapshotId: SNAPSHOT_ID,
-    contractVersion: '1.0.0',
+    contractVersion: '2.0.0',
     cursor: 'complete',
     nextSequence: 1,
     completedRequestKeys: ['overture-2026-06-17.0-santa-clara-fragment'],

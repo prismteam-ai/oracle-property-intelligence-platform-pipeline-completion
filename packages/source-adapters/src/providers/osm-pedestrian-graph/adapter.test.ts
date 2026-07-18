@@ -4,9 +4,10 @@ import { readFile } from 'node:fs/promises';
 import type {
   ArtifactBody,
   ArtifactByteRange,
-  ArtifactStore,
   ImmutableArtifactWrite,
+  RecoverableArtifactStore,
   StoredArtifact,
+  StreamingImmutableArtifactWrite,
 } from '@oracle/artifacts/artifact-store';
 import type {
   CheckpointCommit,
@@ -25,14 +26,16 @@ import { runIdSchema } from '@oracle/contracts/ids';
 import { describe, expect, it } from 'vitest';
 
 import type {
-  AcquisitionContext,
-  DecodeContext,
   DiscoveryContext,
   PlanningContext,
-  SourceRunObservation,
+  SourceRunObservationV2,
+  StreamingAcquisitionContext,
+  StreamingDecodeContext,
 } from '../../spi/adapter.js';
+import type { StreamingArtifactContentV2 } from '../../spi/acquired-artifact.js';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../../spi/http.js';
 import { sha256Hex } from '../../spi/bytes.js';
+import { createSharedRecordBudget } from '../../spi/record-budget.js';
 import { createOsmPedestrianGraphAdapter } from './adapter.js';
 import {
   GEOFABRIK_NORCAL_260715_DISTRIBUTOR_IDENTITY,
@@ -41,8 +44,10 @@ import {
   OSM_PEDESTRIAN_GRAPH_SOURCE_ID,
 } from './constants.js';
 import { createPedestrianGraphReferenceMutation, normalizeOsmPedestrianGraph } from './graph.js';
+import { oracleBoundedOsmDecoderContract } from './index.js';
 import type {
   OsmDecodedElement,
+  OsmPbfDecodeLimits,
   OsmPbfDecoder,
   PinnedOsmExtract,
   ValidatedOsmElement,
@@ -117,17 +122,27 @@ class FixtureDecoder implements OsmPbfDecoder {
   readonly #elements: readonly OsmDecodedElement[];
   readonly seenByteHashes: string[] = [];
   readonly signals: AbortSignal[] = [];
+  readonly limits: OsmPbfDecodeLimits[] = [];
+  readonly emitted: OsmDecodedElement[] = [];
 
   public constructor(elements: readonly OsmDecodedElement[]) {
     this.#elements = elements;
   }
 
-  public async *decode(bytes: Uint8Array, signal: AbortSignal): AsyncIterable<OsmDecodedElement> {
-    this.seenByteHashes.push(sha256Hex(bytes));
+  public async *decode(
+    content: StreamingArtifactContentV2,
+    signal: AbortSignal,
+    limits: OsmPbfDecodeLimits,
+  ): AsyncIterable<OsmDecodedElement> {
+    const hash = createHash('sha256');
+    for await (const chunk of content.read({ maxChunkBytes: 7 })) hash.update(chunk);
+    this.seenByteHashes.push(hash.digest('hex'));
     this.signals.push(signal);
+    this.limits.push(limits);
     for (const element of this.#elements) {
       signal.throwIfAborted();
       await Promise.resolve();
+      this.emitted.push(element);
       yield element;
     }
   }
@@ -182,13 +197,25 @@ async function collectArtifactBody(body: ArtifactBody): Promise<Uint8Array> {
   return new Uint8Array(Buffer.concat(chunks));
 }
 
-class TestArtifactStore implements ArtifactStore {
+class TestArtifactStore implements RecoverableArtifactStore {
   readonly values = new Map<string, Readonly<{ descriptor: StoredArtifact; bytes: Uint8Array }>>();
 
   public async putImmutable(request: ImmutableArtifactWrite): Promise<StoredArtifact> {
+    return this.#put(request);
+  }
+
+  public async putImmutableStreaming(
+    request: StreamingImmutableArtifactWrite,
+  ): Promise<StoredArtifact> {
+    return this.#put(request);
+  }
+
+  async #put(request: StreamingImmutableArtifactWrite): Promise<StoredArtifact> {
     const bytes = await collectArtifactBody(request.body);
     const sha256 = sha256Hex(bytes);
-    if (sha256 !== request.expectedSha256) throw new Error('test store integrity failure');
+    if (request.expectedSha256 !== undefined && sha256 !== request.expectedSha256) {
+      throw new Error('test store integrity failure');
+    }
     const descriptor = Object.freeze({
       logicalKey: request.logicalKey,
       uri: `file:///oracle-test/${encodeURIComponent(request.logicalKey)}`,
@@ -204,6 +231,13 @@ class TestArtifactStore implements ArtifactStore {
 
   public head(uri: string): Promise<StoredArtifact | undefined> {
     return Promise.resolve(this.values.get(uri)?.descriptor);
+  }
+
+  public headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined> {
+    return Promise.resolve(
+      [...this.values.values()].find((item) => item.descriptor.logicalKey === logicalKey)
+        ?.descriptor,
+    );
   }
 
   public async *read(uri: string, range?: ArtifactByteRange): AsyncIterable<Uint8Array> {
@@ -271,11 +305,11 @@ function planningContext(signal = new AbortController().signal): PlanningContext
 
 function acquisitionContext(
   http: HttpTransport,
-  artifactStore: ArtifactStore,
+  artifactStore: RecoverableArtifactStore,
   checkpointStore: CheckpointStore,
   signal = new AbortController().signal,
   delays: number[] = [],
-): AcquisitionContext {
+): StreamingAcquisitionContext {
   return {
     ...discoveryContext(http, signal, delays),
     artifactStore,
@@ -283,12 +317,13 @@ function acquisitionContext(
   };
 }
 
-function phaseContext(signal = new AbortController().signal): DecodeContext {
+function phaseContext(signal = new AbortController().signal): StreamingDecodeContext {
   return {
     signal,
     clock,
-    artifactStore: {} as ArtifactStore,
-    analyticalRuntime: {} as DecodeContext['analyticalRuntime'],
+    artifactStore: {} as RecoverableArtifactStore,
+    analyticalRuntime: {} as StreamingDecodeContext['analyticalRuntime'],
+    recordBudget: createSharedRecordBudget(2),
   };
 }
 
@@ -352,6 +387,17 @@ function syntheticRecord(
     ordinal,
     recordSha256: createHash('sha256').update(JSON.stringify(element)).digest('hex'),
     element,
+  });
+}
+
+function observed<T>(values: readonly T[]) {
+  return Object.freeze({
+    count: values.length,
+    logicalSha256: sha256Hex(new TextEncoder().encode(JSON.stringify(values))),
+    read: async function* () {
+      await Promise.resolve();
+      for (const value of values) yield value;
+    },
   });
 }
 
@@ -475,8 +521,30 @@ describe('OSM pedestrian graph adapter', () => {
     )) {
       resumed.push(artifact);
     }
-    expect(resumed).toEqual([]);
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0]?.metadata.artifactId).toBe(ARTIFACT_ID);
     expect(resumedHttp.requests).toEqual([]);
+
+    const orphanCheckpoints = new TestCheckpointStore();
+    const adopted = [];
+    for await (const artifact of instance.acquire(
+      plan,
+      undefined,
+      acquisitionContext(new ScriptedHttp([]), artifacts, orphanCheckpoints),
+    )) {
+      adopted.push(artifact);
+    }
+    expect(adopted).toHaveLength(1);
+
+    await expect(async () => {
+      for await (const artifact of instance.acquire(
+        plan,
+        checkpoint,
+        acquisitionContext(new ScriptedHttp([]), new TestArtifactStore(), checkpoints),
+      )) {
+        void artifact;
+      }
+    }).rejects.toMatchObject({ code: 'RECONCILIATION' });
   });
 
   it('rejects byte-integrity mismatch and propagates abort before emission', async () => {
@@ -516,8 +584,29 @@ describe('OSM pedestrian graph adapter', () => {
 
   it('keeps PBF transport separate from the real decoded-record boundary', async () => {
     const { decoder, artifact, records } = await validatedOfficialRecords();
+    expect(oracleBoundedOsmDecoderContract).toEqual({
+      formatVersion: '1.0.0',
+      inputContract: 'StreamingArtifactContentV2',
+      noNetwork: true,
+      noWholeCopy: true,
+      deterministicOrdering: 'nodes_then_ways_then_relations_positive_id_version',
+      enforcedLimits: [
+        'maximumBlobBytes',
+        'maximumTagsPerElement',
+        'maximumWayNodeRefs',
+        'maximumRelationMembers',
+      ],
+    });
     expect(decoder.seenByteHashes).toEqual([PBF_SHA256]);
     expect(decoder.signals).toHaveLength(1);
+    expect(decoder.limits).toEqual([
+      {
+        maximumBlobBytes: 32 * 1024 * 1024,
+        maximumTagsPerElement: 4_096,
+        maximumWayNodeRefs: 65_536,
+        maximumRelationMembers: 65_536,
+      },
+    ]);
     expect(artifact.metadata.encoding).toBe('pbf');
     expect(records).toHaveLength(18);
     expect(records.filter(({ element }) => element.type === 'node')).toHaveLength(15);
@@ -525,6 +614,80 @@ describe('OSM pedestrian graph adapter', () => {
     expect(
       records.some(({ element }) => element.type === 'node' && element.tags.barrier === 'gate'),
     ).toBe(true);
+  });
+
+  it('enforces decoded tag/reference/member ceilings and propagates decoder abort cleanup', async () => {
+    const cases: readonly Readonly<{ element: OsmDecodedElement; message: string }>[] = [
+      {
+        element: {
+          type: 'node',
+          id: 1,
+          version: 1,
+          timestamp: AT,
+          latitude: 37.3,
+          longitude: -122.1,
+          tags: Object.fromEntries(
+            Array.from({ length: 4_097 }, (_, index) => [`tag-${index}`, 'value']),
+          ),
+        },
+        message: 'tag-count ceiling',
+      },
+      {
+        element: {
+          type: 'way',
+          id: 2,
+          version: 1,
+          timestamp: AT,
+          nodeRefs: Array.from({ length: 65_537 }, (_, index) => index + 1),
+          tags: {},
+        },
+        message: 'node-reference ceiling',
+      },
+      {
+        element: {
+          type: 'relation',
+          id: 3,
+          version: 1,
+          timestamp: AT,
+          members: Array.from({ length: 65_537 }, (_, index) => ({
+            type: 'node',
+            ref: index + 1,
+            role: '',
+          })),
+          tags: {},
+        },
+        message: 'member-count ceiling',
+      },
+    ];
+    for (const testCase of cases) {
+      const instance = adapter(new FixtureDecoder([testCase.element]));
+      const { artifact } = await acquireFixture(instance);
+      await expect(async () => {
+        for await (const record of instance.decode(artifact, phaseContext())) void record;
+      }).rejects.toThrow(testCase.message);
+    }
+
+    const controller = new AbortController();
+    let cleaned = false;
+    const abortingDecoder: OsmPbfDecoder = {
+      decode: async function* (content, signal) {
+        try {
+          for await (const chunk of content.read({ maxChunkBytes: 3 })) void chunk;
+          controller.abort(new Error('decoder stopped'));
+          signal.throwIfAborted();
+          yield* await Promise.resolve([] as OsmDecodedElement[]);
+        } finally {
+          cleaned = true;
+        }
+      },
+    };
+    const abortingAdapter = adapter(abortingDecoder);
+    const { artifact } = await acquireFixture(abortingAdapter);
+    await expect(async () => {
+      for await (const record of abortingAdapter.decode(artifact, phaseContext(controller.signal)))
+        void record;
+    }).rejects.toThrow('decoder stopped');
+    expect(cleaned).toBe(true);
   });
 
   it('deduplicates identical decoded elements and rejects conflicting duplicate IDs', async () => {
@@ -549,6 +712,66 @@ describe('OSM pedestrian graph adapter', () => {
         expect(unexpectedRecord.featureId).toBe(first.id);
       }
     }).rejects.toMatchObject({ code: 'SCHEMA_DRIFT' });
+  });
+
+  it('rejects a non-positive ordering separator before it can reset descending-order state', async () => {
+    const validTen: OsmDecodedElement = {
+      type: 'node',
+      id: 10,
+      version: 1,
+      timestamp: AT,
+      latitude: 37.394,
+      longitude: -122.076,
+      tags: {},
+    };
+    const invalidSeparator: OsmDecodedElement = { ...validTen, id: 0 };
+    const descendingFive: OsmDecodedElement = { ...validTen, id: 5 };
+    const decoder = new FixtureDecoder([validTen, invalidSeparator, descendingFive]);
+    const instance = adapter(decoder);
+    const { artifact } = await acquireFixture(instance);
+    const yieldedIds: unknown[] = [];
+    await expect(async () => {
+      for await (const record of instance.decode(artifact, phaseContext())) {
+        yieldedIds.push(record.element.id);
+      }
+    }).rejects.toMatchObject({
+      code: 'SCHEMA_DRIFT',
+      message: 'OSM decoder emitted an unsupported element type or non-positive element ID',
+    });
+    expect(yieldedIds).toEqual([10]);
+    expect(decoder.emitted.map(({ id }) => id)).toEqual([10, 0]);
+  });
+
+  it('rejects an unsupported ordering separator before it can hide a conflicting duplicate', async () => {
+    const valid: OsmDecodedElement = {
+      type: 'node',
+      id: 10,
+      version: 1,
+      timestamp: AT,
+      latitude: 37.394,
+      longitude: -122.076,
+      tags: {},
+    };
+    const invalidSeparator = {
+      ...valid,
+      type: 'changeset',
+      id: 11,
+    } as unknown as OsmDecodedElement;
+    const conflictingDuplicate: OsmDecodedElement = { ...valid, version: 2 };
+    const decoder = new FixtureDecoder([valid, invalidSeparator, conflictingDuplicate]);
+    const instance = adapter(decoder);
+    const { artifact } = await acquireFixture(instance);
+    const yieldedVersions: unknown[] = [];
+    await expect(async () => {
+      for await (const record of instance.decode(artifact, phaseContext())) {
+        yieldedVersions.push(record.element.version);
+      }
+    }).rejects.toMatchObject({
+      code: 'SCHEMA_DRIFT',
+      message: 'OSM decoder emitted an unsupported element type or non-positive element ID',
+    });
+    expect(yieldedVersions).toEqual([1]);
+    expect(decoder.emitted.map(({ type }) => type)).toEqual(['node', 'changeset']);
   });
 
   it('rejects malformed coordinates, tags, way references, and relation members', async () => {
@@ -913,7 +1136,7 @@ describe('OSM pedestrian graph adapter', () => {
     const checkpoint: SourceCheckpoint = sourceCheckpointSchema.parse({
       sourceId: OSM_PEDESTRIAN_GRAPH_SOURCE_ID,
       snapshotId: SNAPSHOT_ID,
-      contractVersion: '1.0.0',
+      contractVersion: '2.0.0',
       cursor: 'sequence:1',
       nextSequence: 1,
       completedRequestKeys: [TEST_EXTRACT.extractId],
@@ -921,7 +1144,7 @@ describe('OSM pedestrian graph adapter', () => {
       updatedAt: AT,
       complete: true,
     });
-    const run: SourceRunObservation = {
+    const run: SourceRunObservationV2 = {
       descriptor: instance.describe(),
       runId: RUN_ID,
       request: request(),
@@ -933,11 +1156,11 @@ describe('OSM pedestrian graph adapter', () => {
       decodedRecords: records.length,
       acceptedRecords: records.length,
       rejectedRecords: 0,
-      mutations,
-      validationIssues: [],
+      mutations: observed(mutations),
+      validationIssues: observed([]),
       aborted: false,
     };
-    expect(instance.summarize(run, phaseContext())).toMatchObject({
+    await expect(instance.summarize(run, phaseContext())).resolves.toMatchObject({
       status: 'succeeded',
       artifactsAcquired: 1,
       bytesAcquired: PBF_TRANSPORT_SENTINEL.byteLength,
@@ -946,6 +1169,8 @@ describe('OSM pedestrian graph adapter', () => {
       rejectedRecords: 0,
       visibilityCounts: { public: 1 },
     });
-    expect(() => instance.summarize({ ...run, decodedRecords: 17 }, phaseContext())).toThrow();
+    await expect(
+      instance.summarize({ ...run, decodedRecords: 17 }, phaseContext()),
+    ).rejects.toThrow();
   });
 });

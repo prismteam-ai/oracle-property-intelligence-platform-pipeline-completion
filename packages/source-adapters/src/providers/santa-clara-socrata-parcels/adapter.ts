@@ -1,4 +1,5 @@
 import { createCheckpointEnvelope } from '@oracle/artifacts/checkpoint-store';
+import type { StoredArtifact } from '@oracle/artifacts/artifact-store';
 import {
   canonicalMutationSchema,
   type CanonicalMutation,
@@ -11,6 +12,7 @@ import {
   acquiredArtifactSchema,
   sourceCheckpointSchema,
   sourceRunSummarySchema,
+  type AcquiredArtifact,
   type AcquisitionPlan,
   type AcquisitionRequest,
   type SourceAsOf,
@@ -21,19 +23,22 @@ import {
 } from '@oracle/contracts/source';
 
 import {
-  createAcquiredByteArtifact,
-  type AcquiredByteArtifact,
+  createStreamingAcquiredArtifact,
+  LegacyWholeCopyLimitError,
+  LEGACY_WHOLE_COPY_MAX_BYTES,
+  type AcquiredArtifactSource,
 } from '../../spi/acquired-artifact.js';
+import { persistAcquiredBody } from '../../spi/acquisition.js';
 import type {
-  AcquisitionContext,
-  DecodeContext,
   DiscoveryContext,
   DiscoveryResult,
   NormalizationContext,
   PlanningContext,
   RecordValidation,
-  SourceAdapter,
-  SourceRunObservation,
+  SourceRunObservationV2,
+  StreamingAcquisitionContext,
+  StreamingDecodeContext,
+  StreamingSourceAdapter,
   SummaryContext,
   ValidationContext,
 } from '../../spi/adapter.js';
@@ -58,15 +63,19 @@ import {
   type SantaClaraParcelDecodedRecord,
   type SantaClaraParcelValidatedRecord,
 } from './records.js';
+import { inspectGeoJsonEnvelope, streamJsonObjectArrayProperty } from './streaming-json.js';
 
 const ACCEPT_GEOJSON = 'application/geo+json, application/vnd.geo+json, application/json';
 const ACCEPT_JSON = 'application/json';
 const DEFAULT_PAGE_SIZE = 5_000;
 const MAX_PAGE_SIZE = 50_000;
+const DEFAULT_MAXIMUM_RESPONSE_BYTES = 128 * 1024 * 1024;
+const MAXIMUM_DISCOVERY_BYTES = 2 * 1024 * 1024;
 const TEXT_ENCODER = new TextEncoder();
 
 interface AdapterOptions {
   readonly pageSize?: number;
+  readonly maximumResponseBytes?: number;
 }
 
 interface RequestContext {
@@ -251,22 +260,25 @@ async function requestWithRetry(
   );
 }
 
-async function collectBody(response: HttpResponse, signal: AbortSignal): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
+async function collectDiscoveryBody(
+  response: HttpResponse,
+  signal: AbortSignal,
+): Promise<Uint8Array> {
+  const bytes = new Uint8Array(MAXIMUM_DISCOVERY_BYTES);
   let byteLength = 0;
   for await (const chunk of response.body) {
     signal.throwIfAborted();
-    const copy = Uint8Array.from(chunk);
-    chunks.push(copy);
-    byteLength += copy.byteLength;
+    if (byteLength + chunk.byteLength > bytes.byteLength) {
+      throw sourceError(
+        'SCHEMA_DRIFT',
+        'Socrata discovery response exceeded its byte ceiling',
+        'discover',
+      );
+    }
+    bytes.set(chunk, byteLength);
+    byteLength += chunk.byteLength;
   }
-  const bytes = new Uint8Array(byteLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
+  return bytes.slice(0, byteLength);
 }
 
 function parseJson(bytes: Uint8Array, phase: string): unknown {
@@ -375,9 +387,101 @@ function isoHttpDate(value: string | undefined): string | null {
   return Number.isNaN(parsed.valueOf()) ? null : parsed.toISOString();
 }
 
-function visibilityCounts(mutations: readonly CanonicalMutation[]) {
+function artifactRead(artifact: AcquiredArtifactSource): AsyncIterable<Uint8Array> {
+  if (artifact.content !== undefined) return artifact.content.read({ maxChunkBytes: 64 * 1024 });
+  if (artifact.bytes.byteLength > LEGACY_WHOLE_COPY_MAX_BYTES) {
+    throw new LegacyWholeCopyLimitError(artifact.bytes.byteLength, LEGACY_WHOLE_COPY_MAX_BYTES);
+  }
+  return (async function* legacyFixture() {
+    await Promise.resolve();
+    yield artifact.bytes.copy();
+  })();
+}
+
+function acquiredMetadataFromStored(
+  plan: AcquisitionPlan,
+  item: AcquisitionPlan['items'][number],
+  stored: StoredArtifact,
+): AcquiredArtifact {
+  const metadata = stored.metadata;
+  if (
+    metadata.sourceId !== plan.sourceId ||
+    metadata.snapshotId !== plan.snapshotId ||
+    metadata.requestKey !== item.requestKey ||
+    metadata.sourceUrl !== item.url
+  ) {
+    throw sourceError(
+      'RECONCILIATION',
+      'Recovered Socrata page metadata does not match the immutable plan',
+      'acquire',
+      { requestKey: item.requestKey },
+    );
+  }
+  const retrievedAt = metadata.retrievedAt;
+  const attempt = Number(metadata.attempt);
+  const httpStatus = Number(metadata.httpStatus);
+  if (
+    retrievedAt === undefined ||
+    !Number.isSafeInteger(attempt) ||
+    attempt < 1 ||
+    !Number.isSafeInteger(httpStatus) ||
+    httpStatus < 200 ||
+    httpStatus >= 300 ||
+    !item.expectedMediaTypes.includes(stored.mediaType)
+  ) {
+    throw sourceError('RECONCILIATION', 'Recovered Socrata page metadata is invalid', 'acquire', {
+      requestKey: item.requestKey,
+    });
+  }
+  const lastModified = metadata.lastModified === '' ? null : isoHttpDate(metadata.lastModified);
+  if (metadata.lastModified !== '' && lastModified === null) {
+    throw sourceError('RECONCILIATION', 'Recovered Last-Modified metadata is invalid', 'acquire');
+  }
+  return acquiredArtifactSchema.parse({
+    artifactId: `sc:artifact:sha256:${stored.sha256}` as ArtifactId,
+    sourceId: plan.sourceId,
+    snapshotId: plan.snapshotId,
+    retrievedAt,
+    sourceAsOf:
+      lastModified === null
+        ? {
+            state: 'unknown',
+            reason: 'The page response did not include a valid Last-Modified header',
+          }
+        : { state: 'reported', at: lastModified },
+    request: {
+      requestKey: item.requestKey,
+      method: item.method,
+      url: item.url,
+      headers: [{ name: 'accept', valueSha256: sha256Hex(TEXT_ENCODER.encode(ACCEPT_GEOJSON)) }],
+      bodySha256: null,
+      attempt,
+    },
+    response: {
+      httpStatus,
+      etag: metadata.etag === '' ? null : metadata.etag,
+      lastModified,
+      finalUrl: metadata.finalUrl ?? item.url,
+    },
+    mediaType: stored.mediaType,
+    encoding: 'geojson',
+    byteSize: stored.byteSize,
+    sha256: stored.sha256,
+    schemaFingerprint: {
+      algorithm: 'sha256',
+      value: SANTA_CLARA_PARCELS_SCHEMA_FINGERPRINT,
+      schemaName: 'santa-clara-socrata-parcels-ubcd-cewv',
+      canonicalizationVersion: '2.0.0',
+    },
+    rawUri: stored.uri,
+    licenseSnapshotRef: SANTA_CLARA_PARCELS_DESCRIPTOR.license.licenseSnapshotId,
+    visibility: SANTA_CLARA_PARCELS_DESCRIPTOR.defaultVisibility,
+  });
+}
+
+async function visibilityCounts(mutations: SourceRunObservationV2['mutations']) {
   const counts = { public: 0, authenticated: 0, restricted: 0, prohibited_public: 0 };
-  for (const mutation of mutations) {
+  for await (const mutation of mutations.read()) {
     counts[mutation.visibility] += 1;
   }
   return counts;
@@ -457,17 +561,23 @@ function expectedRecordsFromPlan(plan: AcquisitionPlan): number {
   return expectedOffset;
 }
 
-export class SantaClaraSocrataParcelsAdapter implements SourceAdapter<
+export class SantaClaraSocrataParcelsAdapter implements StreamingSourceAdapter<
   SantaClaraParcelDecodedRecord,
   SantaClaraParcelValidatedRecord
 > {
   readonly #pageSize: number;
+  readonly #maximumResponseBytes: number;
   public constructor(options: AdapterOptions = {}) {
     const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
     if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > MAX_PAGE_SIZE) {
       throw new RangeError(`pageSize must be an integer between 1 and ${MAX_PAGE_SIZE}`);
     }
+    const maximumResponseBytes = options.maximumResponseBytes ?? DEFAULT_MAXIMUM_RESPONSE_BYTES;
+    if (!Number.isSafeInteger(maximumResponseBytes) || maximumResponseBytes < 1) {
+      throw new RangeError('maximumResponseBytes must be a positive safe integer');
+    }
     this.#pageSize = pageSize;
+    this.#maximumResponseBytes = maximumResponseBytes;
   }
 
   public describe(): SourceDescriptor {
@@ -481,13 +591,13 @@ export class SantaClaraSocrataParcelsAdapter implements SourceAdapter<
       context,
     );
     const metadata = parseMetadata(
-      parseJson(await collectBody(metadataResponse.response, context.signal), 'discover'),
+      parseJson(await collectDiscoveryBody(metadataResponse.response, context.signal), 'discover'),
     );
     const countEntries = await Promise.all(
       Object.entries(SANTA_CLARA_PARCELS_COUNT_URLS).map(async ([key, url]) => {
         const result = await requestWithRetry(url, ACCEPT_JSON, context);
         const count = parseCount(
-          parseJson(await collectBody(result.response, context.signal), 'discover'),
+          parseJson(await collectDiscoveryBody(result.response, context.signal), 'discover'),
           key,
         );
         return [key, count] as const;
@@ -598,11 +708,12 @@ export class SantaClaraSocrataParcelsAdapter implements SourceAdapter<
   public async *acquire(
     plan: AcquisitionPlan,
     checkpoint: SourceCheckpoint | undefined,
-    context: AcquisitionContext,
-  ): AsyncIterable<AcquiredByteArtifact> {
+    context: StreamingAcquisitionContext,
+  ): AsyncIterable<AcquiredArtifactSource> {
     if (plan.sourceId !== SANTA_CLARA_PARCELS_SOURCE_ID) {
       throw sourceError('RECORD_QUALITY', 'Acquisition plan belongs to another source', 'acquire');
     }
+    const orderedItems = [...plan.items].sort((left, right) => left.sequence - right.sequence);
     const scope = `source-adapter:${plan.snapshotId}`;
     let envelope = await context.checkpointStore.load(scope);
     const storedCheckpoint =
@@ -627,101 +738,102 @@ export class SantaClaraSocrataParcelsAdapter implements SourceAdapter<
     ) {
       throw sourceError('RECORD_QUALITY', 'Checkpoint does not belong to this plan', 'acquire');
     }
-    const completed = new Set(current?.completedRequestKeys ?? []);
-    const artifactIds = [...(current?.acquiredArtifactIds ?? [])];
-    const orderedItems = [...plan.items].sort((left, right) => left.sequence - right.sequence);
-    for (const item of orderedItems) {
-      context.signal.throwIfAborted();
-      if (completed.has(item.requestKey)) {
-        continue;
-      }
-      if (current !== undefined && item.sequence < current.nextSequence) {
-        throw sourceError('RECONCILIATION', 'Checkpoint skipped an uncommitted page', 'acquire', {
-          requestKey: item.requestKey,
-          nextSequence: current.nextSequence,
-        });
-      }
-      const { response, attempt } = await requestWithRetry(item.url, ACCEPT_GEOJSON, context);
-      const mediaType = header(response.headers, 'content-type')?.split(';', 1)[0]?.trim() ?? '';
-      if (!item.expectedMediaTypes.includes(mediaType)) {
-        throw sourceError('SCHEMA_DRIFT', 'Socrata page media type changed', 'acquire', {
-          requestKey: item.requestKey,
-          mediaType,
-        });
-      }
-      const bytes = await collectBody(response, context.signal);
-      const sha256 = sha256Hex(bytes);
-      const stored = await context.artifactStore.putImmutable({
-        logicalKey: `raw/santa-clara-socrata-parcels/${plan.snapshotId}/${String(item.sequence).padStart(6, '0')}/${sha256}.geojson`,
-        mediaType,
-        body: bytes,
-        expectedSha256: sha256,
-        metadata: Object.freeze({
-          sourceId: plan.sourceId,
-          snapshotId: plan.snapshotId,
-          requestKey: item.requestKey,
-          sourceUrl: item.url,
-        }),
-        ifAbsent: true,
-      });
-      if (stored.sha256 !== sha256 || stored.byteSize !== bytes.byteLength) {
+    if (current !== undefined) {
+      const expectedKeys = orderedItems
+        .slice(0, current.nextSequence)
+        .map((item) => item.requestKey);
+      if (
+        current.nextSequence > orderedItems.length ||
+        current.completedRequestKeys.length !== current.nextSequence ||
+        current.acquiredArtifactIds.length > current.nextSequence ||
+        current.completedRequestKeys.some((key, index) => key !== expectedKeys[index]) ||
+        current.complete !== (current.nextSequence === orderedItems.length)
+      ) {
         throw sourceError(
           'RECONCILIATION',
-          'Immutable artifact store returned mismatched metadata',
+          'Checkpoint does not describe an exact contiguous acquisition prefix',
           'acquire',
-          {
-            requestKey: item.requestKey,
-          },
+          { nextSequence: current.nextSequence },
         );
       }
-      const retrievedAt = context.clock.now();
-      const lastModified = isoHttpDate(header(response.headers, 'last-modified'));
-      const artifactId = `sc:artifact:sha256:${sha256}` as ArtifactId;
-      const metadata = acquiredArtifactSchema.parse({
-        artifactId,
-        sourceId: plan.sourceId,
-        snapshotId: plan.snapshotId,
-        retrievedAt,
-        sourceAsOf:
-          lastModified === null
-            ? {
-                state: 'unknown',
-                reason: 'The page response did not include a valid Last-Modified header',
-              }
-            : { state: 'reported', at: lastModified },
-        request: {
-          requestKey: item.requestKey,
-          method: item.method,
-          url: item.url,
-          headers: [
-            { name: 'accept', valueSha256: sha256Hex(TEXT_ENCODER.encode(ACCEPT_GEOJSON)) },
-          ],
-          bodySha256: null,
-          attempt,
-        },
-        response: {
-          httpStatus: response.status,
-          etag: header(response.headers, 'etag') ?? null,
-          lastModified,
-          finalUrl: item.url,
-        },
-        mediaType,
-        encoding: 'geojson',
-        byteSize: bytes.byteLength,
-        sha256,
-        schemaFingerprint: {
-          algorithm: 'sha256',
-          value: SANTA_CLARA_PARCELS_SCHEMA_FINGERPRINT,
-          schemaName: 'santa-clara-socrata-parcels-ubcd-cewv',
-          canonicalizationVersion: '1.0.0',
-        },
-        rawUri: stored.uri,
-        licenseSnapshotRef: SANTA_CLARA_PARCELS_DESCRIPTOR.license.licenseSnapshotId,
-        visibility: SANTA_CLARA_PARCELS_DESCRIPTOR.defaultVisibility,
-      });
-      const artifact = createAcquiredByteArtifact(metadata, bytes);
+    }
+    const completed = new Set(current?.completedRequestKeys ?? []);
+    const artifactIds = [...(current?.acquiredArtifactIds ?? [])];
+    const recoveredArtifactIds: SourceCheckpoint['acquiredArtifactIds'][number][] = [];
+    for (const item of orderedItems) {
+      context.signal.throwIfAborted();
+      const wasCompleted = completed.has(item.requestKey);
+      const logicalKey = `raw/santa-clara-socrata-parcels/${plan.snapshotId}/${String(item.sequence).padStart(6, '0')}.geojson`;
+      let stored = await context.artifactStore.headByLogicalKey(logicalKey);
+      if (wasCompleted && stored === undefined) {
+        throw sourceError(
+          'RECONCILIATION',
+          'Checkpoint references a missing immutable page artifact',
+          'acquire',
+          { requestKey: item.requestKey, logicalKey },
+        );
+      }
+      if (stored === undefined) {
+        const { response, attempt } = await requestWithRetry(item.url, ACCEPT_GEOJSON, context);
+        const mediaType = header(response.headers, 'content-type')?.split(';', 1)[0]?.trim() ?? '';
+        if (!item.expectedMediaTypes.includes(mediaType)) {
+          throw sourceError('SCHEMA_DRIFT', 'Socrata page media type changed', 'acquire', {
+            requestKey: item.requestKey,
+            mediaType,
+          });
+        }
+        const retrievedAt = context.clock.now();
+        const lastModified = isoHttpDate(header(response.headers, 'last-modified'));
+        stored = await persistAcquiredBody({
+          store: context.artifactStore,
+          logicalKey,
+          mediaType,
+          body: response.body,
+          maximumBytes: this.#maximumResponseBytes,
+          metadata: Object.freeze({
+            sourceId: plan.sourceId,
+            snapshotId: plan.snapshotId,
+            requestKey: item.requestKey,
+            sourceUrl: item.url,
+            retrievedAt,
+            attempt: String(attempt),
+            httpStatus: String(response.status),
+            etag: header(response.headers, 'etag') ?? '',
+            lastModified: lastModified ?? '',
+            finalUrl: item.url,
+          }),
+          signal: context.signal,
+        });
+      }
+      const metadata = acquiredMetadataFromStored(plan, item, stored);
+      const artifact = await createStreamingAcquiredArtifact(metadata, context.artifactStore);
+      const artifactId = artifact.metadata.artifactId;
+      if (wasCompleted) {
+        if (!artifactIds.includes(artifactId)) {
+          throw sourceError(
+            'RECONCILIATION',
+            'Checkpoint artifact identity does not match the recovered immutable page',
+            'acquire',
+            { requestKey: item.requestKey, logicalKey },
+          );
+        }
+        if (!recoveredArtifactIds.includes(artifactId)) recoveredArtifactIds.push(artifactId);
+        if (
+          item.sequence + 1 === current?.nextSequence &&
+          (recoveredArtifactIds.length !== artifactIds.length ||
+            recoveredArtifactIds.some((candidate, index) => candidate !== artifactIds[index]))
+        ) {
+          throw sourceError(
+            'RECONCILIATION',
+            'Checkpoint artifact identities do not exactly match the recovered immutable prefix',
+            'acquire',
+          );
+        }
+        yield artifact;
+        continue;
+      }
       completed.add(item.requestKey);
-      artifactIds.push(artifactId);
+      if (!artifactIds.includes(artifactId)) artifactIds.push(artifactId);
       const nextSequence = item.sequence + 1;
       const nextCheckpoint = sourceCheckpointSchema.parse({
         sourceId: plan.sourceId,
@@ -735,7 +847,7 @@ export class SantaClaraSocrataParcelsAdapter implements SourceAdapter<
         nextSequence,
         completedRequestKeys: [...completed],
         acquiredArtifactIds: artifactIds,
-        updatedAt: context.clock.now(),
+        updatedAt: artifact.metadata.retrievedAt,
         complete: nextSequence >= orderedItems.length,
       });
       const nextEnvelope = createCheckpointEnvelope({
@@ -765,26 +877,23 @@ export class SantaClaraSocrataParcelsAdapter implements SourceAdapter<
   }
 
   public async *decode(
-    artifact: AcquiredByteArtifact,
-    context: DecodeContext,
+    artifact: AcquiredArtifactSource,
+    context: StreamingDecodeContext,
   ): AsyncIterable<SantaClaraParcelDecodedRecord> {
     context.signal.throwIfAborted();
-    await Promise.resolve();
-    const root = parseJson(artifact.bytes.copy(), 'decode');
-    if (!isObject(root) || root.type !== 'FeatureCollection' || !Array.isArray(root.features)) {
-      throw sourceError(
-        'SCHEMA_DRIFT',
-        'Socrata GeoJSON page is not a FeatureCollection',
-        'decode',
-      );
+    const envelope = await inspectGeoJsonEnvelope(artifactRead(artifact), context.signal);
+    if (envelope.type !== 'FeatureCollection' || envelope.crs !== SANTA_CLARA_PARCELS_CRS) {
+      throw sourceError('SCHEMA_DRIFT', 'Socrata GeoJSON envelope or CRS changed', 'decode', {
+        type: envelope.type,
+        crs: envelope.crs,
+      });
     }
-    const crs =
-      isObject(root.crs) &&
-      isObject(root.crs.properties) &&
-      typeof root.crs.properties.name === 'string'
-        ? root.crs.properties.name
-        : '';
-    for (const [ordinal, feature] of root.features.entries()) {
+    let ordinal = 0;
+    for await (const feature of streamJsonObjectArrayProperty(
+      artifactRead(artifact),
+      'features',
+      context.signal,
+    )) {
       context.signal.throwIfAborted();
       if (
         !isObject(feature) ||
@@ -830,9 +939,10 @@ export class SantaClaraSocrataParcelsAdapter implements SourceAdapter<
             : typeof objectId === 'number'
               ? String(objectId)
               : '',
-        crs,
+        crs: envelope.crs,
         rawFeatureSha256,
       });
+      ordinal += 1;
     }
   }
 
@@ -1033,20 +1143,29 @@ export class SantaClaraSocrataParcelsAdapter implements SourceAdapter<
     }
   }
 
-  public summarize(run: SourceRunObservation, context: SummaryContext): SourceRunSummary {
+  public async summarize(
+    run: SourceRunObservationV2,
+    context: SummaryContext,
+  ): Promise<SourceRunSummary> {
     context.signal.throwIfAborted();
     const expectedCount = expectedRecordsFromPlan(run.plan);
     const countMismatch = run.decodedRecords !== expectedCount;
-    const warningCount = run.validationIssues.filter(
-      (issue) => issue.severity === 'warning',
-    ).length;
-    const validationErrorCount = run.validationIssues.filter(
-      (issue) => issue.severity === 'error' || issue.severity === 'fatal',
-    ).length;
+    let warningCount = 0;
+    let validationErrorCount = 0;
+    let hasFatal = false;
+    for await (const issue of run.validationIssues.read()) {
+      context.signal.throwIfAborted();
+      if (issue.severity === 'warning') warningCount += 1;
+      else if (issue.severity === 'error') validationErrorCount += 1;
+      else {
+        validationErrorCount += 1;
+        hasFatal = true;
+      }
+    }
     const errorCount = validationErrorCount + (countMismatch ? 1 : 0);
     const status = run.aborted
       ? 'aborted'
-      : countMismatch || run.validationIssues.some((issue) => issue.severity === 'fatal')
+      : countMismatch || hasFatal
         ? 'failed'
         : run.rejectedRecords > 0 || validationErrorCount > 0 || !run.finalCheckpoint.complete
           ? 'partial'
@@ -1064,8 +1183,8 @@ export class SantaClaraSocrataParcelsAdapter implements SourceAdapter<
       decodedRecords: run.decodedRecords,
       acceptedRecords: run.acceptedRecords,
       rejectedRecords: run.rejectedRecords,
-      normalizedMutations: run.mutations.length,
-      visibilityCounts: visibilityCounts(run.mutations),
+      normalizedMutations: run.mutations.count,
+      visibilityCounts: await visibilityCounts(run.mutations),
       warningCount,
       errorCount,
       finalCheckpoint: run.finalCheckpoint,

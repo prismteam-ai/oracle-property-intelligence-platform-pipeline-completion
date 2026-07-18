@@ -6,7 +6,8 @@ export type SourceAdapterContractVersion = string & {
   readonly [sourceAdapterContractVersionBrand]: true;
 };
 
-export const SOURCE_ADAPTER_CONTRACT_VERSION = '1.0.0' as SourceAdapterContractVersion;
+export const SOURCE_ADAPTER_CONTRACT_VERSION = '2.0.0' as SourceAdapterContractVersion;
+export const LEGACY_SOURCE_ADAPTER_CONTRACT_VERSION = '1.0.0' as SourceAdapterContractVersion;
 
 export function parseSourceAdapterContractVersion(value: string): SourceAdapterContractVersion {
   if (!semverSchema.safeParse(value).success) {

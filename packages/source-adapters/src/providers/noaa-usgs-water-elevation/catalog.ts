@@ -68,7 +68,7 @@ function descriptor(input: {
   );
   return sourceDescriptorSchema.parse({
     sourceId,
-    contractVersion: '1.0.0',
+    contractVersion: '2.0.0',
     name: input.name,
     authority: {
       authorityType: 'official_government',

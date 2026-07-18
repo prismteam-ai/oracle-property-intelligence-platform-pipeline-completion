@@ -4,13 +4,15 @@ import { readFile } from 'node:fs/promises';
 import type {
   ArtifactBody,
   ImmutableArtifactWrite,
+  StreamingImmutableArtifactWrite,
   StoredArtifact,
 } from '@oracle/artifacts/artifact-store';
-import type {
-  CheckpointCommit,
-  CheckpointCommitResult,
-  CheckpointEnvelope,
-  CheckpointValue,
+import {
+  createCheckpointEnvelope,
+  type CheckpointCommit,
+  type CheckpointCommitResult,
+  type CheckpointEnvelope,
+  type CheckpointValue,
 } from '@oracle/artifacts/checkpoint-store';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
 import { runIdSchema } from '@oracle/contracts/ids';
@@ -23,12 +25,14 @@ import { describe, expect, it } from 'vitest';
 
 import { createAcquiredByteArtifact } from '../../spi/acquired-artifact.js';
 import type {
-  DecodeContext,
   DiscoveryResult,
   NormalizationContext,
+  RepeatableObservationValues,
+  StreamingDecodeContext,
   ValidationContext,
 } from '../../spi/adapter.js';
 import { sha256Hex } from '../../spi/bytes.js';
+import { createSharedRecordBudget } from '../../spi/record-budget.js';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../../spi/http.js';
 import {
   createSantaClaraSocrataParcelsAdapter,
@@ -156,6 +160,22 @@ class TestArtifactStore {
     return descriptor;
   }
 
+  public async putImmutableStreaming(
+    request: StreamingImmutableArtifactWrite,
+  ): Promise<StoredArtifact> {
+    const bytes = await bytesFromBody(request.body);
+    const sha256 = sha256Hex(bytes);
+    return this.putImmutable({
+      ...request,
+      body: bytes,
+      expectedSha256: request.expectedSha256 ?? sha256,
+    });
+  }
+
+  public async headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined> {
+    return Promise.resolve(this.#artifacts.get(logicalKey)?.descriptor);
+  }
+
   public async head(uri: string): Promise<StoredArtifact | undefined> {
     return Promise.resolve(
       [...this.#artifacts.values()].find(({ descriptor }) => descriptor.uri === uri)?.descriptor,
@@ -169,6 +189,10 @@ class TestArtifactStore {
       throw new Error(`missing artifact ${uri}`);
     }
     yield Uint8Array.from(artifact.bytes);
+  }
+
+  public deleteLogicalKey(logicalKey: string): void {
+    this.#artifacts.delete(logicalKey);
   }
 }
 
@@ -339,12 +363,24 @@ async function fixtureArtifact() {
   return createAcquiredByteArtifact(metadataValue, bytes);
 }
 
-function decodeContext(signal = new AbortController().signal): DecodeContext {
+function decodeContext(signal = new AbortController().signal): StreamingDecodeContext {
   return {
     clock: new FixedClock(),
     signal,
     artifactStore: new TestArtifactStore(),
     analyticalRuntime: { open: () => Promise.reject(new Error('not used')) },
+    recordBudget: createSharedRecordBudget(1),
+  };
+}
+
+function repeatable<T>(values: readonly T[]): RepeatableObservationValues<T> {
+  return {
+    count: values.length,
+    logicalSha256: sha256Hex(new TextEncoder().encode(JSON.stringify(values))),
+    read: async function* () {
+      await Promise.resolve();
+      for (const value of values) yield value;
+    },
   };
 }
 
@@ -452,7 +488,7 @@ describe('Santa Clara Socrata parcel adapter', () => {
     ]);
   });
 
-  it('resumes after a committed page and checkpoints each later immutable artifact before emission', async () => {
+  it('re-emits the exact committed prefix before acquiring later pages and supports zero-network restart', async () => {
     const fixture = new Uint8Array(await readFile(FIXTURE_URL));
     const secondPageFixture = new Uint8Array(fixture.byteLength + 1);
     secondPageFixture.set(fixture);
@@ -462,31 +498,49 @@ describe('Santa Clara Socrata parcel adapter', () => {
       clock: new FixedClock(),
       signal: new AbortController().signal,
     });
-    const pageOneId = `sc:artifact:sha256:${'c'.repeat(64)}`;
-    const checkpoint = sourceCheckpointSchema.parse({
-      sourceId: plan.sourceId,
-      snapshotId: plan.snapshotId,
-      contractVersion: plan.contractVersion,
-      cursor: 'page-000001',
+    const artifactStore = new TestArtifactStore();
+    const checkpointStore = new TestCheckpointStore();
+    const firstTransport = new RouteTransport({
+      [plan.items[0]?.url ?? 'missing-0']: [success(fixture, GEOJSON_HEADERS)],
+    });
+    const firstAcquisition = adapter.acquire(plan, undefined, {
+      ...baseContext(firstTransport),
+      artifactStore,
+      checkpointStore,
+    });
+    const firstIterator = firstAcquisition[Symbol.asyncIterator]();
+    const first = await firstIterator.next();
+    await firstIterator.return?.();
+    expect(first.done).toBe(false);
+    expect(first.value?.metadata.request.requestKey).toBe('page-000000');
+    expect(
+      sourceCheckpointSchema.parse(
+        (await checkpointStore.load(`source-adapter:${plan.snapshotId}`))?.payload,
+      ),
+    ).toMatchObject({
       nextSequence: 1,
       completedRequestKeys: ['page-000000'],
-      acquiredArtifactIds: [pageOneId],
-      updatedAt: '2026-07-17T13:00:00.000Z',
-      complete: false,
     });
+
     const transport = new RouteTransport({
+      // The second page deliberately has the same bytes/hash as the committed first page.
       [plan.items[1]?.url ?? 'missing-1']: [success(fixture, GEOJSON_HEADERS)],
       [plan.items[2]?.url ?? 'missing-2']: [success(secondPageFixture, GEOJSON_HEADERS)],
     });
-    const checkpointStore = new TestCheckpointStore();
     const context = {
       ...baseContext(transport),
-      artifactStore: new TestArtifactStore(),
+      artifactStore,
       checkpointStore,
     };
 
-    const artifacts = await collect(adapter.acquire(plan, checkpoint, context));
-    expect(artifacts).toHaveLength(2);
+    const artifacts = await collect(adapter.acquire(plan, undefined, context));
+    expect(artifacts).toHaveLength(3);
+    expect(artifacts.map((item) => item.metadata.request.requestKey)).toEqual([
+      'page-000000',
+      'page-000001',
+      'page-000002',
+    ]);
+    expect(artifacts[0]?.metadata.artifactId).toBe(artifacts[1]?.metadata.artifactId);
     expect(transport.requests.map((item) => new URL(item.url).searchParams.get('$offset'))).toEqual(
       ['2', '4'],
     );
@@ -495,14 +549,68 @@ describe('Santa Clara Socrata parcel adapter', () => {
       complete: true,
       nextSequence: 3,
       completedRequestKeys: ['page-000000', 'page-000001', 'page-000002'],
+      acquiredArtifactIds: [artifacts[0]?.metadata.artifactId, artifacts[2]?.metadata.artifactId],
     });
-    const firstCopy = artifacts[0]?.bytes.copy();
-    if (firstCopy === undefined) {
+    const recoveredFirst = artifacts[0];
+    if (recoveredFirst?.content === undefined) {
       throw new Error('expected resumed artifact');
     }
+    const firstCopy = await bytesFromBody(recoveredFirst.content.read());
     firstCopy[0] = 0;
-    expect(artifacts[0]?.bytes.sha256).toBe(artifacts[0]?.metadata.sha256);
-    expect(artifacts[0]?.bytes.copy()[0]).not.toBe(0);
+    expect(recoveredFirst.content.sha256).toBe(recoveredFirst.metadata.sha256);
+    expect((await bytesFromBody(recoveredFirst.content.read()))[0]).not.toBe(0);
+
+    const zeroNetwork = new RouteTransport({});
+    const restarted = await collect(
+      adapter.acquire(plan, undefined, {
+        ...baseContext(zeroNetwork),
+        artifactStore,
+        checkpointStore,
+      }),
+    );
+    expect(zeroNetwork.requests).toHaveLength(0);
+    expect(restarted.map((item) => item.metadata)).toEqual(artifacts.map((item) => item.metadata));
+
+    const reversedCheckpointStore = new TestCheckpointStore();
+    const persistedCheckpoint = sourceCheckpointSchema.parse(persisted?.payload);
+    const reversedCheckpoint = sourceCheckpointSchema.parse({
+      ...persistedCheckpoint,
+      acquiredArtifactIds: [...persistedCheckpoint.acquiredArtifactIds].reverse(),
+    });
+    const scope = `source-adapter:${plan.snapshotId}`;
+    await reversedCheckpointStore.commit({
+      expectedRevision: null,
+      checkpoint: createCheckpointEnvelope({
+        scope,
+        previousRevision: null,
+        writtenAt: reversedCheckpoint.updatedAt,
+        payload: reversedCheckpoint,
+      }),
+    });
+    const reversedTransport = new RouteTransport({});
+    await expect(
+      collect(
+        adapter.acquire(plan, undefined, {
+          ...baseContext(reversedTransport),
+          artifactStore,
+          checkpointStore: reversedCheckpointStore,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'RECONCILIATION' });
+    expect(reversedTransport.requests).toHaveLength(0);
+
+    artifactStore.deleteLogicalKey(
+      `raw/santa-clara-socrata-parcels/${plan.snapshotId}/000000.geojson`,
+    );
+    await expect(
+      collect(
+        adapter.acquire(plan, undefined, {
+          ...baseContext(new RouteTransport({})),
+          artifactStore,
+          checkpointStore,
+        }),
+      ),
+    ).rejects.toMatchObject({ code: 'RECONCILIATION' });
   });
 
   it('retries transient pages within policy and propagates abort without another emission', async () => {
@@ -541,6 +649,30 @@ describe('Santa Clara Socrata parcel adapter', () => {
     await expect(aborted[Symbol.asyncIterator]().next()).rejects.toMatchObject({
       name: 'AbortError',
     });
+  });
+
+  it('streams acquisition through the immutable store and enforces the configured byte ceiling', async () => {
+    const fixture = new Uint8Array(await readFile(FIXTURE_URL));
+    const adapter = createSantaClaraSocrataParcelsAdapter({
+      pageSize: 2,
+      maximumResponseBytes: fixture.byteLength - 1,
+    });
+    const plan = await adapter.plan(request(), discovery(2), {
+      clock: new FixedClock(),
+      signal: new AbortController().signal,
+    });
+    const transport = new RouteTransport({
+      [plan.items[0]?.url ?? 'missing']: [success(fixture, GEOJSON_HEADERS)],
+    });
+    const consume = async (): Promise<void> => {
+      for await (const artifact of adapter.acquire(plan, undefined, {
+        ...baseContext(transport),
+        artifactStore: new TestArtifactStore(),
+        checkpointStore: new TestCheckpointStore(),
+      }))
+        void artifact;
+    };
+    await expect(consume()).rejects.toMatchObject({ code: 'ACQUISITION_BYTE_LIMIT' });
   });
 
   it('preserves stable source order, duplicate APNs, and distinct official geometries', async () => {
@@ -686,7 +818,7 @@ describe('Santa Clara Socrata parcel adapter', () => {
       complete: true,
     });
     const restartedAdapter = createSantaClaraSocrataParcelsAdapter();
-    const summary = restartedAdapter.summarize(
+    const summary = await restartedAdapter.summarize(
       {
         descriptor: restartedAdapter.describe(),
         runId: RUN_ID,
@@ -699,8 +831,8 @@ describe('Santa Clara Socrata parcel adapter', () => {
         decodedRecords: 1,
         acceptedRecords: 1,
         rejectedRecords: 0,
-        mutations,
-        validationIssues: [],
+        mutations: repeatable(mutations),
+        validationIssues: repeatable([]),
         aborted: false,
       },
       { clock: new FixedClock(), signal: new AbortController().signal },

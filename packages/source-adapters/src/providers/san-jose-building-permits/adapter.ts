@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
-import { Readable } from 'node:stream';
+import { once } from 'node:events';
 
-import { assertStoredArtifactIntegrity } from '@oracle/artifacts/artifact-store';
+import type { StoredArtifact } from '@oracle/artifacts/artifact-store';
 import { createCheckpointEnvelope, type CheckpointValue } from '@oracle/artifacts/checkpoint-store';
 import {
   canonicalMutationSchema,
@@ -21,6 +21,7 @@ import {
   schemaFingerprintValueSchema,
 } from '@oracle/contracts/ids';
 import {
+  acquiredArtifactSchema,
   acquisitionPlanSchema,
   sourceCheckpointSchema,
   sourceDescriptorSchema,
@@ -38,22 +39,25 @@ import type { Visibility } from '@oracle/contracts/visibility';
 import { parse } from 'csv-parse';
 
 import {
-  type AcquisitionContext,
-  type DecodeContext,
   type DiscoveryContext,
   type DiscoveryResult,
   type NormalizationContext,
   type PlanningContext,
   type RecordValidation,
-  type SourceAdapter,
-  type SourceRunObservation,
+  type SourceRunObservationV2,
+  type StreamingAcquisitionContext,
+  type StreamingDecodeContext,
+  type StreamingSourceAdapter,
   type SummaryContext,
   type ValidationContext,
 } from '../../spi/adapter.js';
 import {
-  createAcquiredByteArtifact,
-  type AcquiredByteArtifact,
+  createStreamingAcquiredArtifact,
+  LegacyWholeCopyLimitError,
+  LEGACY_WHOLE_COPY_MAX_BYTES,
+  type AcquiredArtifactSource,
 } from '../../spi/acquired-artifact.js';
+import { persistAcquiredBody } from '../../spi/acquisition.js';
 import { sha256Hex } from '../../spi/bytes.js';
 import type { HttpHeaders, HttpResponse } from '../../spi/http.js';
 import {
@@ -77,10 +81,12 @@ import type {
   SanJoseValidatedPermitRecord,
 } from './types.js';
 
-const CONTRACT_VERSION = '1.0.0';
+const CONTRACT_VERSION = '2.0.0';
 const TRANSFORM_VERSION = '1.0.0';
 const MAX_METADATA_BYTES = 2 * 1024 * 1024;
 const CSV_STREAM_CHUNK_BYTES = 64 * 1024;
+const DEFAULT_MAXIMUM_RESPONSE_BYTES = 256 * 1024 * 1024;
+const DEFAULT_MAXIMUM_RECORD_BYTES = 1024 * 1024;
 const ACCEPT_CSV_HASH = sha256Hex(new TextEncoder().encode('text/csv'));
 const ACCEPT_JSON_HASH = sha256Hex(new TextEncoder().encode('application/json'));
 const SCHEMA_FINGERPRINT_VALUE = schemaFingerprintValueSchema.parse(SAN_JOSE_SCHEMA_FINGERPRINT);
@@ -241,7 +247,7 @@ function deterministicBackoff(
 }
 
 async function requestWithRetry(
-  context: DiscoveryContext | AcquisitionContext,
+  context: DiscoveryContext | StreamingAcquisitionContext,
   requestKey: string,
   url: string,
   accept: string,
@@ -312,7 +318,10 @@ async function collectBody(
   signal: AbortSignal,
   maximumBytes = Number.POSITIVE_INFINITY,
 ): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes < 1) {
+    throw oracleError('SCHEMA_DRIFT', 'Discovery response byte ceiling is invalid', 'discover');
+  }
+  const bytes = new Uint8Array(maximumBytes);
   let total = 0;
   for await (const chunk of response.body) {
     signal.throwIfAborted();
@@ -320,15 +329,9 @@ async function collectBody(
     if (total > maximumBytes) {
       throw oracleError('SCHEMA_DRIFT', `Response exceeded ${maximumBytes} bytes`, 'discover');
     }
-    chunks.push(Uint8Array.from(chunk));
+    bytes.set(chunk, total - chunk.byteLength);
   }
-  const joined = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    joined.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return joined;
+  return bytes.slice(0, total);
 }
 
 function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
@@ -387,7 +390,7 @@ function parsePackageMetadata(bytes: Uint8Array, feed: SanJosePermitFeed): Packa
   return Object.freeze({ resourceUrl: resource.url, modifiedAt: metadataDateToIso(modified) });
 }
 
-function feedForArtifact(artifact: AcquiredByteArtifact): SanJosePermitFeed {
+function feedForArtifact(artifact: AcquiredArtifactSource): SanJosePermitFeed {
   const requestKey = artifact.metadata.request.requestKey;
   if (!isSanJosePermitFeed(requestKey)) {
     throw oracleError('SCHEMA_DRIFT', `Unknown San Jose feed key: ${requestKey}`, 'decode');
@@ -408,27 +411,29 @@ function assertHeader(actual: readonly string[], feed: SanJosePermitFeed): void 
 }
 
 async function* csvRecords(
-  bytes: Uint8Array,
+  chunks: AsyncIterable<Uint8Array>,
   signal: AbortSignal,
   feed: SanJosePermitFeed,
+  maximumRecordBytes: number,
 ): AsyncIterable<CsvRow> {
-  const input = Readable.from(
-    (function* chunks(): Iterable<Uint8Array> {
-      for (let offset = 0; offset < bytes.byteLength; offset += CSV_STREAM_CHUNK_BYTES) {
-        signal.throwIfAborted();
-        yield bytes.slice(offset, Math.min(bytes.byteLength, offset + CSV_STREAM_CHUNK_BYTES));
+  const parser = parse({
+    bom: true,
+    columns: false,
+    encoding: 'utf8',
+    relax_column_count: false,
+    skip_empty_lines: true,
+    max_record_size: maximumRecordBytes,
+  });
+  const pumping = Promise.resolve().then(async () => {
+    try {
+      for await (const text of validatedUtf8Chunks(chunks, signal)) {
+        if (!parser.write(text)) await once(parser, 'drain');
       }
-    })(),
-  );
-  const parser = input.pipe(
-    parse({
-      bom: true,
-      columns: false,
-      encoding: 'utf8',
-      relax_column_count: false,
-      skip_empty_lines: true,
-    }),
-  );
+      parser.end();
+    } catch (error: unknown) {
+      parser.destroy(error instanceof Error ? error : new Error('CSV input stream failed'));
+    }
+  });
   let header: readonly string[] | undefined;
   try {
     for await (const parsedCandidate of parser) {
@@ -446,6 +451,8 @@ async function* csvRecords(
       yield Object.freeze({ header, values: row });
     }
   } catch (error: unknown) {
+    if (!parser.destroyed) parser.destroy();
+    await pumping.catch(() => undefined);
     if (isRecord(error) && typeof error.code === 'string' && error.code.startsWith('CSV_')) {
       throw oracleError('RECORD_QUALITY', `Malformed CSV: ${error.code}`, 'decode');
     }
@@ -453,22 +460,50 @@ async function* csvRecords(
       ? error
       : new Error('Unknown CSV decoding failure', { cause: error });
   }
+  await pumping;
   if (header === undefined) {
     throw oracleError('SCHEMA_DRIFT', 'CSV snapshot has no header', 'decode');
   }
 }
 
 async function countAndValidateCsv(
-  bytes: Uint8Array,
+  chunks: AsyncIterable<Uint8Array>,
   feed: SanJosePermitFeed,
   signal: AbortSignal,
+  maximumRecordBytes: number,
 ): Promise<number> {
   let count = 0;
-  for await (const row of csvRecords(bytes, signal, feed)) {
+  for await (const row of csvRecords(chunks, signal, feed, maximumRecordBytes)) {
     void row;
     count += 1;
   }
   return count;
+}
+
+async function* validatedUtf8Chunks(
+  chunks: AsyncIterable<Uint8Array>,
+  signal: AbortSignal,
+): AsyncIterable<string> {
+  const decoder = new TextDecoder('utf-8', { fatal: true });
+  try {
+    for await (const chunk of chunks) {
+      signal.throwIfAborted();
+      for (let offset = 0; offset < chunk.byteLength; offset += CSV_STREAM_CHUNK_BYTES) {
+        const text = decoder.decode(
+          chunk.subarray(offset, Math.min(chunk.byteLength, offset + CSV_STREAM_CHUNK_BYTES)),
+          { stream: true },
+        );
+        if (text.length > 0) yield text;
+      }
+    }
+    const final = decoder.decode();
+    if (final.length > 0) yield final;
+  } catch (error: unknown) {
+    if (signal.aborted) throw signal.reason;
+    throw oracleError('RECORD_QUALITY', 'Snapshot is not valid UTF-8', 'decode', {
+      cause: error instanceof Error ? error.message : String(error),
+    });
+  }
 }
 
 function sourceAsOfFromArtifact(metadata: AcquiredArtifact): SourceAsOf {
@@ -476,6 +511,92 @@ function sourceAsOfFromArtifact(metadata: AcquiredArtifact): SourceAsOf {
   return lastModified === null
     ? Object.freeze({ state: 'unknown', reason: 'Official response omitted Last-Modified' })
     : Object.freeze({ state: 'reported', at: lastModified });
+}
+
+function artifactRead(artifact: AcquiredArtifactSource): AsyncIterable<Uint8Array> {
+  if (artifact.content !== undefined) {
+    return artifact.content.read({ maxChunkBytes: CSV_STREAM_CHUNK_BYTES });
+  }
+  if (artifact.bytes.byteLength > LEGACY_WHOLE_COPY_MAX_BYTES) {
+    throw new LegacyWholeCopyLimitError(artifact.bytes.byteLength, LEGACY_WHOLE_COPY_MAX_BYTES);
+  }
+  return (async function* legacyFixture() {
+    await Promise.resolve();
+    yield artifact.bytes.copy();
+  })();
+}
+
+function acquiredMetadataFromStored(
+  plan: AcquisitionPlan,
+  item: AcquisitionPlan['items'][number],
+  stored: StoredArtifact,
+): AcquiredArtifact {
+  const metadata = stored.metadata;
+  const attempt = Number(metadata.attempt);
+  const httpStatus = Number(metadata.httpStatus);
+  if (
+    metadata.sourceId !== plan.sourceId ||
+    metadata.snapshotId !== plan.snapshotId ||
+    metadata.requestKey !== item.requestKey ||
+    metadata.sourceUrl !== item.url ||
+    metadata.retrievedAt === undefined ||
+    !Number.isSafeInteger(attempt) ||
+    attempt < 1 ||
+    !Number.isSafeInteger(httpStatus) ||
+    httpStatus < 200 ||
+    httpStatus >= 300 ||
+    !item.expectedMediaTypes.includes(stored.mediaType)
+  ) {
+    throw oracleError(
+      'RECONCILIATION',
+      'Recovered permit artifact metadata is invalid',
+      'acquire',
+      {
+        requestKey: item.requestKey,
+      },
+    );
+  }
+  const lastModified = metadata.lastModified === '' ? null : httpDateToIso(metadata.lastModified);
+  if (metadata.lastModified !== '' && lastModified === null) {
+    throw oracleError('RECONCILIATION', 'Recovered Last-Modified metadata is invalid', 'acquire');
+  }
+  return acquiredArtifactSchema.parse({
+    artifactId: artifactIdSchema.parse(`sc:artifact:sha256:${stored.sha256}`),
+    sourceId: SAN_JOSE_BUILDING_PERMIT_SOURCE_ID,
+    snapshotId: plan.snapshotId,
+    retrievedAt: metadata.retrievedAt,
+    sourceAsOf:
+      lastModified === null
+        ? { state: 'unknown', reason: 'Official response omitted Last-Modified' }
+        : { state: 'reported', at: lastModified },
+    request: {
+      requestKey: item.requestKey,
+      method: 'GET',
+      url: item.url,
+      headers: [{ name: 'accept', valueSha256: ACCEPT_CSV_HASH }],
+      bodySha256: null,
+      attempt,
+    },
+    response: {
+      httpStatus,
+      etag: metadata.etag === '' ? null : metadata.etag,
+      lastModified,
+      finalUrl: metadata.finalUrl ?? item.url,
+    },
+    mediaType: stored.mediaType,
+    encoding: 'csv',
+    byteSize: stored.byteSize,
+    sha256: stored.sha256,
+    schemaFingerprint: {
+      algorithm: 'sha256',
+      value: SCHEMA_FINGERPRINT_VALUE,
+      schemaName: 'city-of-san-jose-building-permits-v1',
+      canonicalizationVersion: CONTRACT_VERSION,
+    },
+    rawUri: stored.uri,
+    licenseSnapshotRef: SAN_JOSE_BUILDING_PERMIT_LICENSE_ID,
+    visibility: 'public',
+  });
 }
 
 function checkpointPayload(
@@ -856,28 +977,36 @@ function acceptedFeedFromMutation(mutation: CanonicalMutation): SanJosePermitFee
   return isSanJosePermitFeed(mutation.observation.value) ? mutation.observation.value : undefined;
 }
 
-export function summarizeSanJoseBuildingPermits(
-  run: SourceRunObservation,
+export async function summarizeSanJoseBuildingPermits(
+  run: SourceRunObservationV2,
   source: SourceRunSummary,
-): SanJoseBuildingPermitSummary {
+): Promise<SanJoseBuildingPermitSummary> {
+  const acceptedByFeed = new Map<SanJosePermitFeed, number>();
+  for await (const mutation of run.mutations.read()) {
+    const feed = acceptedFeedFromMutation(mutation);
+    if (feed !== undefined) acceptedByFeed.set(feed, (acceptedByFeed.get(feed) ?? 0) + 1);
+  }
+  const rejectedByFeed = new Map<SanJosePermitFeed, number>();
+  const lastRejectedKey = new Map<SanJosePermitFeed, string>();
+  for await (const validationIssue of run.validationIssues.read()) {
+    const feed = feedFromRecordKey(validationIssue.recordKey);
+    const recordKey = validationIssue.recordKey;
+    if (feed !== undefined && recordKey !== null && lastRejectedKey.get(feed) !== recordKey) {
+      rejectedByFeed.set(feed, (rejectedByFeed.get(feed) ?? 0) + 1);
+      lastRejectedKey.set(feed, recordKey);
+    }
+  }
   const feedSnapshots: SanJoseFeedSnapshotSummary[] = SAN_JOSE_FEEDS.map((feed) => {
     const artifacts = run.artifacts.filter((artifact) => artifact.request.requestKey === feed);
-    const accepted = run.mutations.filter(
-      (mutation) => acceptedFeedFromMutation(mutation) === feed,
-    ).length;
-    const rejectedKeys = new Set(
-      run.validationIssues
-        .filter((validationIssue) => feedFromRecordKey(validationIssue.recordKey) === feed)
-        .map((validationIssue) => validationIssue.recordKey)
-        .filter((recordKey): recordKey is string => recordKey !== null),
-    );
+    const accepted = acceptedByFeed.get(feed) ?? 0;
+    const rejected = rejectedByFeed.get(feed) ?? 0;
     const artifact = artifacts[0];
     return Object.freeze({
       feed,
       artifactCount: artifacts.length,
       acceptedRecords: accepted,
-      rejectedRecords: rejectedKeys.size,
-      decodedRecords: accepted + rejectedKeys.size,
+      rejectedRecords: rejected,
+      decodedRecords: accepted + rejected,
       byteSize: artifacts.reduce((total, item) => total + item.byteSize, 0),
       sha256: artifacts.length === 1 && artifact !== undefined ? artifact.sha256 : null,
       sourceAsOf: artifacts.length === 1 && artifact !== undefined ? artifact.sourceAsOf : null,
@@ -898,14 +1027,26 @@ export function summarizeSanJoseBuildingPermits(
   });
 }
 
-class SanJoseBuildingPermitAdapter implements SourceAdapter<
+class SanJoseBuildingPermitAdapter implements StreamingSourceAdapter<
   SanJoseDecodedPermitRecord,
   SanJoseValidatedPermitRecord
 > {
   readonly #options: SanJoseBuildingPermitAdapterOptions;
+  readonly #maximumResponseBytes: number;
+  readonly #maximumRecordBytes: number;
 
   public constructor(options: SanJoseBuildingPermitAdapterOptions) {
+    const maximumResponseBytes = options.maximumResponseBytes ?? DEFAULT_MAXIMUM_RESPONSE_BYTES;
+    if (!Number.isSafeInteger(maximumResponseBytes) || maximumResponseBytes < 1) {
+      throw new RangeError('maximumResponseBytes must be a positive safe integer');
+    }
+    const maximumRecordBytes = options.maximumRecordBytes ?? DEFAULT_MAXIMUM_RECORD_BYTES;
+    if (!Number.isSafeInteger(maximumRecordBytes) || maximumRecordBytes < 1) {
+      throw new RangeError('maximumRecordBytes must be a positive safe integer');
+    }
     this.#options = options;
+    this.#maximumResponseBytes = maximumResponseBytes;
+    this.#maximumRecordBytes = maximumRecordBytes;
   }
 
   public describe(): SourceDescriptor {
@@ -997,8 +1138,8 @@ class SanJoseBuildingPermitAdapter implements SourceAdapter<
   public async *acquire(
     plan: AcquisitionPlan,
     checkpoint: SourceCheckpoint | undefined,
-    context: AcquisitionContext,
-  ): AsyncIterable<AcquiredByteArtifact> {
+    context: StreamingAcquisitionContext,
+  ): AsyncIterable<AcquiredArtifactSource> {
     if (plan.sourceId !== SAN_JOSE_BUILDING_PERMIT_SOURCE_ID) {
       throw oracleError('SCHEMA_DRIFT', 'Acquisition plan source mismatch', 'acquire');
     }
@@ -1019,117 +1160,130 @@ class SanJoseBuildingPermitAdapter implements SourceAdapter<
       throw oracleError('RECONCILIATION', 'Caller and persisted checkpoints disagree', 'acquire');
     }
     const resumeCheckpoint = persistedSourceCheckpoint ?? suppliedSourceCheckpoint;
+    if (resumeCheckpoint !== undefined) {
+      const expectedKeys = sorted
+        .slice(0, resumeCheckpoint.nextSequence)
+        .map((item) => item.requestKey);
+      if (
+        resumeCheckpoint.completedRequestKeys.length !== resumeCheckpoint.nextSequence ||
+        resumeCheckpoint.acquiredArtifactIds.length > resumeCheckpoint.nextSequence ||
+        resumeCheckpoint.completedRequestKeys.some((key, index) => key !== expectedKeys[index]) ||
+        resumeCheckpoint.complete !== (resumeCheckpoint.nextSequence === sorted.length)
+      ) {
+        throw oracleError(
+          'RECONCILIATION',
+          'Checkpoint does not describe an exact contiguous acquisition prefix',
+          'acquire',
+        );
+      }
+    }
     const completed = [...(resumeCheckpoint?.completedRequestKeys ?? [])];
     const artifactIds = [...(resumeCheckpoint?.acquiredArtifactIds ?? [])];
     const startSequence = resumeCheckpoint?.nextSequence ?? 0;
+    const recoveredArtifactIds: SourceCheckpoint['acquiredArtifactIds'][number][] = [];
 
     for (const item of sorted) {
-      if (item.sequence < startSequence || completed.includes(item.requestKey)) {
-        continue;
-      }
       context.signal.throwIfAborted();
-      const { response, attempt } = await requestWithRetry(
-        context,
-        item.requestKey,
-        item.url,
-        'text/csv',
-        'acquire',
-      );
-      const bytes = await collectBody(response, context.signal);
-      const sha256 = sha256Hex(bytes);
-      const contentType = headerValue(response.headers, 'content-type');
-      if (contentType === undefined) {
-        throw oracleError('SCHEMA_DRIFT', `Missing Content-Type for ${item.requestKey}`, 'acquire');
-      }
-      const mediaType = contentType.split(';', 1)[0]?.trim().toLowerCase();
-      if (mediaType === undefined || !item.expectedMediaTypes.includes(mediaType)) {
+      const wasCompleted = item.sequence < startSequence;
+      const logicalKey = `raw/san-jose-building-permits/${plan.snapshotId}/${item.requestKey}.csv`;
+      let stored = await context.artifactStore.headByLogicalKey(logicalKey);
+      if (wasCompleted && stored === undefined) {
         throw oracleError(
-          'SCHEMA_DRIFT',
-          `Unexpected media type for ${item.requestKey}`,
+          'RECONCILIATION',
+          `Checkpoint references a missing immutable feed artifact: ${item.requestKey}`,
           'acquire',
-          {
-            mediaType,
-          },
         );
       }
-      const logicalKey = `raw/san-jose-building-permits/${plan.snapshotId}/${item.requestKey}/${sha256}.csv`;
-      const stored = await context.artifactStore.putImmutable({
-        logicalKey,
-        mediaType,
-        body: bytes,
-        expectedSha256: sha256,
-        metadata: Object.freeze({
-          authority: 'City of San Jose',
-          sourceUrl: item.url,
-          feed: item.requestKey,
-          snapshotId: plan.snapshotId,
-          license: 'CC0-1.0',
-        }),
-        ifAbsent: true,
-      });
-      try {
-        assertStoredArtifactIntegrity(
-          {
-            logicalKey,
-            mediaType,
-            byteSize: bytes.byteLength,
-            sha256,
-          },
-          stored,
+      if (stored === undefined) {
+        const { response, attempt } = await requestWithRetry(
+          context,
+          item.requestKey,
+          item.url,
+          'text/csv',
+          'acquire',
         );
-      } catch (error: unknown) {
-        throw new Error(`Immutable store verification failed for ${item.requestKey}`, {
-          cause: error,
+        const contentType = headerValue(response.headers, 'content-type');
+        if (contentType === undefined) {
+          throw oracleError(
+            'SCHEMA_DRIFT',
+            `Missing Content-Type for ${item.requestKey}`,
+            'acquire',
+          );
+        }
+        const mediaType = contentType.split(';', 1)[0]?.trim().toLowerCase();
+        if (mediaType === undefined || !item.expectedMediaTypes.includes(mediaType)) {
+          throw oracleError(
+            'SCHEMA_DRIFT',
+            `Unexpected media type for ${item.requestKey}`,
+            'acquire',
+            {
+              mediaType,
+            },
+          );
+        }
+        const retrievedAt = context.clock.now();
+        const lastModified = httpDateToIso(headerValue(response.headers, 'last-modified'));
+        stored = await persistAcquiredBody({
+          store: context.artifactStore,
+          logicalKey,
+          mediaType,
+          body: response.body,
+          maximumBytes: this.#maximumResponseBytes,
+          metadata: Object.freeze({
+            authority: 'City of San Jose',
+            sourceId: plan.sourceId,
+            sourceUrl: item.url,
+            requestKey: item.requestKey,
+            feed: item.requestKey,
+            snapshotId: plan.snapshotId,
+            license: 'CC0-1.0',
+            retrievedAt,
+            attempt: String(attempt),
+            httpStatus: String(response.status),
+            etag: headerValue(response.headers, 'etag') ?? '',
+            lastModified: lastModified ?? '',
+            finalUrl: item.url,
+          }),
+          signal: context.signal,
         });
       }
-      const retrievedAt = context.clock.now();
-      const lastModified = httpDateToIso(headerValue(response.headers, 'last-modified'));
-      const metadata: AcquiredArtifact = {
-        artifactId: artifactIdSchema.parse(`sc:artifact:sha256:${sha256}`),
-        sourceId: SAN_JOSE_BUILDING_PERMIT_SOURCE_ID,
-        snapshotId: plan.snapshotId,
-        retrievedAt,
-        sourceAsOf:
-          lastModified === null
-            ? { state: 'unknown', reason: 'Official response omitted Last-Modified' }
-            : { state: 'reported', at: lastModified },
-        request: {
-          requestKey: item.requestKey,
-          method: 'GET',
-          url: item.url,
-          headers: [{ name: 'accept', valueSha256: ACCEPT_CSV_HASH }],
-          bodySha256: null,
-          attempt,
-        },
-        response: {
-          httpStatus: response.status,
-          etag: headerValue(response.headers, 'etag') ?? null,
-          lastModified,
-          finalUrl: item.url,
-        },
-        mediaType,
-        encoding: 'csv',
-        byteSize: bytes.byteLength,
-        sha256,
-        schemaFingerprint: {
-          algorithm: 'sha256',
-          value: SCHEMA_FINGERPRINT_VALUE,
-          schemaName: 'city-of-san-jose-building-permits-v1',
-          canonicalizationVersion: CONTRACT_VERSION,
-        },
-        rawUri: stored.uri,
-        licenseSnapshotRef: SAN_JOSE_BUILDING_PERMIT_LICENSE_ID,
-        visibility: 'public',
-      };
-      const artifact = createAcquiredByteArtifact(metadata, bytes);
+      const metadata = acquiredMetadataFromStored(plan, item, stored);
+      const artifact = await createStreamingAcquiredArtifact(metadata, context.artifactStore);
+      if (wasCompleted) {
+        if (!artifactIds.includes(artifact.metadata.artifactId)) {
+          throw oracleError(
+            'RECONCILIATION',
+            `Checkpoint artifact identity mismatches recovered feed: ${item.requestKey}`,
+            'acquire',
+          );
+        }
+        if (!recoveredArtifactIds.includes(artifact.metadata.artifactId)) {
+          recoveredArtifactIds.push(artifact.metadata.artifactId);
+        }
+        if (
+          item.sequence + 1 === startSequence &&
+          (recoveredArtifactIds.length !== artifactIds.length ||
+            recoveredArtifactIds.some((candidate, index) => candidate !== artifactIds[index]))
+        ) {
+          throw oracleError(
+            'RECONCILIATION',
+            'Checkpoint artifact identities do not exactly match the recovered immutable prefix',
+            'acquire',
+          );
+        }
+        yield artifact;
+        continue;
+      }
       completed.push(item.requestKey);
-      artifactIds.push(artifact.metadata.artifactId);
+      if (!artifactIds.includes(artifact.metadata.artifactId)) {
+        artifactIds.push(artifact.metadata.artifactId);
+      }
       const sourceCheckpoint = createSourceCheckpoint(
         plan,
         item.sequence + 1,
         completed,
         artifactIds,
-        context.clock.now(),
+        artifact.metadata.retrievedAt,
       );
       const envelope = createCheckpointEnvelope({
         scope,
@@ -1160,23 +1314,22 @@ class SanJoseBuildingPermitAdapter implements SourceAdapter<
   }
 
   public async *decode(
-    artifact: AcquiredByteArtifact,
-    context: DecodeContext,
+    artifact: AcquiredArtifactSource,
+    context: StreamingDecodeContext,
   ): AsyncIterable<SanJoseDecodedPermitRecord> {
     context.signal.throwIfAborted();
     if (artifact.metadata.encoding !== 'csv') {
       throw oracleError('SCHEMA_DRIFT', 'San Jose permit artifact is not CSV', 'decode');
     }
     const feed = feedForArtifact(artifact);
-    const bytes = artifact.bytes.copy();
-    try {
-      new TextDecoder('utf-8', { fatal: true }).decode(bytes);
-    } catch {
-      throw oracleError('RECORD_QUALITY', `Snapshot is not valid UTF-8 for ${feed}`, 'decode');
-    }
     const expectedCount = this.#options.expectedRecordCounts?.[feed];
     if (expectedCount !== undefined) {
-      const observedCount = await countAndValidateCsv(bytes, feed, context.signal);
+      const observedCount = await countAndValidateCsv(
+        artifactRead(artifact),
+        feed,
+        context.signal,
+        this.#maximumRecordBytes,
+      );
       if (observedCount !== expectedCount) {
         throw oracleError(
           'SCHEMA_DRIFT',
@@ -1187,7 +1340,12 @@ class SanJoseBuildingPermitAdapter implements SourceAdapter<
       }
     }
     let ordinal = 0;
-    for await (const row of csvRecords(bytes, context.signal, feed)) {
+    for await (const row of csvRecords(
+      artifactRead(artifact),
+      context.signal,
+      feed,
+      this.#maximumRecordBytes,
+    )) {
       ordinal += 1;
       const raw = rowObject(row.values);
       const sourceRowId = raw.FOLDERRSN.trim() || `ordinal-${ordinal}`;
@@ -1341,7 +1499,10 @@ class SanJoseBuildingPermitAdapter implements SourceAdapter<
     }
   }
 
-  public summarize(run: SourceRunObservation, context: SummaryContext): SourceRunSummary {
+  public async summarize(
+    run: SourceRunObservationV2,
+    context: SummaryContext,
+  ): Promise<SourceRunSummary> {
     context.signal.throwIfAborted();
     if (run.decodedRecords !== run.acceptedRecords + run.rejectedRecords) {
       throw oracleError(
@@ -1373,8 +1534,16 @@ class SanJoseBuildingPermitAdapter implements SourceAdapter<
       restricted: 0,
       prohibited_public: 0,
     };
-    for (const mutation of run.mutations) {
+    for await (const mutation of run.mutations.read()) {
+      context.signal.throwIfAborted();
       visibilityCounts[mutation.visibility] += 1;
+    }
+    let warningCount = 0;
+    let errorCount = 0;
+    for await (const validationIssue of run.validationIssues.read()) {
+      context.signal.throwIfAborted();
+      if (validationIssue.severity === 'warning') warningCount += 1;
+      else errorCount += 1;
     }
     return sourceRunSummarySchema.parse({
       sourceId: run.descriptor.sourceId,
@@ -1393,14 +1562,10 @@ class SanJoseBuildingPermitAdapter implements SourceAdapter<
       decodedRecords: run.decodedRecords,
       acceptedRecords: run.acceptedRecords,
       rejectedRecords: run.rejectedRecords,
-      normalizedMutations: run.mutations.length,
+      normalizedMutations: run.mutations.count,
       visibilityCounts,
-      warningCount: run.validationIssues.filter(
-        (validationIssue) => validationIssue.severity === 'warning',
-      ).length,
-      errorCount: run.validationIssues.filter(
-        (validationIssue) => validationIssue.severity !== 'warning',
-      ).length,
+      warningCount,
+      errorCount,
       finalCheckpoint: run.finalCheckpoint,
     });
   }
@@ -1408,7 +1573,7 @@ class SanJoseBuildingPermitAdapter implements SourceAdapter<
 
 export function createSanJoseBuildingPermitAdapter(
   options: SanJoseBuildingPermitAdapterOptions,
-): SourceAdapter<SanJoseDecodedPermitRecord, SanJoseValidatedPermitRecord> {
+): StreamingSourceAdapter<SanJoseDecodedPermitRecord, SanJoseValidatedPermitRecord> {
   return new SanJoseBuildingPermitAdapter(options);
 }
 

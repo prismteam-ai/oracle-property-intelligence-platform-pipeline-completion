@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import type { RunId, SnapshotId, SourceId } from '@oracle/contracts/ids';
 import { licenseSnapshotIdSchema, snapshotIdSchema, sourceIdSchema } from '@oracle/contracts/ids';
 import { SourceAdapterRegistry } from '@oracle/source-adapters/registry';
-import type { SourceAdapter } from '@oracle/source-adapters/spi/adapter';
+import type { AnySourceAdapter } from '@oracle/source-adapters/spi/adapter';
 import {
   CA_SOS_BUSINESS_DESCRIPTOR,
   createCaSosBusinessAdapter,
@@ -243,12 +243,63 @@ async function loadOsmDecoder(
   const loaded = (await import(pathToFileURL(absolute).href)) as Readonly<{
     decoder?: OsmPbfDecoder;
     createDecoder?: () => OsmPbfDecoder;
+    oracleBoundedOsmDecoderContract?: unknown;
   }>;
+  assertBoundedOsmDecoderContract(loaded.oracleBoundedOsmDecoderContract);
   const decoder = loaded.decoder ?? loaded.createDecoder?.();
   if (decoder === undefined || typeof decoder.decode !== 'function') {
     throw new TypeError('Configured OSM decoder module must export decoder or createDecoder()');
   }
   return decoder;
+}
+
+export const BOUNDED_OSM_DECODER_CONTRACT = Object.freeze({
+  formatVersion: '1.0.0',
+  inputContract: 'StreamingArtifactContentV2',
+  noNetwork: true,
+  noWholeCopy: true,
+  deterministicOrdering: 'nodes_then_ways_then_relations_positive_id_version',
+  enforcedLimits: Object.freeze([
+    'maximumBlobBytes',
+    'maximumTagsPerElement',
+    'maximumWayNodeRefs',
+    'maximumRelationMembers',
+  ]),
+});
+
+export function assertBoundedOsmDecoderContract(value: unknown): void {
+  if (
+    canonicalJsonForAttestation(value) !== canonicalJsonForAttestation(BOUNDED_OSM_DECODER_CONTRACT)
+  ) {
+    throw new UnsupportedOsmDecoderContractError();
+  }
+}
+
+function canonicalJsonForAttestation(value: unknown): string {
+  if (value === null || typeof value !== 'object') return '';
+  const record = value as Record<string, unknown>;
+  return JSON.stringify({
+    formatVersion: record.formatVersion,
+    inputContract: record.inputContract,
+    noNetwork: record.noNetwork,
+    noWholeCopy: record.noWholeCopy,
+    deterministicOrdering: record.deterministicOrdering,
+    enforcedLimits: record.enforcedLimits,
+    extraKeys: Object.keys(record)
+      .filter((key) => !Object.keys(BOUNDED_OSM_DECODER_CONTRACT).includes(key))
+      .sort(),
+  });
+}
+
+export class UnsupportedOsmDecoderContractError extends Error {
+  public readonly code = 'UNSUPPORTED_OSM_DECODER_CONTRACT';
+
+  public constructor() {
+    super(
+      'Configured OSM decoder lacks the exact bounded streaming v1 attestation; decode was not started.',
+    );
+    this.name = 'UnsupportedOsmDecoderContractError';
+  }
 }
 
 export function resolveWorkspaceModulePath(workspaceDirectory: string, modulePath: string): string {
@@ -431,7 +482,7 @@ export async function composeProductionSources(
     }
   }
 
-  const registry = new SourceAdapterRegistry<SourceAdapter>();
+  const registry = new SourceAdapterRegistry<AnySourceAdapter>(['1.0.0', '2.0.0']);
   registry.registerAll(sources.map(({ adapter }) => adapter));
   const registered = new Set(registry.descriptors().map(({ sourceId }) => sourceId));
   if (registered.size !== sources.length)

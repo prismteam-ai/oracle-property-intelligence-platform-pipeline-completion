@@ -2,8 +2,9 @@ import { readFile } from 'node:fs/promises';
 
 import type {
   ArtifactBody,
-  ArtifactStore,
+  RecoverableArtifactStore,
   ImmutableArtifactWrite,
+  StreamingImmutableArtifactWrite,
   StoredArtifact,
 } from '@oracle/artifacts/artifact-store';
 import type {
@@ -28,19 +29,20 @@ import type {
 import { describe, expect, it } from 'vitest';
 
 import type {
-  AcquisitionContext,
   Clock,
-  DecodeContext,
   Delay,
   DiscoveryContext,
   NormalizationContext,
-  SourceRunObservation,
+  SourceRunObservationV2,
+  StreamingAcquisitionContext,
+  StreamingDecodeContext,
 } from '../../spi/adapter.js';
 import {
   createAcquiredByteArtifact,
-  type AcquiredByteArtifact,
+  type StreamingAcquiredArtifact,
 } from '../../spi/acquired-artifact.js';
 import { sha256Hex } from '../../spi/bytes.js';
+import { createSharedRecordBudget } from '../../spi/record-budget.js';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../../spi/http.js';
 import { createCslbContractorAdapter } from './adapter.js';
 import {
@@ -110,9 +112,10 @@ async function bodyBytes(body: ArtifactBody): Promise<Uint8Array> {
   return bytes;
 }
 
-class MemoryArtifactStore implements ArtifactStore {
-  public readonly writes: ImmutableArtifactWrite[] = [];
+class MemoryArtifactStore implements RecoverableArtifactStore {
+  public readonly writes: (ImmutableArtifactWrite | StreamingImmutableArtifactWrite)[] = [];
   readonly #stored = new Map<string, Readonly<{ descriptor: StoredArtifact; bytes: Uint8Array }>>();
+  readonly #logical = new Map<string, string>();
   readonly #corrupt: boolean;
 
   public constructor(corrupt = false) {
@@ -120,23 +123,44 @@ class MemoryArtifactStore implements ArtifactStore {
   }
 
   public async putImmutable(request: ImmutableArtifactWrite): Promise<StoredArtifact> {
+    return this.#put(request);
+  }
+
+  public async putImmutableStreaming(
+    request: StreamingImmutableArtifactWrite,
+  ): Promise<StoredArtifact> {
+    return this.#put(request);
+  }
+
+  async #put(request: StreamingImmutableArtifactWrite): Promise<StoredArtifact> {
     const bytes = await bodyBytes(request.body);
     this.writes.push(request);
+    if (this.#corrupt) throw new Error('Immutable artifact integrity mismatch');
+    const actualSha256 = sha256Hex(bytes);
+    if (request.expectedSha256 !== undefined && request.expectedSha256 !== actualSha256) {
+      throw new Error('test store expected hash mismatch');
+    }
     const descriptor = Object.freeze({
       logicalKey: request.logicalKey,
       uri: `s3://oracle-test/${encodeURIComponent(request.logicalKey)}`,
       mediaType: request.mediaType,
       byteSize: bytes.byteLength,
-      sha256: this.#corrupt ? 'f'.repeat(64) : request.expectedSha256,
+      sha256: actualSha256,
       storedAt: NOW,
       metadata: request.metadata,
     });
     this.#stored.set(descriptor.uri, Object.freeze({ descriptor, bytes }));
+    this.#logical.set(request.logicalKey, descriptor.uri);
     return descriptor;
   }
 
   public head(uri: string): Promise<StoredArtifact | undefined> {
     return Promise.resolve(this.#stored.get(uri)?.descriptor);
+  }
+
+  public headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined> {
+    const uri = this.#logical.get(logicalKey);
+    return Promise.resolve(uri === undefined ? undefined : this.#stored.get(uri)?.descriptor);
   }
 
   public async *read(uri: string): AsyncIterable<Uint8Array> {
@@ -222,7 +246,7 @@ function acquisitionContext(
   artifactStore = new MemoryArtifactStore(),
   checkpointStore = new MemoryCheckpointStore(),
   delay = new RecordingDelay(),
-): AcquisitionContext {
+): StreamingAcquisitionContext {
   return {
     ...discoveryContext(http, delay),
     artifactStore,
@@ -230,12 +254,13 @@ function acquisitionContext(
   };
 }
 
-function decodeContext(): DecodeContext {
+function decodeContext(): StreamingDecodeContext {
   return {
     clock: new FixedClock(),
     signal: signal(),
     artifactStore: new MemoryArtifactStore(),
     analyticalRuntime: new UnusedAnalyticalRuntime(),
+    recordBudget: createSharedRecordBudget(2),
   };
 }
 
@@ -271,10 +296,10 @@ async function safeFixture(): Promise<SafeFixture> {
 function acquired(
   csv: string,
   overrides?: Readonly<{ mediaType?: string; bytes?: Uint8Array }>,
-): AcquiredByteArtifact {
+): StreamingAcquiredArtifact {
   const bytes = overrides?.bytes ?? new TextEncoder().encode(csv);
   const sha256 = sha256Hex(bytes);
-  return createAcquiredByteArtifact(
+  const legacy = createAcquiredByteArtifact(
     {
       artifactId: artifactIdSchema.parse(`sc:artifact:sha256:${sha256}`),
       sourceId: CSLB_CONTRACTOR_SOURCE_ID,
@@ -315,6 +340,30 @@ function acquired(
     },
     bytes,
   );
+  return Object.freeze({
+    metadata: legacy.metadata,
+    content: Object.freeze({
+      formatVersion: '2.0.0' as const,
+      byteLength: bytes.byteLength,
+      sha256,
+      rawUri: legacy.metadata.rawUri,
+      read: async function* () {
+        await Promise.resolve();
+        yield Uint8Array.from(bytes);
+      },
+    }),
+  });
+}
+
+function observed<T>(values: readonly T[]) {
+  return Object.freeze({
+    count: values.length,
+    logicalSha256: sha256Hex(new TextEncoder().encode(JSON.stringify(values))),
+    read: async function* () {
+      await Promise.resolve();
+      for (const value of values) yield value;
+    },
+  });
 }
 
 async function collect<T>(values: AsyncIterable<T>): Promise<T[]> {
@@ -418,13 +467,38 @@ describe('CSLB contractor adapter', () => {
     const context = acquisitionContext(http, artifactStore, checkpointStore, delay);
     const artifacts = await collect(adapter.acquire(plan, undefined, context));
     expect(artifacts).toHaveLength(1);
-    expect(artifacts[0]?.bytes.sha256).toBe(sha256Hex(new TextEncoder().encode(csv)));
+    const acquiredArtifact = artifacts[0];
+    if (acquiredArtifact?.content === undefined) throw new Error('expected streaming artifact');
+    expect(acquiredArtifact.content.sha256).toBe(sha256Hex(new TextEncoder().encode(csv)));
     expect(artifactStore.writes).toHaveLength(1);
     expect(delay.waits[0]).toBe(1_000);
     expect(http.requests[1]?.headers.cookie).toBeUndefined();
     expect(http.requests[2]?.headers.cookie).toBe('anon=two');
-    expect(await collect(adapter.acquire(plan, undefined, context))).toEqual([]);
+    const resumed = await collect(adapter.acquire(plan, undefined, context));
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0]?.metadata.sha256).toBe(acquiredArtifact.metadata.sha256);
     expect(http.requests).toHaveLength(4);
+
+    const orphanHttp = new ScriptedHttp([]);
+    const adopted = await collect(
+      adapter.acquire(
+        plan,
+        undefined,
+        acquisitionContext(orphanHttp, artifactStore, new MemoryCheckpointStore()),
+      ),
+    );
+    expect(adopted).toHaveLength(1);
+    expect(orphanHttp.requests).toEqual([]);
+
+    await expect(
+      collect(
+        adapter.acquire(
+          plan,
+          undefined,
+          acquisitionContext(new ScriptedHttp([]), new MemoryArtifactStore(), checkpointStore),
+        ),
+      ),
+    ).rejects.toMatchObject({ code: 'RECONCILIATION' });
   });
 
   it('fails acquisition on immutable-store corruption, response-size overflow, and abort', async () => {
@@ -455,7 +529,7 @@ describe('CSLB contractor adapter', () => {
     });
     await expect(
       collect(limited.acquire(plan, undefined, acquisitionContext(scripted()))),
-    ).rejects.toMatchObject({ code: 'SCHEMA_DRIFT' });
+    ).rejects.toMatchObject({ code: 'ACQUISITION_BYTE_LIMIT' });
 
     const controller = new AbortController();
     controller.abort(new DOMException('stop', 'AbortError'));
@@ -554,7 +628,7 @@ describe('CSLB contractor adapter', () => {
     const finalCheckpoint = sourceCheckpointSchema.parse({
       sourceId: CSLB_CONTRACTOR_SOURCE_ID,
       snapshotId: SNAPSHOT_ID,
-      contractVersion: '1.0.0',
+      contractVersion: '2.0.0',
       cursor: 'sequence:1',
       nextSequence: 1,
       completedRequestKeys: ['license-master-csv'],
@@ -562,7 +636,7 @@ describe('CSLB contractor adapter', () => {
       updatedAt: NOW,
       complete: true,
     });
-    const run: SourceRunObservation = {
+    const run: SourceRunObservationV2 = {
       descriptor: adapter.describe(),
       runId: RUN_ID,
       request: acquisitionRequestSchema.parse({
@@ -580,12 +654,12 @@ describe('CSLB contractor adapter', () => {
       decodedRecords: 2,
       acceptedRecords: 2,
       rejectedRecords: 0,
-      mutations,
-      validationIssues: [],
+      mutations: observed(mutations),
+      validationIssues: observed([]),
       aborted: false,
     };
     const context = { clock: new FixedClock(), signal: signal() };
-    const succeeded = adapter.summarize(run, context);
+    const succeeded = await adapter.summarize(run, context);
     expect(succeeded.status).toBe('succeeded');
     expect(succeeded.decodedRecords).toBe(2);
     expect(succeeded.acceptedRecords + succeeded.rejectedRecords).toBe(2);
@@ -597,13 +671,13 @@ describe('CSLB contractor adapter', () => {
       prohibited_public: 0,
     });
 
-    const rejected = adapter.summarize(
+    const rejected = await adapter.summarize(
       {
         ...run,
         acceptedRecords: 1,
         rejectedRecords: 1,
-        mutations: mutations.slice(0, 9),
-        validationIssues: [
+        mutations: observed(mutations.slice(0, 9)),
+        validationIssues: observed([
           {
             code: 'MALFORMED_LICENSE_NUMBER',
             severity: 'error',
@@ -611,7 +685,7 @@ describe('CSLB contractor adapter', () => {
             recordKey: 'missing-license:row:2',
             fieldPath: '/LicenseNo',
           },
-        ],
+        ]),
       },
       context,
     );
@@ -628,11 +702,12 @@ describe('CSLB contractor adapter', () => {
       complete: false,
     });
     expect(
-      adapter.summarize({ ...run, finalCheckpoint: incompleteCheckpoint }, context).status,
+      (await adapter.summarize({ ...run, finalCheckpoint: incompleteCheckpoint }, context)).status,
     ).toBe('partial');
-    expect(() => adapter.summarize({ ...run, decodedRecords: 3 }, context)).toThrow(
-      expect.objectContaining({ code: 'RECORD_QUALITY', phase: 'summarize' }),
-    );
+    await expect(adapter.summarize({ ...run, decodedRecords: 3 }, context)).rejects.toMatchObject({
+      code: 'RECORD_QUALITY',
+      phase: 'summarize',
+    });
   });
 
   it('preserves duplicate-license status/classification observations without inventing a permit-performance link', async () => {

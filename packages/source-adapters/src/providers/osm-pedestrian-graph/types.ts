@@ -2,6 +2,7 @@ import type { ArtifactId, SnapshotId, SourceId } from '@oracle/contracts/ids';
 import type { Visibility } from '@oracle/contracts/visibility';
 
 import type { PbfDecodedRecord } from '../../spi/decode.js';
+import type { StreamingArtifactContentV2 } from '../../spi/acquired-artifact.js';
 
 export type OsmElementType = 'node' | 'way' | 'relation';
 
@@ -41,13 +42,50 @@ export interface OsmDecodedRelation {
 
 export type OsmDecodedElement = OsmDecodedNode | OsmDecodedWay | OsmDecodedRelation;
 
+export interface OsmPbfDecodeLimits {
+  readonly maximumBlobBytes: number;
+  readonly maximumTagsPerElement: number;
+  readonly maximumWayNodeRefs: number;
+  readonly maximumRelationMembers: number;
+}
+
+/** Exact export required from a production decoder module before composition imports its decoder. */
+export const oracleBoundedOsmDecoderContract = Object.freeze({
+  formatVersion: '1.0.0' as const,
+  inputContract: 'StreamingArtifactContentV2' as const,
+  noNetwork: true as const,
+  noWholeCopy: true as const,
+  deterministicOrdering: 'nodes_then_ways_then_relations_positive_id_version' as const,
+  enforcedLimits: Object.freeze([
+    'maximumBlobBytes',
+    'maximumTagsPerElement',
+    'maximumWayNodeRefs',
+    'maximumRelationMembers',
+  ] as const),
+});
+
+export type BoundedOsmDecoderContract = typeof oracleBoundedOsmDecoderContract;
+
+export interface OsmPbfDecoderModule {
+  readonly oracleBoundedOsmDecoderContract: BoundedOsmDecoderContract;
+  readonly decoder?: OsmPbfDecoder;
+  readonly createDecoder?: () => OsmPbfDecoder;
+}
+
 /**
  * The repository intentionally freezes PBF parsing behind this injected port.
  * Implementations may stream a county-scale PBF, but they cannot acquire bytes
- * or call public Overpass from inside the decoder.
+ * or call public Overpass from inside the decoder. Implementations must emit
+ * nodes, then ways, then relations, with positive IDs in ascending order and
+ * duplicate versions adjacent; this permits bounded duplicate verification.
  */
 export interface OsmPbfDecoder {
-  decode(bytes: Uint8Array, signal: AbortSignal): AsyncIterable<OsmDecodedElement>;
+  /** Consume the repeatable bounded source directly; whole-copy decoder ports are not production-safe. */
+  decode(
+    content: StreamingArtifactContentV2,
+    signal: AbortSignal,
+    limits: OsmPbfDecodeLimits,
+  ): AsyncIterable<OsmDecodedElement>;
 }
 
 export interface OsmPedestrianDecodedRecord extends PbfDecodedRecord {

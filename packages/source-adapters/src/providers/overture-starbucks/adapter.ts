@@ -24,22 +24,27 @@ import {
 import type { Visibility } from '@oracle/contracts/visibility';
 
 import {
-  createAcquiredByteArtifact,
-  type AcquiredByteArtifact,
+  ANALYTICAL_SNAPSHOT_MANIFEST_MEDIA_TYPE,
+  createStreamingAcquiredArtifact,
+  encodeAnalyticalSnapshotManifest,
+  type AcquiredArtifactSource,
+  LEGACY_WHOLE_COPY_MAX_BYTES,
+  type StreamingAcquiredArtifact,
 } from '../../spi/acquired-artifact.js';
 import type {
-  AcquisitionContext,
-  DecodeContext,
   DiscoveryContext,
   DiscoveryResult,
   NormalizationContext,
   PlanningContext,
   RecordValidation,
-  SourceAdapter,
-  SourceRunObservation,
+  SourceRunObservationV2,
+  StreamingAcquisitionContext,
+  StreamingDecodeContext,
+  StreamingSourceAdapter,
   SummaryContext,
   ValidationContext,
 } from '../../spi/adapter.js';
+import { persistAcquiredBody } from '../../spi/acquisition.js';
 import { sha256Hex } from '../../spi/bytes.js';
 import type { JsonValue } from '../../spi/decode.js';
 import type { HttpResponse } from '../../spi/http.js';
@@ -125,6 +130,45 @@ function stableJson(value: unknown): string {
   throw new TypeError(`Unsupported canonical value: ${typeof value}`);
 }
 
+function checkpointForPlan(
+  value: unknown,
+  plan: AcquisitionPlan,
+  requestKey: string,
+  artifactId: ArtifactId,
+  origin: 'caller' | 'stored',
+): SourceCheckpoint {
+  const parsed = sourceCheckpointSchema.safeParse(value);
+  if (!parsed.success) {
+    throw providerError('SCHEMA_DRIFT', `Invalid ${origin} Overture checkpoint`, 'acquire');
+  }
+  const checkpoint = parsed.data;
+  const isInitial =
+    checkpoint.nextSequence === 0 &&
+    checkpoint.completedRequestKeys.length === 0 &&
+    checkpoint.acquiredArtifactIds.length === 0 &&
+    !checkpoint.complete;
+  const isComplete =
+    checkpoint.nextSequence === 1 &&
+    checkpoint.completedRequestKeys.length === 1 &&
+    checkpoint.completedRequestKeys[0] === requestKey &&
+    checkpoint.acquiredArtifactIds.length === 1 &&
+    checkpoint.acquiredArtifactIds[0] === artifactId &&
+    checkpoint.complete;
+  if (
+    checkpoint.sourceId !== plan.sourceId ||
+    checkpoint.snapshotId !== plan.snapshotId ||
+    checkpoint.contractVersion !== plan.contractVersion ||
+    (!isInitial && !isComplete)
+  ) {
+    throw providerError(
+      'RECONCILIATION',
+      `${origin} Overture checkpoint is not an exact prefix of the frozen one-item plan`,
+      'acquire',
+    );
+  }
+  return checkpoint;
+}
+
 function hashText(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -156,7 +200,7 @@ function retryAfterMs(response: HttpResponse): number | undefined {
 
 async function requestWithRetry(
   request: Readonly<{ method: 'GET' | 'HEAD'; url: string; accept: string }>,
-  context: Pick<AcquisitionContext, 'http' | 'delay' | 'ratePolicy' | 'signal'>,
+  context: Pick<StreamingAcquisitionContext, 'http' | 'delay' | 'ratePolicy' | 'signal'>,
 ): Promise<Readonly<{ response: HttpResponse; attempt: number }>> {
   let lastFailure: unknown;
   for (let attempt = 1; attempt <= context.ratePolicy.maxAttempts; attempt += 1) {
@@ -225,27 +269,6 @@ async function requestWithRetry(
       cause: lastFailure instanceof Error ? lastFailure.message : String(lastFailure),
     },
   );
-}
-
-async function collectBody(
-  body: AsyncIterable<Uint8Array>,
-  signal: AbortSignal,
-): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
-  let size = 0;
-  for await (const chunk of body) {
-    signal.throwIfAborted();
-    const copy = Uint8Array.from(chunk);
-    chunks.push(copy);
-    size += copy.byteLength;
-  }
-  const bytes = new Uint8Array(size);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
 }
 
 function assertFrozenHeaders(
@@ -468,7 +491,7 @@ function jsonValue(value: unknown): value is JsonValue {
 function decodeFeature(
   value: unknown,
   ordinal: number,
-  artifact: AcquiredByteArtifact,
+  artifact: Pick<AcquiredArtifactSource, 'metadata'>,
 ): OvertureDecodedPlace {
   const feature = object(value, `features[${ordinal}]`);
   exactKeys(feature, ['type', 'id', 'geometry', 'properties'], `features[${ordinal}]`);
@@ -510,7 +533,7 @@ function decodeFeature(
 
 export function decodeOvertureExcerpt(
   bytes: Uint8Array,
-  artifact: AcquiredByteArtifact,
+  artifact: Pick<AcquiredArtifactSource, 'metadata'>,
 ): readonly OvertureDecodedPlace[] {
   let parsed: unknown;
   try {
@@ -546,6 +569,35 @@ export function decodeOvertureExcerpt(
   return Object.freeze(
     collection.features.map((feature, ordinal) => decodeFeature(feature, ordinal, artifact)),
   );
+}
+
+async function readFixtureGeoJson(
+  artifact: AcquiredArtifactSource,
+  signal: AbortSignal,
+): Promise<Uint8Array> {
+  if (artifact.metadata.byteSize > LEGACY_WHOLE_COPY_MAX_BYTES) {
+    throw providerError(
+      'SCHEMA_DRIFT',
+      `GeoJSON compatibility artifacts are limited to ${LEGACY_WHOLE_COPY_MAX_BYTES} bytes; production Overture acquisition must use Parquet`,
+      'decode',
+    );
+  }
+  if (artifact.bytes !== undefined) return artifact.bytes.copy();
+  const bytes = new Uint8Array(artifact.content.byteLength);
+  let offset = 0;
+  for await (const chunk of artifact.content.read({ maxChunkBytes: 64 * 1024 })) {
+    signal.throwIfAborted();
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  if (offset !== bytes.byteLength) {
+    throw providerError(
+      'SCHEMA_DRIFT',
+      'Overture GeoJSON compatibility read was truncated',
+      'decode',
+    );
+  }
+  return bytes;
 }
 
 function rowToFeature(rowValue: unknown): unknown {
@@ -793,18 +845,20 @@ function contentType(response: HttpResponse): string {
   );
 }
 
-function visibilityCounts(mutations: readonly CanonicalMutation[]): Record<Visibility, number> {
+async function visibilityCounts(
+  mutations: AsyncIterable<CanonicalMutation>,
+): Promise<Record<Visibility, number>> {
   const counts: Record<Visibility, number> = {
     public: 0,
     authenticated: 0,
     restricted: 0,
     prohibited_public: 0,
   };
-  for (const mutation of mutations) counts[mutation.visibility] += 1;
+  for await (const mutation of mutations) counts[mutation.visibility] += 1;
   return counts;
 }
 
-export class OvertureStarbucksAdapter implements SourceAdapter<
+export class OvertureStarbucksAdapter implements StreamingSourceAdapter<
   OvertureDecodedPlace,
   OvertureStarbucksCandidate
 > {
@@ -827,9 +881,9 @@ export class OvertureStarbucksAdapter implements SourceAdapter<
     if (
       !Number.isSafeInteger(this.#maximumRows) ||
       this.#maximumRows < 1 ||
-      this.#maximumRows > 100_000
+      this.#maximumRows > MAXIMUM_ROWS
     ) {
-      throw new RangeError('maximumRows must be between 1 and 100000');
+      throw new RangeError(`maximumRows must be between 1 and ${MAXIMUM_ROWS}`);
     }
     if (
       !Number.isFinite(this.#minimumConfidence) ||
@@ -915,20 +969,29 @@ export class OvertureStarbucksAdapter implements SourceAdapter<
   public async *acquire(
     plan: AcquisitionPlan,
     checkpoint: SourceCheckpoint | undefined,
-    context: AcquisitionContext,
-  ): AsyncIterable<AcquiredByteArtifact> {
+    context: StreamingAcquisitionContext,
+  ): AsyncIterable<StreamingAcquiredArtifact> {
     context.signal.throwIfAborted();
     if (plan.sourceId !== OVERTURE_STARBUCKS_SOURCE_ID || plan.items.length !== 1) {
       throw providerError('RECORD_QUALITY', 'Overture plan identity changed', 'acquire');
     }
+    const item = plan.items[0];
+    if (item === undefined) throw new Error('Overture plan lost its only item');
+    const expectedArtifactId = `sc:artifact:sha256:${this.#artifact.expectedSha256}` as ArtifactId;
     const scope = `${OVERTURE_STARBUCKS_SOURCE_ID}|${plan.snapshotId}`;
     const persisted = await context.checkpointStore.load(scope);
     const persistedCheckpoint =
-      persisted === undefined ? undefined : sourceCheckpointSchema.parse(persisted.payload);
+      persisted === undefined
+        ? undefined
+        : checkpointForPlan(persisted.payload, plan, item.requestKey, expectedArtifactId, 'stored');
+    const callerCheckpoint =
+      checkpoint === undefined
+        ? undefined
+        : checkpointForPlan(checkpoint, plan, item.requestKey, expectedArtifactId, 'caller');
     if (
-      checkpoint !== undefined &&
+      callerCheckpoint !== undefined &&
       persistedCheckpoint !== undefined &&
-      stableJson(checkpoint) !== stableJson(persistedCheckpoint)
+      stableJson(callerCheckpoint) !== stableJson(persistedCheckpoint)
     ) {
       throw providerError(
         'RECONCILIATION',
@@ -936,30 +999,76 @@ export class OvertureStarbucksAdapter implements SourceAdapter<
         'acquire',
       );
     }
-    const current = checkpoint ?? persistedCheckpoint;
-    const item = plan.items[0];
-    if (item === undefined) throw new Error('Overture plan lost its only item');
-    if (
+    const current = callerCheckpoint ?? persistedCheckpoint;
+    const replayingCommittedArtifact =
       current?.complete === true ||
-      current?.completedRequestKeys.includes(item.requestKey) === true
-    )
-      return;
-    const result = await requestWithRetry(
-      { method: 'GET', url: item.url, accept: item.expectedMediaTypes.join(', ') },
-      context,
-    );
-    assertFrozenHeaders(result.response, this.#artifact, 'acquire');
-    const mediaType = contentType(result.response);
-    if (!item.expectedMediaTypes.includes(mediaType)) {
-      throw providerError('SCHEMA_DRIFT', 'Overture artifact media type changed', 'acquire', {
-        mediaType,
-      });
+      current?.completedRequestKeys.includes(item.requestKey) === true;
+    const extension = this.#artifact.encoding === 'parquet' ? 'parquet' : 'geojson';
+    const logicalKey = `raw/overture-starbucks/${OVERTURE_STARBUCKS_RELEASE}/${item.requestKey}.${extension}`;
+    let stored = await context.artifactStore.headByLogicalKey(logicalKey);
+    let mediaType: string;
+    let retrievedAt: string;
+    let responseEtag: string | null;
+    let responseLastModified: string | null;
+    let attempt: number;
+    if (stored === undefined && replayingCommittedArtifact) {
+      throw providerError(
+        'RECONCILIATION',
+        'Committed Overture checkpoint is missing its immutable raw artifact; no network replay was attempted',
+        'acquire',
+      );
     }
-    const bytes = await collectBody(result.response.body, context.signal);
-    const sha256 = sha256Hex(bytes);
+    if (stored === undefined) {
+      const result = await requestWithRetry(
+        { method: 'GET', url: item.url, accept: item.expectedMediaTypes.join(', ') },
+        context,
+      );
+      assertFrozenHeaders(result.response, this.#artifact, 'acquire');
+      mediaType = contentType(result.response);
+      if (!item.expectedMediaTypes.includes(mediaType)) {
+        throw providerError('SCHEMA_DRIFT', 'Overture artifact media type changed', 'acquire', {
+          mediaType,
+        });
+      }
+      retrievedAt = context.clock.now();
+      responseEtag = header(result.response.headers, 'etag') ?? null;
+      responseLastModified = parseHttpInstant(header(result.response.headers, 'last-modified'));
+      attempt = result.attempt;
+      stored = await persistAcquiredBody({
+        store: context.artifactStore,
+        logicalKey,
+        mediaType,
+        body: result.response.body,
+        maximumBytes: this.#artifact.expectedBytes,
+        expectedSha256: this.#artifact.expectedSha256,
+        metadata: Object.freeze({
+          sourceId: OVERTURE_STARBUCKS_SOURCE_ID,
+          release: OVERTURE_STARBUCKS_RELEASE,
+          theme: 'places',
+          type: 'place',
+          sourceUrl: item.url,
+          retrievedAt,
+          responseEtag: responseEtag ?? '',
+          responseLastModified: responseLastModified ?? '',
+          attempt: String(attempt),
+        }),
+        signal: context.signal,
+      });
+    } else {
+      mediaType = stored.mediaType;
+      retrievedAt = stored.metadata.retrievedAt ?? context.clock.now();
+      responseEtag =
+        stored.metadata.responseEtag === '' ? null : (stored.metadata.responseEtag ?? null);
+      responseLastModified =
+        stored.metadata.responseLastModified === ''
+          ? null
+          : (stored.metadata.responseLastModified ?? null);
+      attempt = Number(stored.metadata.attempt ?? '1');
+    }
     if (
-      bytes.byteLength !== this.#artifact.expectedBytes ||
-      sha256 !== this.#artifact.expectedSha256
+      stored.byteSize !== this.#artifact.expectedBytes ||
+      stored.sha256 !== this.#artifact.expectedSha256 ||
+      !item.expectedMediaTypes.includes(stored.mediaType)
     ) {
       throw providerError(
         'SCHEMA_DRIFT',
@@ -967,35 +1076,13 @@ export class OvertureStarbucksAdapter implements SourceAdapter<
         'acquire',
         {
           expectedBytes: this.#artifact.expectedBytes,
-          actualBytes: bytes.byteLength,
+          actualBytes: stored.byteSize,
           expectedSha256: this.#artifact.expectedSha256,
-          actualSha256: sha256,
+          actualSha256: stored.sha256,
         },
       );
     }
-    const extension = this.#artifact.encoding === 'parquet' ? 'parquet' : 'geojson';
-    const stored = await context.artifactStore.putImmutable({
-      logicalKey: `raw/overture-starbucks/${OVERTURE_STARBUCKS_RELEASE}/${sha256}.${extension}`,
-      mediaType,
-      body: bytes,
-      expectedSha256: sha256,
-      metadata: Object.freeze({
-        sourceId: OVERTURE_STARBUCKS_SOURCE_ID,
-        release: OVERTURE_STARBUCKS_RELEASE,
-        theme: 'places',
-        type: 'place',
-        sourceUrl: item.url,
-      }),
-      ifAbsent: true,
-    });
-    if (stored.sha256 !== sha256 || stored.byteSize !== bytes.byteLength) {
-      throw providerError(
-        'RECONCILIATION',
-        'Artifact store returned mismatched Overture metadata',
-        'acquire',
-      );
-    }
-    const retrievedAt = context.clock.now();
+    const sha256 = stored.sha256;
     const artifactId = `sc:artifact:sha256:${sha256}` as ArtifactId;
     const metadata = acquiredArtifactSchema.parse({
       artifactId,
@@ -1014,17 +1101,17 @@ export class OvertureStarbucksAdapter implements SourceAdapter<
           },
         ],
         bodySha256: null,
-        attempt: result.attempt,
+        attempt,
       },
       response: {
-        httpStatus: result.response.status,
-        etag: header(result.response.headers, 'etag') ?? null,
-        lastModified: parseHttpInstant(header(result.response.headers, 'last-modified')),
+        httpStatus: 200,
+        etag: responseEtag,
+        lastModified: responseLastModified,
         finalUrl: item.url,
       },
       mediaType,
       encoding: this.#artifact.encoding,
-      byteSize: bytes.byteLength,
+      byteSize: stored.byteSize,
       sha256,
       schemaFingerprint: {
         algorithm: 'sha256',
@@ -1036,36 +1123,99 @@ export class OvertureStarbucksAdapter implements SourceAdapter<
       licenseSnapshotRef: OVERTURE_STARBUCKS_DESCRIPTOR.license.licenseSnapshotId,
       visibility: OVERTURE_STARBUCKS_DESCRIPTOR.defaultVisibility,
     });
-    const nextCheckpoint = sourceCheckpointSchema.parse({
-      sourceId: plan.sourceId,
-      snapshotId: plan.snapshotId,
-      contractVersion: plan.contractVersion,
-      cursor: 'complete',
-      nextSequence: 1,
-      completedRequestKeys: [item.requestKey],
-      acquiredArtifactIds: [artifactId],
-      updatedAt: retrievedAt,
-      complete: true,
-    });
-    const envelope = createCheckpointEnvelope({
-      scope,
-      previousRevision: persisted?.revision ?? null,
-      writtenAt: retrievedAt,
-      payload: nextCheckpoint,
-    });
-    const committed = await context.checkpointStore.commit({
-      expectedRevision: persisted?.revision ?? null,
-      checkpoint: envelope,
-    });
-    if (committed.status === 'conflict') {
-      throw providerError('RECONCILIATION', 'Optimistic Overture checkpoint conflict', 'acquire');
+    let analyticalManifestLogicalKey: string | undefined;
+    if (metadata.encoding === 'parquet') {
+      analyticalManifestLogicalKey = `${logicalKey}.analytical-manifest.json`;
+      const manifestBytes = encodeAnalyticalSnapshotManifest({
+        formatVersion: '1.0.0',
+        dataArtifacts: Object.freeze([
+          Object.freeze({
+            uri: stored.uri,
+            byteLength: stored.byteSize,
+            sha256: stored.sha256,
+          }),
+        ]),
+        scanBytesByOperation: Object.freeze({
+          decode_overture_santa_clara_starbucks_candidates: stored.byteSize,
+        }),
+      });
+      const manifestSha256 = createHash('sha256').update(manifestBytes).digest('hex');
+      const orphan = await context.artifactStore.headByLogicalKey(analyticalManifestLogicalKey);
+      if (orphan === undefined && replayingCommittedArtifact) {
+        throw providerError(
+          'RECONCILIATION',
+          'Committed Overture checkpoint is missing its analytical manifest',
+          'acquire',
+        );
+      }
+      const manifest =
+        orphan ??
+        (await persistAcquiredBody({
+          store: context.artifactStore,
+          logicalKey: analyticalManifestLogicalKey,
+          mediaType: ANALYTICAL_SNAPSHOT_MANIFEST_MEDIA_TYPE,
+          body: (async function* () {
+            await Promise.resolve();
+            yield manifestBytes;
+          })(),
+          maximumBytes: 1024 * 1024,
+          expectedSha256: manifestSha256,
+          metadata: Object.freeze({
+            sourceId: metadata.sourceId,
+            snapshotId: metadata.snapshotId,
+            parentArtifactId: metadata.artifactId,
+            formatVersion: '1.0.0',
+          }),
+          signal: context.signal,
+        }));
+      if (
+        manifest.mediaType !== ANALYTICAL_SNAPSHOT_MANIFEST_MEDIA_TYPE ||
+        manifest.byteSize !== manifestBytes.byteLength ||
+        manifest.sha256 !== manifestSha256 ||
+        manifest.metadata.parentArtifactId !== metadata.artifactId ||
+        manifest.metadata.formatVersion !== '1.0.0'
+      ) {
+        throw providerError(
+          'SCHEMA_DRIFT',
+          'Overture analytical manifest orphan does not match the frozen artifact',
+          'acquire',
+        );
+      }
     }
-    yield createAcquiredByteArtifact(metadata, bytes);
+    if (!replayingCommittedArtifact) {
+      const nextCheckpoint = sourceCheckpointSchema.parse({
+        sourceId: plan.sourceId,
+        snapshotId: plan.snapshotId,
+        contractVersion: plan.contractVersion,
+        cursor: 'complete',
+        nextSequence: 1,
+        completedRequestKeys: [item.requestKey],
+        acquiredArtifactIds: [artifactId],
+        updatedAt: retrievedAt,
+        complete: true,
+      });
+      const envelope = createCheckpointEnvelope({
+        scope,
+        previousRevision: persisted?.revision ?? null,
+        writtenAt: retrievedAt,
+        payload: nextCheckpoint,
+      });
+      const committed = await context.checkpointStore.commit({
+        expectedRevision: persisted?.revision ?? null,
+        checkpoint: envelope,
+      });
+      if (committed.status === 'conflict') {
+        throw providerError('RECONCILIATION', 'Optimistic Overture checkpoint conflict', 'acquire');
+      }
+    }
+    yield await createStreamingAcquiredArtifact(metadata, context.artifactStore, {
+      ...(analyticalManifestLogicalKey === undefined ? {} : { analyticalManifestLogicalKey }),
+    });
   }
 
   public async *decode(
-    artifact: AcquiredByteArtifact,
-    context: DecodeContext,
+    artifact: AcquiredArtifactSource,
+    context: StreamingDecodeContext,
   ): AsyncIterable<OvertureDecodedPlace> {
     context.signal.throwIfAborted();
     if (artifact.metadata.sourceId !== OVERTURE_STARBUCKS_SOURCE_ID) {
@@ -1074,7 +1224,8 @@ export class OvertureStarbucksAdapter implements SourceAdapter<
     const attachSnapshot = (record: OvertureDecodedPlace): OvertureDecodedPlace =>
       Object.freeze({ ...record, snapshotId: artifact.metadata.snapshotId });
     if (artifact.metadata.encoding === 'geojson') {
-      for (const record of decodeOvertureExcerpt(artifact.bytes.copy(), artifact)) {
+      const bytes = await readFixtureGeoJson(artifact, context.signal);
+      for (const record of decodeOvertureExcerpt(bytes, artifact)) {
         context.signal.throwIfAborted();
         yield attachSnapshot(record);
       }
@@ -1087,43 +1238,67 @@ export class OvertureStarbucksAdapter implements SourceAdapter<
         'decode',
       );
     }
+    const analyticalSnapshot = artifact.content?.analyticalSnapshot;
+    if (artifact.content !== undefined && analyticalSnapshot === undefined) {
+      throw providerError(
+        'SCHEMA_DRIFT',
+        'Overture Parquet artifact is missing its bounded analytical manifest',
+        'decode',
+      );
+    }
     const session = await context.analyticalRuntime.open(
       {
         releaseId: OVERTURE_STARBUCKS_RELEASE,
-        manifestUri: artifact.metadata.rawUri,
-        manifestSha256: artifact.metadata.sha256,
+        manifestUri: analyticalSnapshot?.manifestUri ?? artifact.metadata.rawUri,
+        manifestSha256: analyticalSnapshot?.manifestSha256 ?? artifact.metadata.sha256,
       },
       context.signal,
     );
     try {
-      const result = await session.execute({
-        operation: 'decode_overture_santa_clara_starbucks_candidates',
-        statement: OVERTURE_STARBUCKS_QUERY,
-        parameters: [
-          artifact.metadata.rawUri,
-          SANTA_CLARA_OVERTURE_BOUNDS.west,
-          SANTA_CLARA_OVERTURE_BOUNDS.east,
-          SANTA_CLARA_OVERTURE_BOUNDS.south,
-          SANTA_CLARA_OVERTURE_BOUNDS.north,
-          STARBUCKS_WIKIDATA_ID,
-          '%starbucks%',
-          '%starbucks%',
-        ],
-        timeoutMs: 120_000,
-        maximumScanBytes: this.#artifact.expectedBytes,
-        maximumRows: this.#maximumRows,
-        signal: context.signal,
-      });
-      if (result.truncated) {
-        throw providerError(
-          'QUERY_REGRESSION',
-          'Overture candidate query exceeded its frozen row bound',
-          'decode',
-        );
-      }
-      for (const [ordinal, row] of result.rows.entries()) {
+      let lastGersId = '';
+      let ordinal = 0;
+      for (;;) {
         context.signal.throwIfAborted();
-        yield attachSnapshot(decodeFeature(rowToFeature(row), ordinal, artifact));
+        const result = await session.execute({
+          operation: 'decode_overture_santa_clara_starbucks_candidates',
+          statement: OVERTURE_STARBUCKS_QUERY,
+          parameters: [
+            artifact.metadata.rawUri,
+            SANTA_CLARA_OVERTURE_BOUNDS.west,
+            SANTA_CLARA_OVERTURE_BOUNDS.east,
+            SANTA_CLARA_OVERTURE_BOUNDS.south,
+            SANTA_CLARA_OVERTURE_BOUNDS.north,
+            STARBUCKS_WIKIDATA_ID,
+            '%starbucks%',
+            '%starbucks%',
+            lastGersId,
+          ],
+          timeoutMs: 120_000,
+          maximumScanBytes: this.#artifact.expectedBytes,
+          maximumRows: 1,
+          signal: context.signal,
+        });
+        const row = result.rows[0];
+        if (row === undefined) break;
+        const record = attachSnapshot(decodeFeature(rowToFeature(row), ordinal, artifact));
+        if (record.gersId <= lastGersId) {
+          throw providerError(
+            'QUERY_REGRESSION',
+            'Overture keyset page did not advance in GERS ID order',
+            'decode',
+          );
+        }
+        yield record;
+        ordinal += 1;
+        lastGersId = record.gersId;
+        if (!result.truncated) break;
+        if (ordinal >= this.#maximumRows) {
+          throw providerError(
+            'QUERY_REGRESSION',
+            'Overture candidate query exceeded its frozen row bound',
+            'decode',
+          );
+        }
       }
     } finally {
       await session[Symbol.asyncDispose]();
@@ -1314,9 +1489,18 @@ export class OvertureStarbucksAdapter implements SourceAdapter<
     });
   }
 
-  public summarize(run: SourceRunObservation, context: SummaryContext): SourceRunSummary {
+  public async summarize(
+    run: SourceRunObservationV2,
+    context: SummaryContext,
+  ): Promise<SourceRunSummary> {
     context.signal.throwIfAborted();
-    const errors = run.validationIssues.filter((issue) => issue.severity !== 'warning').length;
+    let warnings = 0;
+    let errors = 0;
+    for await (const issue of run.validationIssues.read()) {
+      context.signal.throwIfAborted();
+      if (issue.severity === 'warning') warnings += 1;
+      else errors += 1;
+    }
     const status = run.aborted
       ? 'aborted'
       : errors > 0 || run.rejectedRecords > 0
@@ -1337,9 +1521,9 @@ export class OvertureStarbucksAdapter implements SourceAdapter<
       decodedRecords: run.decodedRecords,
       acceptedRecords: run.acceptedRecords,
       rejectedRecords: run.rejectedRecords,
-      normalizedMutations: run.mutations.length,
-      visibilityCounts: visibilityCounts(run.mutations),
-      warningCount: run.validationIssues.filter((issue) => issue.severity === 'warning').length,
+      normalizedMutations: run.mutations.count,
+      visibilityCounts: await visibilityCounts(run.mutations.read()),
+      warningCount: warnings,
       errorCount: errors,
       finalCheckpoint: run.finalCheckpoint,
     });

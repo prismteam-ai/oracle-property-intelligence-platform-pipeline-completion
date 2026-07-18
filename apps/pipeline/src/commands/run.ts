@@ -6,8 +6,9 @@ import { pathToFileURL } from 'node:url';
 import { LocalArtifactStore } from '@oracle/artifacts/implementations/local-artifact-store';
 import type {
   ArtifactByteRange,
-  ArtifactStore,
+  RecoverableArtifactStore,
   ImmutableArtifactWrite,
+  StreamingImmutableArtifactWrite,
   StoredArtifact,
 } from '@oracle/artifacts/artifact-store';
 import { LocalCheckpointStore } from '@oracle/artifacts/implementations/local-checkpoint-store';
@@ -28,6 +29,12 @@ import {
   SANTA_CLARA_PARCELS_SCHEMA_COLUMNS,
 } from '@oracle/source-adapters/providers/santa-clara-socrata-parcels/index';
 import type { HttpRequest, HttpResponse, HttpTransport } from '@oracle/source-adapters/spi/http';
+import {
+  ANALYTICAL_SNAPSHOT_MANIFEST_MEDIA_TYPE,
+  MAX_ANALYTICAL_SNAPSHOT_MANIFEST_BYTES,
+  parseAnalyticalSnapshotManifest,
+  type AnalyticalSnapshotManifestV1,
+} from '@oracle/source-adapters/spi/acquired-artifact';
 
 import { createDefaultPipelineProcessors } from '../orchestration/default-processors.js';
 import { createRunProfile } from '../orchestration/profiles.js';
@@ -75,7 +82,7 @@ function requiredFixtureSnapshot(
 }
 
 /** Keeps contract logical keys intact while making every path segment portable to Windows. */
-class PortableLocalArtifactStore implements ArtifactStore {
+class PortableLocalArtifactStore implements RecoverableArtifactStore {
   readonly #delegate: LocalArtifactStore;
   readonly #rootDirectory: string;
 
@@ -85,8 +92,18 @@ class PortableLocalArtifactStore implements ArtifactStore {
   }
 
   public async putImmutable(request: ImmutableArtifactWrite): Promise<StoredArtifact> {
+    return this.#put(request);
+  }
+
+  public async putImmutableStreaming(
+    request: StreamingImmutableArtifactWrite,
+  ): Promise<StoredArtifact> {
+    return this.#put(request);
+  }
+
+  async #put(request: StreamingImmutableArtifactWrite): Promise<StoredArtifact> {
     const physicalKey = this.#physicalKey(request.logicalKey);
-    const stored = await this.#delegate.putImmutable({
+    const stored = await this.#delegate.putImmutableStreaming({
       ...request,
       logicalKey: physicalKey,
       metadata: Object.freeze({ ...request.metadata, [ORIGINAL_KEY_METADATA]: request.logicalKey }),
@@ -100,12 +117,28 @@ class PortableLocalArtifactStore implements ArtifactStore {
     return stored === undefined ? undefined : this.#restore(stored, originalKey);
   }
 
+  public async headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined> {
+    const stored = await this.#delegate.headByLogicalKey(this.#physicalKey(logicalKey));
+    if (stored === undefined) return undefined;
+    if (stored.metadata[ORIGINAL_KEY_METADATA] !== logicalKey) {
+      throw new Error(`Portable artifact logical-key metadata mismatch for ${logicalKey}`);
+    }
+    return this.#restore(stored, logicalKey);
+  }
+
   public read(uri: string, range?: ArtifactByteRange): AsyncIterable<Uint8Array> {
     return this.#delegate.read(this.#delegateUri(this.#logicalKey(uri)), range);
   }
 
   public physicalUri(uri: string): string {
     return this.#delegateUri(this.#logicalKey(uri));
+  }
+
+  public async verify(uri: string): Promise<StoredArtifact> {
+    const logicalKey = this.#logicalKey(uri);
+    const stored = await this.headByLogicalKey(logicalKey);
+    if (stored === undefined) throw new Error(`Artifact not found: ${logicalKey}`);
+    return stored;
   }
 
   #restore(stored: StoredArtifact, originalKey: string): StoredArtifact {
@@ -219,7 +252,7 @@ class FixtureParcelTransport implements HttpTransport {
   }
 }
 
-class FetchTransport implements HttpTransport {
+export class FetchTransport implements HttpTransport {
   readonly #authorization: readonly AuthorizationRule[];
   readonly #requestTimeoutMs: number;
 
@@ -248,14 +281,28 @@ class FetchTransport implements HttpTransport {
       method: request.method,
       headers,
       signal: boundedSignal,
+      redirect: 'manual',
       ...(request.body === undefined ? {} : { body: request.body }),
     };
     const response = await fetch(request.url, init);
+    if (response.status >= 300 && response.status < 400) {
+      throw new RedirectRejectedError(request.url, response.status);
+    }
     return Object.freeze({
       status: response.status,
       headers: collectResponseHeaders(response.headers),
       body: response.body ?? oneChunk(new Uint8Array()),
+      finalUrl: response.url,
     });
+  }
+}
+
+export class RedirectRejectedError extends Error {
+  public readonly code = 'HTTP_REDIRECT_REJECTED';
+
+  public constructor(url: string, status: number) {
+    super(`HTTP redirect ${status} rejected for ${url}`);
+    this.name = 'RedirectRejectedError';
   }
 }
 
@@ -277,22 +324,50 @@ export function collectResponseHeaders(headers: Headers): Readonly<Record<string
 class RemappedAnalyticalSession implements AnalyticalSession {
   readonly #delegate: AnalyticalSession;
   readonly #artifacts: PortableLocalArtifactStore;
+  readonly #expectedDataArtifacts: ReadonlyMap<
+    string,
+    AnalyticalSnapshotManifestV1['dataArtifacts'][number]
+  >;
+  readonly #verifiedDataArtifacts = new Map<string, Promise<string>>();
 
-  public constructor(delegate: AnalyticalSession, artifacts: PortableLocalArtifactStore) {
+  public constructor(
+    delegate: AnalyticalSession,
+    artifacts: PortableLocalArtifactStore,
+    manifest: AnalyticalSnapshotManifestV1,
+  ) {
     this.#delegate = delegate;
     this.#artifacts = artifacts;
+    this.#expectedDataArtifacts = new Map(
+      manifest.dataArtifacts.map((artifact) => [artifact.uri, artifact]),
+    );
   }
 
-  public execute<TRow extends AnalyticalRow = AnalyticalRow>(
+  public async execute<TRow extends AnalyticalRow = AnalyticalRow>(
     query: AnalyticalQuery,
   ): Promise<AnalyticalResult<TRow>> {
+    const parameters = await Promise.all(
+      query.parameters.map(async (value) => {
+        if (typeof value !== 'string' || !value.startsWith('file://oracle-artifact/')) return value;
+        const expected = this.#expectedDataArtifacts.get(value);
+        if (expected === undefined) {
+          throw new Error('Analytical query data artifact is absent from the snapshot manifest');
+        }
+        let verified = this.#verifiedDataArtifacts.get(value);
+        if (verified === undefined) {
+          verified = this.#artifacts.verify(value).then((stored) => {
+            if (stored.byteSize !== expected.byteLength || stored.sha256 !== expected.sha256) {
+              throw new Error('Analytical query data artifact failed snapshot integrity binding');
+            }
+            return this.#artifacts.physicalUri(value);
+          });
+          this.#verifiedDataArtifacts.set(value, verified);
+        }
+        return verified;
+      }),
+    );
     return this.#delegate.execute<TRow>({
       ...query,
-      parameters: query.parameters.map((value) =>
-        typeof value === 'string' && value.startsWith('file://oracle-artifact/')
-          ? this.#artifacts.physicalUri(value)
-          : value,
-      ),
+      parameters,
     });
   }
 
@@ -315,24 +390,10 @@ class PipelineAnalyticalRuntime implements AnalyticalRuntime {
       const { DuckDBAnalyticalRuntime } = untypedModule as DuckDBRuntimeModule;
       return new DuckDBAnalyticalRuntime({
         loadSnapshot: async (snapshot: AnalyticalSnapshot, signal?: AbortSignal) => {
-          signal?.throwIfAborted();
-          const chunks: Uint8Array[] = [];
-          let byteLength = 0;
-          for await (const chunk of this.#artifacts.read(snapshot.manifestUri)) {
-            chunks.push(chunk);
-            byteLength += chunk.byteLength;
-          }
-          const bytes = new Uint8Array(byteLength);
-          let offset = 0;
-          for (const chunk of chunks) {
-            bytes.set(chunk, offset);
-            offset += chunk.byteLength;
-          }
+          const binding = await readAnalyticalSnapshot(this.#artifacts, snapshot, signal);
           return Object.freeze({
-            manifestBytes: bytes,
-            scanBytesByOperation: Object.freeze({
-              decode_overture_santa_clara_starbucks_candidates: byteLength,
-            }),
+            manifestBytes: binding.bytes,
+            scanBytesByOperation: binding.manifest.scanBytesByOperation,
           });
         },
         nowMilliseconds: () => Date.now(),
@@ -345,11 +406,50 @@ class PipelineAnalyticalRuntime implements AnalyticalRuntime {
     snapshot: AnalyticalSnapshot,
     signal?: AbortSignal,
   ): Promise<AnalyticalSession> {
+    const binding = await readAnalyticalSnapshot(this.#artifacts, snapshot, signal);
     return new RemappedAnalyticalSession(
       await (await this.#load()).open(snapshot, signal),
       this.#artifacts,
+      binding.manifest,
     );
   }
+}
+
+async function readAnalyticalSnapshot(
+  artifacts: PortableLocalArtifactStore,
+  snapshot: AnalyticalSnapshot,
+  signal?: AbortSignal,
+): Promise<Readonly<{ bytes: Uint8Array; manifest: AnalyticalSnapshotManifestV1 }>> {
+  signal?.throwIfAborted();
+  const stored = await artifacts.verify(snapshot.manifestUri);
+  if (stored.mediaType !== ANALYTICAL_SNAPSHOT_MANIFEST_MEDIA_TYPE) {
+    throw new TypeError('Analytical snapshot requires a versioned derived manifest');
+  }
+  if (stored.byteSize < 1 || stored.byteSize > MAX_ANALYTICAL_SNAPSHOT_MANIFEST_BYTES) {
+    throw new RangeError(
+      `Analytical snapshot manifest exceeds ${MAX_ANALYTICAL_SNAPSHOT_MANIFEST_BYTES} bytes`,
+    );
+  }
+  if (stored.sha256 !== snapshot.manifestSha256) {
+    throw new Error('Analytical snapshot manifest metadata SHA-256 mismatch');
+  }
+  const bytes = new Uint8Array(stored.byteSize);
+  let offset = 0;
+  for await (const chunk of artifacts.read(snapshot.manifestUri)) {
+    signal?.throwIfAborted();
+    if (offset + chunk.byteLength > bytes.byteLength) {
+      throw new Error('Analytical snapshot manifest exceeded its verified byte length');
+    }
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  if (offset !== bytes.byteLength) {
+    throw new Error('Analytical snapshot manifest ended before its verified byte length');
+  }
+  const manifest = parseAnalyticalSnapshotManifest(
+    JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)),
+  );
+  return Object.freeze({ bytes, manifest });
 }
 
 export type RunCommandOptions = Readonly<{

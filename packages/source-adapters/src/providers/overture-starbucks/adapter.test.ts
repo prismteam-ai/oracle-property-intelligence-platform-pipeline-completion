@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 
 import { acquisitionRequestSchema, sourceCheckpointSchema } from '@oracle/contracts/source';
 import { describe, expect, it } from 'vitest';
+import { createSharedRecordBudget } from '../../spi/record-budget.js';
 
 import { OvertureStarbucksAdapter } from './adapter.js';
 import {
@@ -46,6 +47,17 @@ async function collect<T>(iterable: AsyncIterable<T>): Promise<T[]> {
 
 function controller(): AbortController {
   return new AbortController();
+}
+
+function repeatable<T>(values: readonly T[]) {
+  return Object.freeze({
+    count: values.length,
+    logicalSha256: '0'.repeat(64),
+    read: async function* () {
+      await Promise.resolve();
+      for (const value of values) yield value;
+    },
+  });
 }
 
 function request() {
@@ -138,7 +150,13 @@ describe('OvertureStarbucksAdapter', () => {
     const artifact = artifacts[0];
     if (artifact === undefined) throw new Error('acquired artifact missing');
     const decoded = await collect(
-      adapter.decode(artifact, { artifactStore, analyticalRuntime: UNUSED_RUNTIME, clock, signal }),
+      adapter.decode(artifact, {
+        artifactStore,
+        analyticalRuntime: UNUSED_RUNTIME,
+        recordBudget: createSharedRecordBudget(1),
+        clock,
+        signal,
+      }),
     );
     expect(decoded.map((entry) => entry.gersId)).toEqual([
       '08a87f75-fe95-455d-ab8f-42f37424a70a',
@@ -264,10 +282,11 @@ describe('OvertureStarbucksAdapter', () => {
     };
     const plan = await adapter.plan(request(), discovery, { clock, signal });
     const checkpoints = new TestCheckpointStore();
+    const artifactStore = new TestArtifactStore();
     const artifacts = await collect(
       adapter.acquire(plan, undefined, {
         http: transport,
-        artifactStore: new TestArtifactStore(),
+        artifactStore,
         checkpointStore: checkpoints,
         clock,
         delay,
@@ -282,10 +301,12 @@ describe('OvertureStarbucksAdapter', () => {
       complete: true,
       nextSequence: 1,
     });
+    const replayTransport = new SequenceTransport([]);
+    const replayAdapter = new OvertureStarbucksAdapter({ artifact: config });
     const resumed = await collect(
-      adapter.acquire(plan, sourceCheckpointSchema.parse(envelope?.payload), {
-        http: new SequenceTransport([]),
-        artifactStore: new TestArtifactStore(),
+      replayAdapter.acquire(plan, sourceCheckpointSchema.parse(envelope?.payload), {
+        http: replayTransport,
+        artifactStore,
         checkpointStore: checkpoints,
         clock,
         delay,
@@ -293,11 +314,33 @@ describe('OvertureStarbucksAdapter', () => {
         ratePolicy: RATE_POLICY,
       }),
     );
-    expect(resumed).toEqual([]);
+    expect(replayTransport.requests).toEqual([]);
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0]?.metadata).toEqual(artifacts[0]?.metadata);
+
+    const mismatchedCheckpoint = sourceCheckpointSchema.parse({
+      ...sourceCheckpointSchema.parse(envelope?.payload),
+      acquiredArtifactIds: [`sc:artifact:sha256:${'0'.repeat(64)}`],
+    });
+    const rejectedTransport = new SequenceTransport([]);
+    await expect(
+      collect(
+        replayAdapter.acquire(plan, mismatchedCheckpoint, {
+          http: rejectedTransport,
+          artifactStore,
+          checkpointStore: new TestCheckpointStore(),
+          clock,
+          delay,
+          signal,
+          ratePolicy: RATE_POLICY,
+        }),
+      ),
+    ).rejects.toThrow('exact prefix');
+    expect(rejectedTransport.requests).toEqual([]);
   });
 
   it('propagates abort and optimistic checkpoint conflict without fake success', async () => {
-    const config = await fixtureConfig();
+    const config = await fixtureConfig('parquet');
     const aborted = controller();
     aborted.abort(new DOMException('stop', 'AbortError'));
     const adapter = new OvertureStarbucksAdapter({ artifact: config });
@@ -332,6 +375,7 @@ describe('OvertureStarbucksAdapter', () => {
     };
     const plan = await adapter.plan(request(), discovery, { clock, signal });
     const checkpoints = new TestCheckpointStore();
+    const artifacts = new TestArtifactStore();
     checkpoints.conflict = true;
     await expect(
       collect(
@@ -339,7 +383,7 @@ describe('OvertureStarbucksAdapter', () => {
           http: new SequenceTransport([
             { status: 200, headers: responseHeaders(config), chunks: [bytes] },
           ]),
-          artifactStore: new TestArtifactStore(),
+          artifactStore: artifacts,
           checkpointStore: checkpoints,
           clock,
           delay: new TestDelay(),
@@ -348,6 +392,46 @@ describe('OvertureStarbucksAdapter', () => {
         }),
       ),
     ).rejects.toMatchObject({ code: 'RECONCILIATION' });
+    checkpoints.conflict = false;
+    const replayTransport = new SequenceTransport([]);
+    const adopted = await collect(
+      new OvertureStarbucksAdapter({ artifact: config }).acquire(plan, undefined, {
+        http: replayTransport,
+        artifactStore: artifacts,
+        checkpointStore: checkpoints,
+        clock,
+        delay: new TestDelay(),
+        signal,
+        ratePolicy: RATE_POLICY,
+      }),
+    );
+    expect(replayTransport.requests).toEqual([]);
+    expect(adopted).toHaveLength(1);
+    expect(adopted[0]?.content.analyticalSnapshot).toMatchObject({
+      formatVersion: '1.0.0',
+      byteLength: expect.any(Number),
+    });
+    const committed = sourceCheckpointSchema.parse(
+      checkpoints.checkpoints.get(`${adapter.describe().sourceId}|${SNAPSHOT_ID}`)?.payload,
+    );
+    const completedReplayTransport = new SequenceTransport([]);
+    const completedReplay = await collect(
+      new OvertureStarbucksAdapter({ artifact: config }).acquire(plan, committed, {
+        http: completedReplayTransport,
+        artifactStore: artifacts,
+        checkpointStore: checkpoints,
+        clock,
+        delay: new TestDelay(),
+        signal,
+        ratePolicy: RATE_POLICY,
+      }),
+    );
+    expect(completedReplayTransport.requests).toEqual([]);
+    expect(completedReplay).toHaveLength(1);
+    expect(completedReplay[0]?.metadata).toEqual(adopted[0]?.metadata);
+    expect(completedReplay[0]?.content.analyticalSnapshot).toEqual(
+      adopted[0]?.content.analyticalSnapshot,
+    );
   });
 
   it('rejects malformed geometry and strict schema drift', async () => {
@@ -372,6 +456,7 @@ describe('OvertureStarbucksAdapter', () => {
         adapter.decode(malformed, {
           artifactStore: new TestArtifactStore(),
           analyticalRuntime: UNUSED_RUNTIME,
+          recordBudget: createSharedRecordBudget(1),
           clock: new TestClock(),
           signal: controller().signal,
         }),
@@ -401,6 +486,7 @@ describe('OvertureStarbucksAdapter', () => {
         adapter.decode(drift, {
           artifactStore: new TestArtifactStore(),
           analyticalRuntime: UNUSED_RUNTIME,
+          recordBudget: createSharedRecordBudget(1),
           clock: new TestClock(),
           signal: controller().signal,
         }),
@@ -412,18 +498,23 @@ describe('OvertureStarbucksAdapter', () => {
     const config = await fixtureConfig('parquet');
     const artifact = await acquiredFixture('parquet');
     let disposed = false;
-    let observedQuery: unknown;
+    const observedQueries: Readonly<Record<string, unknown>>[] = [];
     const runtime = {
       open: async () => {
         await Promise.resolve();
         return {
           execute: async (query: unknown) => {
             await Promise.resolve();
-            observedQuery = query;
+            const boundedQuery = query as Readonly<Record<string, unknown>>;
+            observedQueries.push(boundedQuery);
+            const page = observedQueries.length;
             return {
               rows: [
                 {
-                  id: '346ea5cb-3d37-4661-9001-7d0b0ea36a5a',
+                  id:
+                    page === 1
+                      ? '346ea5cb-3d37-4661-9001-7d0b0ea36a5a'
+                      : 'f46ea5cb-3d37-4661-9001-7d0b0ea36a5a',
                   version: 3,
                   names: { primary: 'Starbucks', common: null, rules: [] },
                   categories: { primary: 'coffee_shop', alternate: ['cafe'] },
@@ -467,7 +558,7 @@ describe('OvertureStarbucksAdapter', () => {
               ],
               elapsedMs: 5,
               scannedBytes: config.expectedBytes,
-              truncated: false,
+              truncated: page === 1,
             };
           },
           [Symbol.asyncDispose]: async () => {
@@ -482,17 +573,22 @@ describe('OvertureStarbucksAdapter', () => {
       adapter.decode(artifact, {
         artifactStore: new TestArtifactStore(),
         analyticalRuntime: runtime as never,
+        recordBudget: createSharedRecordBudget(1),
         clock: new TestClock(),
         signal: controller().signal,
       }),
     );
-    expect(decoded).toHaveLength(1);
-    expect(observedQuery).toMatchObject({
+    expect(decoded).toHaveLength(2);
+    expect(observedQueries[0]).toMatchObject({
       operation: 'decode_overture_santa_clara_starbucks_candidates',
       statement: OVERTURE_STARBUCKS_QUERY,
-      maximumRows: 25,
+      maximumRows: 1,
       maximumScanBytes: config.expectedBytes,
-      parameters: expect.arrayContaining([STARBUCKS_WIKIDATA_ID, '%starbucks%']),
+      parameters: expect.arrayContaining([STARBUCKS_WIKIDATA_ID, '%starbucks%', '']),
+    });
+    expect(observedQueries[1]).toMatchObject({
+      maximumRows: 1,
+      parameters: expect.arrayContaining(['346ea5cb-3d37-4661-9001-7d0b0ea36a5a']),
     });
     expect(disposed).toBe(true);
   });
@@ -502,7 +598,7 @@ describe('OvertureStarbucksAdapter', () => {
     const checkpoint = sourceCheckpointSchema.parse({
       sourceId: adapter.describe().sourceId,
       snapshotId: SNAPSHOT_ID,
-      contractVersion: '1.0.0',
+      contractVersion: '2.0.0',
       cursor: 'none',
       nextSequence: 0,
       completedRequestKeys: [],
@@ -510,7 +606,7 @@ describe('OvertureStarbucksAdapter', () => {
       updatedAt: '2026-07-17T10:00:00.000Z',
       complete: false,
     });
-    const summary = adapter.summarize(
+    const summary = await adapter.summarize(
       {
         descriptor: adapter.describe(),
         runId: `sc:run:${'1'.repeat(64)}` as never,
@@ -518,7 +614,7 @@ describe('OvertureStarbucksAdapter', () => {
         plan: {
           sourceId: adapter.describe().sourceId,
           snapshotId: SNAPSHOT_ID,
-          contractVersion: '1.0.0',
+          contractVersion: '2.0.0',
           plannedAt: '2026-07-17T10:00:00.000Z',
           items: [
             {
@@ -538,8 +634,8 @@ describe('OvertureStarbucksAdapter', () => {
         decodedRecords: 0,
         acceptedRecords: 0,
         rejectedRecords: 0,
-        mutations: [],
-        validationIssues: [],
+        mutations: repeatable([]),
+        validationIssues: repeatable([]),
         aborted: true,
       },
       { clock: new TestClock(), signal: controller().signal },

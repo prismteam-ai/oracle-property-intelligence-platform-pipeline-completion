@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-import { assertStoredArtifactIntegrity } from '@oracle/artifacts/artifact-store';
+import type { StoredArtifact } from '@oracle/artifacts/artifact-store';
 import { createCheckpointEnvelope } from '@oracle/artifacts/checkpoint-store';
 import {
   canonicalMutationSchema,
@@ -21,6 +21,7 @@ import {
   sourceDescriptorSchema,
   sourceRunSummarySchema,
   type AcquisitionPlan,
+  type AcquiredArtifact,
   type AcquisitionRequest,
   type SourceCheckpoint,
   type SourceDescriptor,
@@ -29,19 +30,22 @@ import {
 } from '@oracle/contracts/source';
 
 import {
-  createAcquiredByteArtifact,
-  type AcquiredByteArtifact,
+  createStreamingAcquiredArtifact,
+  LegacyWholeCopyLimitError,
+  LEGACY_WHOLE_COPY_MAX_BYTES,
+  type AcquiredArtifactSource,
 } from '../../spi/acquired-artifact.js';
+import { persistAcquiredBody } from '../../spi/acquisition.js';
 import type {
-  AcquisitionContext,
-  DecodeContext,
   DiscoveryContext,
   DiscoveryResult,
   NormalizationContext,
   PlanningContext,
   RecordValidation,
-  SourceAdapter,
-  SourceRunObservation,
+  SourceRunObservationV2,
+  StreamingAcquisitionContext,
+  StreamingDecodeContext,
+  StreamingSourceAdapter,
   SummaryContext,
   ValidationContext,
 } from '../../spi/adapter.js';
@@ -71,11 +75,14 @@ import type {
   MtcPaloAltoRawRow,
   MtcPaloAltoValidatedRecord,
 } from './types.js';
+import { streamTopLevelJsonObjects } from './streaming-json.js';
 
 const DEFAULT_PAGE_SIZE = 10_000;
 const ACCEPT = 'application/json';
 const COUNT_QUERY_URL = `${MTC_PALO_ALTO_RESOURCE_URL}?%24select=count(*)%20as%20count`;
 const CHECKPOINT_SCOPE_PREFIX = 'source/mtc-palo-alto-year-built';
+const DEFAULT_MAXIMUM_RESPONSE_BYTES = 128 * 1024 * 1024;
+const MAXIMUM_DISCOVERY_BYTES = 2 * 1024 * 1024;
 
 const DESCRIPTOR: SourceDescriptor = sourceDescriptorSchema.parse({
   sourceId: MTC_PALO_ALTO_SOURCE_ID,
@@ -127,6 +134,7 @@ const DESCRIPTOR: SourceDescriptor = sourceDescriptorSchema.parse({
 
 interface AdapterOptions {
   readonly pageSize?: number;
+  readonly maximumResponseBytes?: number;
 }
 
 interface PageKey {
@@ -161,23 +169,25 @@ function providerError(
   return new MtcPaloAltoProviderError(code, message, phase);
 }
 
-async function collectBody(response: HttpResponse, signal: AbortSignal): Promise<Uint8Array> {
-  const chunks: Uint8Array[] = [];
+async function collectDiscoveryBody(
+  response: HttpResponse,
+  signal: AbortSignal,
+): Promise<Uint8Array> {
+  const bytes = new Uint8Array(MAXIMUM_DISCOVERY_BYTES);
   let byteLength = 0;
   for await (const chunk of response.body) {
     signal.throwIfAborted();
-    const copy = Uint8Array.from(chunk);
-    chunks.push(copy);
-    byteLength += copy.byteLength;
+    if (byteLength + chunk.byteLength > bytes.byteLength) {
+      throw providerError(
+        'SCHEMA_DRIFT',
+        'Socrata discovery response exceeded its byte ceiling',
+        'discover',
+      );
+    }
+    bytes.set(chunk, byteLength);
+    byteLength += chunk.byteLength;
   }
-  signal.throwIfAborted();
-  const bytes = new Uint8Array(byteLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return bytes;
+  return bytes.slice(0, byteLength);
 }
 
 function header(headers: HttpHeaders, name: string): string | undefined {
@@ -189,6 +199,81 @@ function parseHttpDate(value: string | undefined): string | null {
   if (value === undefined) return null;
   const milliseconds = Date.parse(value);
   return Number.isFinite(milliseconds) ? new Date(milliseconds).toISOString() : null;
+}
+
+function artifactRead(artifact: AcquiredArtifactSource): AsyncIterable<Uint8Array> {
+  if (artifact.content !== undefined) return artifact.content.read({ maxChunkBytes: 64 * 1024 });
+  if (artifact.bytes.byteLength > LEGACY_WHOLE_COPY_MAX_BYTES) {
+    throw new LegacyWholeCopyLimitError(artifact.bytes.byteLength, LEGACY_WHOLE_COPY_MAX_BYTES);
+  }
+  return (async function* legacyFixture() {
+    await Promise.resolve();
+    yield artifact.bytes.copy();
+  })();
+}
+
+function acquiredMetadataFromStored(
+  plan: AcquisitionPlan,
+  item: AcquisitionPlan['items'][number],
+  stored: StoredArtifact,
+): AcquiredArtifact {
+  const page = parsePageRequestKey(item.requestKey);
+  const metadata = stored.metadata;
+  const attempt = Number(metadata.attempt);
+  const httpStatus = Number(metadata.httpStatus);
+  if (
+    metadata.sourceId !== plan.sourceId ||
+    metadata.snapshotId !== plan.snapshotId ||
+    metadata.requestKey !== item.requestKey ||
+    metadata.requestUrl !== item.url ||
+    metadata.retrievedAt === undefined ||
+    !Number.isSafeInteger(attempt) ||
+    attempt < 1 ||
+    !Number.isSafeInteger(httpStatus) ||
+    httpStatus < 200 ||
+    httpStatus >= 300 ||
+    !item.expectedMediaTypes.includes(stored.mediaType)
+  ) {
+    throw providerError('RECONCILIATION', 'Recovered Socrata page metadata is invalid', 'acquire');
+  }
+  const lastModified = metadata.lastModified === '' ? null : parseHttpDate(metadata.lastModified);
+  if (metadata.lastModified !== '' && lastModified === null) {
+    throw providerError('RECONCILIATION', 'Recovered Last-Modified metadata is invalid', 'acquire');
+  }
+  return acquiredArtifactSchema.parse({
+    artifactId: `sc:artifact:sha256:${stored.sha256}`,
+    sourceId: plan.sourceId,
+    snapshotId: plan.snapshotId,
+    retrievedAt: metadata.retrievedAt,
+    sourceAsOf: { state: 'reported', at: new Date(page.sourceAsOfEpochMs).toISOString() },
+    request: {
+      requestKey: item.requestKey,
+      method: 'GET',
+      url: item.url,
+      headers: [{ name: 'accept', valueSha256: sha256Hex(new TextEncoder().encode(ACCEPT)) }],
+      bodySha256: null,
+      attempt,
+    },
+    response: {
+      httpStatus,
+      etag: metadata.etag === '' ? null : metadata.etag,
+      lastModified,
+      finalUrl: metadata.finalUrl ?? item.url,
+    },
+    mediaType: stored.mediaType,
+    encoding: 'json',
+    byteSize: stored.byteSize,
+    sha256: stored.sha256,
+    schemaFingerprint: {
+      algorithm: 'sha256',
+      value: MTC_PALO_ALTO_SCHEMA_FINGERPRINT,
+      schemaName: 'mtc-palo-alto-c252-zdg8-v1',
+      canonicalizationVersion: MTC_PALO_ALTO_CONTRACT_VERSION,
+    },
+    rawUri: stored.uri,
+    licenseSnapshotRef: MTC_PALO_ALTO_LICENSE_SNAPSHOT_ID,
+    visibility: MTC_PALO_ALTO_VISIBILITY,
+  });
 }
 
 function parseRetryAfter(value: string | undefined): number | undefined {
@@ -210,7 +295,7 @@ function isAbortError(error: unknown): boolean {
 
 async function requestWithRetry(
   url: string,
-  context: DiscoveryContext | AcquisitionContext,
+  context: DiscoveryContext | StreamingAcquisitionContext,
   phase: 'discover' | 'acquire',
 ): Promise<Readonly<{ response: HttpResponse; attempt: number }>> {
   const policy = context.ratePolicy;
@@ -452,7 +537,7 @@ function issue(
   return Object.freeze({ code, severity, message, recordKey, fieldPath });
 }
 
-function sourceAsOfFromArtifact(artifact: AcquiredByteArtifact): string | null {
+function sourceAsOfFromArtifact(artifact: AcquiredArtifactSource): string | null {
   const value = artifact.metadata.sourceAsOf;
   return value.state === 'unknown' ? null : value.at;
 }
@@ -504,14 +589,15 @@ function createSourceCheckpoint(
   plan: AcquisitionPlan,
   previous: SourceCheckpoint | undefined,
   itemSequence: number,
-  artifactId: string,
+  artifactId: SourceCheckpoint['acquiredArtifactIds'][number],
   updatedAt: string,
 ): SourceCheckpoint {
   const completedRequestKeys = [
     ...(previous?.completedRequestKeys ?? []),
     plan.items[itemSequence]?.requestKey ?? '',
   ];
-  const acquiredArtifactIds = [...(previous?.acquiredArtifactIds ?? []), artifactId];
+  const acquiredArtifactIds = [...(previous?.acquiredArtifactIds ?? [])];
+  if (!acquiredArtifactIds.includes(artifactId)) acquiredArtifactIds.push(artifactId);
   const nextSequence = itemSequence + 1;
   return sourceCheckpointSchema.parse({
     sourceId: plan.sourceId,
@@ -526,18 +612,24 @@ function createSourceCheckpoint(
   });
 }
 
-export class MtcPaloAltoYearBuiltAdapter implements SourceAdapter<
+export class MtcPaloAltoYearBuiltAdapter implements StreamingSourceAdapter<
   MtcPaloAltoDecodedRecord,
   MtcPaloAltoValidatedRecord
 > {
   readonly #pageSize: number;
+  readonly #maximumResponseBytes: number;
 
   public constructor(options: AdapterOptions = {}) {
     const pageSize = options.pageSize ?? DEFAULT_PAGE_SIZE;
     if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 50_000) {
       throw new RangeError('pageSize must be a safe integer from 1 through 50000');
     }
+    const maximumResponseBytes = options.maximumResponseBytes ?? DEFAULT_MAXIMUM_RESPONSE_BYTES;
+    if (!Number.isSafeInteger(maximumResponseBytes) || maximumResponseBytes < 1) {
+      throw new RangeError('maximumResponseBytes must be a positive safe integer');
+    }
     this.#pageSize = pageSize;
+    this.#maximumResponseBytes = maximumResponseBytes;
   }
 
   public describe(): SourceDescriptor {
@@ -550,10 +642,10 @@ export class MtcPaloAltoYearBuiltAdapter implements SourceAdapter<
       context,
       'discover',
     );
-    const metadataBytes = await collectBody(metadataResponse.response, context.signal);
+    const metadataBytes = await collectDiscoveryBody(metadataResponse.response, context.signal);
     const metadata = readMetadata(parseJson(metadataBytes, 'Socrata metadata'));
     const countResponse = await requestWithRetry(COUNT_QUERY_URL, context, 'discover');
-    const countBytes = await collectBody(countResponse.response, context.signal);
+    const countBytes = await collectDiscoveryBody(countResponse.response, context.signal);
     const expectedRecords = readCount(parseJson(countBytes, 'Socrata count response'));
     return Object.freeze({
       sourceId: MTC_PALO_ALTO_SOURCE_ID,
@@ -637,8 +729,8 @@ export class MtcPaloAltoYearBuiltAdapter implements SourceAdapter<
   public async *acquire(
     plan: AcquisitionPlan,
     checkpoint: SourceCheckpoint | undefined,
-    context: AcquisitionContext,
-  ): AsyncIterable<AcquiredByteArtifact> {
+    context: StreamingAcquisitionContext,
+  ): AsyncIterable<AcquiredArtifactSource> {
     if (plan.sourceId !== MTC_PALO_ALTO_SOURCE_ID) {
       throw providerError(
         'RECORD_QUALITY',
@@ -693,84 +785,106 @@ export class MtcPaloAltoYearBuiltAdapter implements SourceAdapter<
       );
     }
     let currentCheckpoint = persistedCheckpoint ?? checkpoint;
-    for (const item of [...plan.items].sort((left, right) => left.sequence - right.sequence)) {
-      if (item.sequence < (currentCheckpoint?.nextSequence ?? 0)) continue;
-      context.signal.throwIfAborted();
-      const { response, attempt } = await requestWithRetry(item.url, context, 'acquire');
-      const page = parsePageRequestKey(item.requestKey);
-      const bytes = await collectBody(response, context.signal);
-      const sha256 = sha256Hex(bytes);
-      const responseMediaType = header(response.headers, 'content-type');
-      const mediaType = responseMediaType?.split(';')[0]?.trim().toLowerCase();
-      if (mediaType === undefined || !item.expectedMediaTypes.includes(mediaType)) {
+    const orderedItems = [...plan.items].sort((left, right) => left.sequence - right.sequence);
+    if (currentCheckpoint !== undefined) {
+      const expectedKeys = orderedItems
+        .slice(0, currentCheckpoint.nextSequence)
+        .map((item) => item.requestKey);
+      if (
+        currentCheckpoint.nextSequence > orderedItems.length ||
+        currentCheckpoint.completedRequestKeys.length !== currentCheckpoint.nextSequence ||
+        currentCheckpoint.acquiredArtifactIds.length > currentCheckpoint.nextSequence ||
+        currentCheckpoint.completedRequestKeys.some((key, index) => key !== expectedKeys[index]) ||
+        currentCheckpoint.complete !== (currentCheckpoint.nextSequence === orderedItems.length)
+      ) {
         throw providerError(
-          'SCHEMA_DRIFT',
-          `Unexpected response media type: ${responseMediaType ?? 'missing'}`,
+          'QUERY_REGRESSION',
+          'Checkpoint does not describe an exact contiguous acquisition prefix',
           'acquire',
         );
       }
-      const retrievedAt = context.clock.now();
-      const logicalKey = `raw/mtc-palo-alto-year-built/${plan.snapshotId}/${item.sequence}-${sha256}.json`;
-      const storedArtifact = await context.artifactStore.putImmutable({
-        logicalKey,
-        mediaType,
-        body: bytes,
-        expectedSha256: sha256,
-        metadata: Object.freeze({
-          authority: DESCRIPTOR.authority.organization,
-          datasetId: MTC_PALO_ALTO_DATASET_ID,
-          requestKey: item.requestKey,
-          requestUrl: item.url,
-          sourceAsOf: new Date(page.sourceAsOfEpochMs).toISOString(),
-          retrievedAt,
-          etag: header(response.headers, 'etag') ?? '',
-          lastModified: header(response.headers, 'last-modified') ?? '',
-          backingArcgisUrl: MTC_PALO_ALTO_ARCGIS_URL,
-        }),
-        ifAbsent: true,
-      });
-      assertStoredArtifactIntegrity(
-        { logicalKey, mediaType, byteSize: bytes.byteLength, sha256 },
-        storedArtifact,
-      );
-      const metadata = acquiredArtifactSchema.parse({
-        artifactId: `sc:artifact:sha256:${sha256}`,
-        sourceId: plan.sourceId,
-        snapshotId: plan.snapshotId,
-        retrievedAt,
-        sourceAsOf: {
-          state: 'reported',
-          at: new Date(page.sourceAsOfEpochMs).toISOString(),
-        },
-        request: {
-          requestKey: item.requestKey,
-          method: 'GET',
-          url: item.url,
-          headers: [{ name: 'accept', valueSha256: sha256Hex(new TextEncoder().encode(ACCEPT)) }],
-          bodySha256: null,
-          attempt,
-        },
-        response: {
-          httpStatus: response.status,
-          etag: header(response.headers, 'etag') ?? null,
-          lastModified: parseHttpDate(header(response.headers, 'last-modified')),
-          finalUrl: item.url,
-        },
-        mediaType,
-        encoding: 'json',
-        byteSize: bytes.byteLength,
-        sha256,
-        schemaFingerprint: {
-          algorithm: 'sha256',
-          value: MTC_PALO_ALTO_SCHEMA_FINGERPRINT,
-          schemaName: 'mtc-palo-alto-c252-zdg8-v1',
-          canonicalizationVersion: MTC_PALO_ALTO_CONTRACT_VERSION,
-        },
-        rawUri: storedArtifact.uri,
-        licenseSnapshotRef: MTC_PALO_ALTO_LICENSE_SNAPSHOT_ID,
-        visibility: MTC_PALO_ALTO_VISIBILITY,
-      });
-      const acquired = createAcquiredByteArtifact(metadata, bytes);
+    }
+    const recoveredArtifactIds: SourceCheckpoint['acquiredArtifactIds'][number][] = [];
+    for (const item of orderedItems) {
+      context.signal.throwIfAborted();
+      const wasCompleted = item.sequence < (currentCheckpoint?.nextSequence ?? 0);
+      const page = parsePageRequestKey(item.requestKey);
+      const logicalKey = `raw/mtc-palo-alto-year-built/${plan.snapshotId}/${String(item.sequence).padStart(6, '0')}.json`;
+      let storedArtifact = await context.artifactStore.headByLogicalKey(logicalKey);
+      if (wasCompleted && storedArtifact === undefined) {
+        throw providerError(
+          'QUERY_REGRESSION',
+          `Checkpoint references a missing immutable page artifact: ${item.requestKey}`,
+          'acquire',
+        );
+      }
+      if (storedArtifact === undefined) {
+        const { response, attempt } = await requestWithRetry(item.url, context, 'acquire');
+        const responseMediaType = header(response.headers, 'content-type');
+        const mediaType = responseMediaType?.split(';')[0]?.trim().toLowerCase();
+        if (mediaType === undefined || !item.expectedMediaTypes.includes(mediaType)) {
+          throw providerError(
+            'SCHEMA_DRIFT',
+            `Unexpected response media type: ${responseMediaType ?? 'missing'}`,
+            'acquire',
+          );
+        }
+        const retrievedAt = context.clock.now();
+        storedArtifact = await persistAcquiredBody({
+          store: context.artifactStore,
+          logicalKey,
+          mediaType,
+          body: response.body,
+          maximumBytes: this.#maximumResponseBytes,
+          metadata: Object.freeze({
+            authority: DESCRIPTOR.authority.organization,
+            sourceId: plan.sourceId,
+            snapshotId: plan.snapshotId,
+            datasetId: MTC_PALO_ALTO_DATASET_ID,
+            requestKey: item.requestKey,
+            requestUrl: item.url,
+            sourceAsOf: new Date(page.sourceAsOfEpochMs).toISOString(),
+            retrievedAt,
+            attempt: String(attempt),
+            httpStatus: String(response.status),
+            etag: header(response.headers, 'etag') ?? '',
+            lastModified: header(response.headers, 'last-modified') ?? '',
+            finalUrl: item.url,
+            backingArcgisUrl: MTC_PALO_ALTO_ARCGIS_URL,
+          }),
+          signal: context.signal,
+        });
+      }
+      const metadata = acquiredMetadataFromStored(plan, item, storedArtifact);
+      const acquired = await createStreamingAcquiredArtifact(metadata, context.artifactStore);
+      if (wasCompleted) {
+        if (!currentCheckpoint?.acquiredArtifactIds.includes(acquired.metadata.artifactId)) {
+          throw providerError(
+            'QUERY_REGRESSION',
+            `Checkpoint artifact identity mismatches recovered page: ${item.requestKey}`,
+            'acquire',
+          );
+        }
+        if (!recoveredArtifactIds.includes(acquired.metadata.artifactId)) {
+          recoveredArtifactIds.push(acquired.metadata.artifactId);
+        }
+        if (
+          item.sequence + 1 === currentCheckpoint.nextSequence &&
+          (recoveredArtifactIds.length !== currentCheckpoint.acquiredArtifactIds.length ||
+            recoveredArtifactIds.some(
+              (candidate, index) => candidate !== currentCheckpoint?.acquiredArtifactIds[index],
+            ))
+        ) {
+          throw providerError(
+            'QUERY_REGRESSION',
+            'Checkpoint artifact identities do not exactly match the recovered immutable prefix',
+            'acquire',
+          );
+        }
+        yield acquired;
+        continue;
+      }
+      const retrievedAt = acquired.metadata.retrievedAt;
       currentCheckpoint = createSourceCheckpoint(
         plan,
         currentCheckpoint,
@@ -797,8 +911,8 @@ export class MtcPaloAltoYearBuiltAdapter implements SourceAdapter<
   }
 
   public async *decode(
-    artifact: AcquiredByteArtifact,
-    context: DecodeContext,
+    artifact: AcquiredArtifactSource,
+    context: StreamingDecodeContext,
   ): AsyncIterable<MtcPaloAltoDecodedRecord> {
     context.signal.throwIfAborted();
     if (artifact.metadata.schemaFingerprint.value !== MTC_PALO_ALTO_SCHEMA_FINGERPRINT) {
@@ -808,19 +922,12 @@ export class MtcPaloAltoYearBuiltAdapter implements SourceAdapter<
         'decode',
       );
     }
-    const json = parseJson(artifact.bytes.copy(), 'Socrata page');
-    if (!Array.isArray(json)) {
-      throw providerError('SCHEMA_DRIFT', 'Socrata page must be a JSON array', 'decode');
-    }
     const page = parsePageRequestKey(artifact.metadata.request.requestKey);
-    if (json.length !== page.expectedRows) {
-      throw providerError(
-        'QUERY_REGRESSION',
-        `Socrata page ${page.sequence} expected ${page.expectedRows} rows but received ${json.length}`,
-        'decode',
-      );
-    }
-    for (const [localOrdinal, rawValue] of json.entries()) {
+    let localOrdinal = 0;
+    for await (const rawValue of streamTopLevelJsonObjects(
+      artifactRead(artifact),
+      context.signal,
+    )) {
       context.signal.throwIfAborted();
       const ordinal = page.offset + localOrdinal;
       if (!Number.isSafeInteger(ordinal)) {
@@ -855,7 +962,15 @@ export class MtcPaloAltoYearBuiltAdapter implements SourceAdapter<
         rawPointer: `/${localOrdinal}`,
         raw,
       });
+      localOrdinal += 1;
       await Promise.resolve();
+    }
+    if (localOrdinal !== page.expectedRows) {
+      throw providerError(
+        'QUERY_REGRESSION',
+        `Socrata page ${page.sequence} expected ${page.expectedRows} rows but received ${localOrdinal}`,
+        'decode',
+      );
     }
   }
 
@@ -1111,7 +1226,10 @@ export class MtcPaloAltoYearBuiltAdapter implements SourceAdapter<
     }
   }
 
-  public summarize(run: SourceRunObservation, context: SummaryContext): SourceRunSummary {
+  public async summarize(
+    run: SourceRunObservationV2,
+    context: SummaryContext,
+  ): Promise<SourceRunSummary> {
     context.signal.throwIfAborted();
     const expectedRecords = run.plan.items.reduce(
       (total, item) => total + parsePageRequestKey(item.requestKey).expectedRows,
@@ -1130,13 +1248,17 @@ export class MtcPaloAltoYearBuiltAdapter implements SourceAdapter<
       restricted: 0,
       prohibited_public: 0,
     };
-    for (const mutation of run.mutations) visibilityCounts[mutation.visibility] += 1;
-    const errorCount = run.validationIssues.filter(
-      (entry) => entry.severity === 'error' || entry.severity === 'fatal',
-    ).length;
-    const warningCount = run.validationIssues.filter(
-      (entry) => entry.severity === 'warning',
-    ).length;
+    for await (const mutation of run.mutations.read()) {
+      context.signal.throwIfAborted();
+      visibilityCounts[mutation.visibility] += 1;
+    }
+    let errorCount = 0;
+    let warningCount = 0;
+    for await (const entry of run.validationIssues.read()) {
+      context.signal.throwIfAborted();
+      if (entry.severity === 'warning') warningCount += 1;
+      else errorCount += 1;
+    }
     const status = run.aborted
       ? 'aborted'
       : errorCount > 0 || run.rejectedRecords > 0
@@ -1155,7 +1277,7 @@ export class MtcPaloAltoYearBuiltAdapter implements SourceAdapter<
       decodedRecords: run.decodedRecords,
       acceptedRecords: run.acceptedRecords,
       rejectedRecords: run.rejectedRecords,
-      normalizedMutations: run.mutations.length,
+      normalizedMutations: run.mutations.count,
       visibilityCounts,
       warningCount,
       errorCount,

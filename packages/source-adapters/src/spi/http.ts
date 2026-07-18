@@ -14,6 +14,8 @@ export interface HttpResponse {
   readonly status: number;
   readonly headers: HttpHeaders;
   readonly body: AsyncIterable<Uint8Array>;
+  /** Actual transport URL. Production transports fail closed instead of silently following. */
+  readonly finalUrl?: string;
 }
 
 /** The only transport authority available to discovery/acquisition phases. */

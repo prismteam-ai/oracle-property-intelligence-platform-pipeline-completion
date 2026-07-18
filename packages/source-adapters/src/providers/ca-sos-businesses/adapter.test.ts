@@ -1,7 +1,13 @@
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
-import type { ArtifactStore, StoredArtifact } from '@oracle/artifacts/artifact-store';
+import type {
+  ImmutableArtifactWrite,
+  RecoverableArtifactStore,
+  StoredArtifact,
+  StreamingImmutableArtifactWrite,
+} from '@oracle/artifacts/artifact-store';
 import type { CheckpointEnvelope, CheckpointValue } from '@oracle/artifacts/checkpoint-store';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
 import { runIdSchema, snapshotIdSchema } from '@oracle/contracts/ids';
@@ -10,15 +16,16 @@ import { zipSync } from 'fflate';
 import { describe, expect, it } from 'vitest';
 
 import type {
-  AcquisitionContext,
-  DecodeContext,
   DiscoveryContext,
   NormalizationContext,
   PlanningContext,
   ValidationContext,
+  StreamingAcquisitionContext,
+  StreamingDecodeContext,
 } from '../../spi/adapter.js';
 import { sha256Hex } from '../../spi/bytes.js';
 import type { HttpRequest, HttpResponse } from '../../spi/http.js';
+import { createSharedRecordBudget } from '../../spi/record-budget.js';
 import { createCaSosBusinessAdapter } from './adapter.js';
 import {
   CA_SOS_BUSINESS_SOURCE_ID,
@@ -146,22 +153,25 @@ class ScriptedHttp {
   }
 }
 
-class MemoryArtifacts implements ArtifactStore {
+class MemoryArtifacts implements RecoverableArtifactStore {
   readonly #values = new Map<string, Readonly<{ descriptor: StoredArtifact; bytes: Uint8Array }>>();
 
-  public async putImmutable(request: {
-    readonly logicalKey: string;
-    readonly mediaType: string;
-    readonly body: Uint8Array | AsyncIterable<Uint8Array>;
-    readonly expectedSha256: string;
-    readonly metadata: Readonly<Record<string, string>>;
-    readonly ifAbsent: true;
-  }) {
+  public putImmutable(request: ImmutableArtifactWrite) {
+    return this.#put(request);
+  }
+
+  public putImmutableStreaming(request: StreamingImmutableArtifactWrite) {
+    return this.#put(request);
+  }
+
+  async #put(request: StreamingImmutableArtifactWrite) {
     if (this.#values.has(request.logicalKey)) throw new Error('duplicate artifact');
     const bytes =
       request.body instanceof Uint8Array ? request.body : await collectBytes(request.body);
     const sha256 = sha256Hex(bytes);
-    if (sha256 !== request.expectedSha256) throw new Error('artifact hash mismatch');
+    if (request.expectedSha256 !== undefined && sha256 !== request.expectedSha256) {
+      throw new Error('artifact hash mismatch');
+    }
     const descriptor = Object.freeze({
       logicalKey: request.logicalKey,
       uri: `s3://test/${encodeURIComponent(request.logicalKey)}`,
@@ -178,6 +188,10 @@ class MemoryArtifacts implements ArtifactStore {
   public head(uri: string) {
     const value = [...this.#values.values()].find((candidate) => candidate.descriptor.uri === uri);
     return Promise.resolve(value?.descriptor);
+  }
+
+  public headByLogicalKey(logicalKey: string) {
+    return Promise.resolve(this.#values.get(logicalKey)?.descriptor);
   }
 
   public async *read(uri: string): AsyncIterable<Uint8Array> {
@@ -270,13 +284,14 @@ function contexts(http: ScriptedHttp, controller = new AbortController()) {
       delay,
       artifactStore: artifacts,
       checkpointStore: checkpoints,
-    } satisfies AcquisitionContext,
+    } satisfies StreamingAcquisitionContext,
     decode: {
       clock,
       signal: controller.signal,
       artifactStore: artifacts,
       analyticalRuntime: analyticalRuntime(),
-    } satisfies DecodeContext,
+      recordBudget: createSharedRecordBudget(2),
+    } satisfies StreamingDecodeContext,
     validation: { clock, signal: controller.signal } satisfies ValidationContext,
     normalization: {
       clock,
@@ -290,8 +305,12 @@ async function plannedAdapter(
   bytes: Uint8Array,
   expectedCount = 1,
   sourceLock: CaSosBusinessSourceLock = IDENTITY_SOURCE_LOCK,
+  maximumBytes = 1024 * 1024,
 ) {
-  const adapter = createCaSosBusinessAdapter(options(bytes, expectedCount, sourceLock));
+  const adapter = createCaSosBusinessAdapter({
+    ...options(bytes, expectedCount, sourceLock),
+    maximumBytes,
+  });
   const ctx = contexts(new ScriptedHttp([]));
   const discovery = await adapter.discover(ctx.discovery);
   const request = acquisitionRequestSchema.parse({
@@ -309,8 +328,9 @@ async function acquireOne(
   bytes: Uint8Array,
   responses?: readonly (HttpResponse | Error)[],
   sourceLock: CaSosBusinessSourceLock = IDENTITY_SOURCE_LOCK,
+  maximumBytes = 1024 * 1024,
 ) {
-  const planned = await plannedAdapter(bytes, 1, sourceLock);
+  const planned = await plannedAdapter(bytes, 1, sourceLock, maximumBytes);
   const http = new ScriptedHttp(
     responses ?? [response(200, bytes, { 'content-type': 'application/zip', etag: '"fixture"' })],
   );
@@ -322,6 +342,14 @@ async function acquireOne(
   const artifact = artifacts[0];
   if (artifact === undefined) throw new Error('expected artifact');
   return { ...planned, artifact, http, ctx };
+}
+
+async function caSosTemporaryDirectories(): Promise<ReadonlySet<string>> {
+  return new Set(
+    (await readdir(tmpdir(), { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith('oracle-ca-sos-'))
+      .map((entry) => entry.name),
+  );
 }
 
 async function decodedRecords(
@@ -342,6 +370,17 @@ async function decodedRecords(
   if (artifact === undefined) throw new Error('expected artifact');
   for await (const record of planned.adapter.decode(artifact, ctx.decode)) records.push(record);
   return { ...planned, records, ctx, artifact };
+}
+
+function observed<T>(values: readonly T[]) {
+  return Object.freeze({
+    count: values.length,
+    logicalSha256: sha256Hex(new TextEncoder().encode(JSON.stringify(values))),
+    read: async function* () {
+      await Promise.resolve();
+      for (const value of values) yield value;
+    },
+  });
 }
 
 describe('CA SOS business bulk adapter', () => {
@@ -384,8 +423,41 @@ describe('CA SOS business bulk adapter', () => {
       acquired.ctx.acquisition,
     ))
       resumed.push(artifact);
-    expect(resumed).toEqual([]);
+    expect(resumed).toHaveLength(1);
+    expect(resumed[0]?.metadata.sha256).toBe(acquired.artifact.metadata.sha256);
     expect(acquired.http.requests).toHaveLength(3);
+
+    const orphanHttp = new ScriptedHttp([]);
+    const orphanContext = {
+      ...acquired.ctx.acquisition,
+      http: orphanHttp,
+      checkpointStore: new MemoryCheckpoints(),
+    } satisfies StreamingAcquisitionContext;
+    const adopted = [];
+    for await (const artifact of acquired.adapter.acquire(
+      acquired.plan,
+      undefined,
+      orphanContext,
+    )) {
+      adopted.push(artifact);
+    }
+    expect(adopted).toHaveLength(1);
+    expect(orphanHttp.requests).toEqual([]);
+
+    const missingContext = {
+      ...acquired.ctx.acquisition,
+      http: new ScriptedHttp([]),
+      artifactStore: new MemoryArtifacts(),
+    } satisfies StreamingAcquisitionContext;
+    await expect(async () => {
+      for await (const artifact of acquired.adapter.acquire(
+        acquired.plan,
+        undefined,
+        missingContext,
+      )) {
+        void artifact;
+      }
+    }).rejects.toMatchObject({ code: 'RECONCILIATION' });
   });
 
   it('retries transport exceptions but propagates AbortError without retry', async () => {
@@ -552,6 +624,65 @@ describe('CA SOS business bulk adapter', () => {
       for await (const record of malformed.adapter.decode(malformed.artifact, malformed.ctx.decode))
         void record;
     }).rejects.toThrow('ZIP is malformed');
+  });
+
+  it('caps ZIP entry/name metadata and cleans the confined spool after adversarial rejection', async () => {
+    const csv = await readFile(fixturePath());
+    const before = await caSosTemporaryDirectories();
+    const assertRejectedAndClean = async (
+      bytes: Uint8Array,
+      message: string,
+      maximumBytes?: number,
+    ) => {
+      const acquired = await acquireOne(
+        bytes,
+        undefined,
+        IDENTITY_SOURCE_LOCK,
+        maximumBytes ?? 1024 * 1024,
+      );
+      await expect(async () => {
+        for await (const record of acquired.adapter.decode(acquired.artifact, acquired.ctx.decode))
+          void record;
+      }).rejects.toThrow(message);
+      expect(await caSosTemporaryDirectories()).toEqual(before);
+    };
+
+    const tooManyEntries: Record<string, Uint8Array> = { 'BusinessEntities.csv': csv };
+    for (let index = 0; index < 4_096; index += 1) {
+      tooManyEntries[`ignored/${index.toString().padStart(4, '0')}.bin`] = new Uint8Array();
+    }
+    await assertRejectedAndClean(zipSync(tooManyEntries), 'entry count');
+
+    await assertRejectedAndClean(
+      zipSync({
+        'BusinessEntities.csv': csv,
+        [`ignored/${'x'.repeat(1_025)}.bin`]: new Uint8Array(),
+      }),
+      'entry name',
+    );
+
+    const excessiveNames: Record<string, Uint8Array> = { 'BusinessEntities.csv': csv };
+    for (let index = 0; index < 1_050; index += 1) {
+      excessiveNames[`ignored/${index.toString().padStart(4, '0')}-${'n'.repeat(990)}.bin`] =
+        new Uint8Array();
+    }
+    await assertRejectedAndClean(
+      zipSync(excessiveNames),
+      'aggregate entry-name bytes',
+      4 * 1024 * 1024,
+    );
+  });
+
+  it('removes its confined ZIP spool when a decode iterator closes early', async () => {
+    const csv = await readFile(fixturePath());
+    const before = await caSosTemporaryDirectories();
+    const acquired = await acquireOne(zipCsv(csv));
+    const decoded = acquired.adapter.decode(acquired.artifact, acquired.ctx.decode);
+    const iterator = decoded[Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toMatchObject({ done: false });
+    expect((await caSosTemporaryDirectories()).size).toBe(before.size + 1);
+    await iterator.return?.();
+    expect(await caSosTemporaryDirectories()).toEqual(before);
   });
 
   it('binds a renamed and reordered raw header to the frozen interchange', async () => {
@@ -747,7 +878,7 @@ describe('CA SOS business bulk adapter', () => {
     const checkpoint: SourceCheckpoint = {
       sourceId: CA_SOS_BUSINESS_SOURCE_ID,
       snapshotId: SNAPSHOT_ID,
-      contractVersion: '1.0.0',
+      contractVersion: '2.0.0',
       cursor: 'sequence:1',
       nextSequence: 1,
       completedRequestKeys: ['business-entities'],
@@ -767,15 +898,15 @@ describe('CA SOS business bulk adapter', () => {
       decodedRecords: 1,
       acceptedRecords: 1,
       rejectedRecords: 0,
-      mutations,
-      validationIssues: [],
+      mutations: observed(mutations),
+      validationIssues: observed([]),
       aborted: false,
     } as const;
     const summaryContext = {
       clock: new FixedClock(),
       signal: new AbortController().signal,
     };
-    const summary = decoded.adapter.summarize(run, summaryContext);
+    const summary = await decoded.adapter.summarize(run, summaryContext);
     expect(summary).toMatchObject({
       status: 'succeeded',
       decodedRecords: 1,
@@ -784,9 +915,9 @@ describe('CA SOS business bulk adapter', () => {
       normalizedMutations: 14,
       visibilityCounts: { prohibited_public: 14 },
     });
-    expect(() => decoded.adapter.summarize({ ...run, decodedRecords: 2 }, summaryContext)).toThrow(
-      'summary count drift',
-    );
+    await expect(
+      decoded.adapter.summarize({ ...run, decodedRecords: 2 }, summaryContext),
+    ).rejects.toThrow('summary count drift');
   });
 
   it('preserves duplicate and superseded entity identity without claiming ownership', async () => {

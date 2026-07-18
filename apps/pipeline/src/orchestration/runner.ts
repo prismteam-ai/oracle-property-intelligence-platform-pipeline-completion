@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import type { CheckpointEnvelope } from '@oracle/artifacts/checkpoint-store';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
 import type { SourceId } from '@oracle/contracts/ids';
@@ -11,17 +13,47 @@ import type {
   SourceRunSummary,
   ValidationIssue,
 } from '@oracle/contracts/source';
-import { createAcquiredByteArtifact } from '@oracle/source-adapters/spi/acquired-artifact';
-import type { DiscoveryResult, SourceRunObservation } from '@oracle/source-adapters/spi/adapter';
+import {
+  createAcquiredByteArtifact,
+  durableAcquiredArtifactReference,
+  LEGACY_WHOLE_COPY_MAX_BYTES,
+  openDurableAcquiredArtifactReference,
+  type AcquiredArtifactSource,
+  type AcquiredByteArtifact,
+  type DurableAcquiredArtifactReference,
+} from '@oracle/source-adapters/spi/acquired-artifact';
+import type {
+  DiscoveryResult,
+  SourceAdapter,
+  SourceRunObservation,
+  SourceRunObservationV2,
+  StreamingSourceAdapter,
+  RepeatableAcquiredArtifactSources,
+} from '@oracle/source-adapters/spi/adapter';
+import {
+  createSharedRecordBudget,
+  type RecordBudgetLease,
+  type SharedRecordBudget,
+} from '@oracle/source-adapters/spi/record-budget';
 
 import { readJsonArtifact, writeJsonArtifact } from './artifacts.js';
-import { sha256 } from './canonical-json.js';
+import { canonicalJson, sha256 } from './canonical-json.js';
 import { commitRunState, loadRunState } from './checkpoint.js';
+import {
+  CanonicalChunkWriter,
+  combineChunkSequences,
+  emptyChunkSequence,
+  openChunkSequence,
+  openChunkSequencePrefix,
+  type ChunkReference,
+  type ChunkSequence,
+} from './chunks.js';
 import { acquisitionModeFor } from './profiles.js';
 import {
   ORCHESTRATION_PHASES,
   type OrchestrationDependencies,
   type OrchestrationPhase,
+  type NormalizationCursor,
   type PersistedRunState,
   type PersistedSourceState,
   type PhaseArtifact,
@@ -37,6 +69,8 @@ import {
 } from './types.js';
 
 const SOURCE_PHASES = ORCHESTRATION_PHASES.slice(0, 7);
+const LEGACY_OBSERVATION_MAX_VALUES = 10_000;
+const BORROWED_RECORD_LEASE: RecordBudgetLease = Object.freeze({ release: () => undefined });
 
 interface MutableRun {
   envelope: CheckpointEnvelope | undefined;
@@ -45,9 +79,33 @@ interface MutableRun {
 
 type SourceRuntime = Readonly<{
   state: PersistedSourceState;
-  mutations: readonly CanonicalMutation[];
+  mutations: ChunkSequence<CanonicalMutation>;
   manifest: SourceExecutionManifest;
 }>;
+
+type NormalizationEvent =
+  | Readonly<{
+      schemaVersion: '2.0.0';
+      kind: 'record_start';
+      cursor: NormalizationCursor;
+    }>
+  | Readonly<{
+      schemaVersion: '2.0.0';
+      kind: 'validation_issue';
+      cursor: NormalizationCursor;
+      value: ValidationIssue;
+    }>
+  | Readonly<{
+      schemaVersion: '2.0.0';
+      kind: 'mutation';
+      cursor: NormalizationCursor;
+      value: CanonicalMutation;
+    }>
+  | Readonly<{
+      schemaVersion: '2.0.0';
+      kind: 'record_complete';
+      cursor: NormalizationCursor;
+    }>;
 
 export const REQUIRED_COUNTY_CAPABILITIES = Object.freeze([
   'santa_clara_parcels',
@@ -74,13 +132,25 @@ function emptySource(source: SourceConfiguration): PersistedSourceState {
     discoveryArtifact: null,
     planArtifact: null,
     acquiredArtifact: null,
+    acquisitionChunks: Object.freeze([]),
+    acquisitionRecords: 0,
+    acquisitionLogicalSha256: null,
     mutationArtifact: null,
+    mutationChunks: Object.freeze([]),
+    validationIssueChunks: Object.freeze([]),
+    mutationLogicalSha256: null,
+    validationIssueLogicalSha256: null,
+    normalizationChunks: Object.freeze([]),
+    normalizationEventRecords: 0,
+    normalizationLogicalSha256: null,
+    normalizationCursor: null,
     summaryArtifact: null,
     manifestArtifact: null,
     decodedRecords: 0,
     acceptedRecords: 0,
     rejectedRecords: 0,
-    validationIssues: Object.freeze([]),
+    mutationRecords: 0,
+    validationIssueRecords: 0,
     timings: Object.freeze([]),
     terminalState: null,
     limitations: Object.freeze(source.limitations ?? []),
@@ -93,7 +163,7 @@ function initialState(
   configurationHash: string,
 ): PersistedRunState {
   return Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: 2,
     runId: configuration.runId,
     configurationHash,
     sources: Object.freeze(configuration.sources.map((source) => emptySource(source))),
@@ -357,7 +427,7 @@ function finalSourceCheckpoint(
     cursor: `sequence:${plan.items.length}`,
     nextSequence: plan.items.length,
     completedRequestKeys: plan.items.map(({ requestKey }) => requestKey),
-    acquiredArtifactIds: artifacts.map(({ artifactId }) => artifactId),
+    acquiredArtifactIds: [...new Set(artifacts.map(({ artifactId }) => artifactId))],
     updatedAt: completedAt,
     complete: artifacts.length === plan.items.length,
   });
@@ -508,15 +578,23 @@ async function runSource(
   restored: PersistedSourceState,
   dependencies: OrchestrationDependencies,
   coordinator: RunCheckpointCoordinator,
+  recordBudget: SharedRecordBudget,
+  onActiveRecordDelta: (delta: number) => void,
+  onBufferedEventDelta: (delta: number) => void,
   checkpointRevision: () => string | null,
 ): Promise<SourceRuntime> {
   let state = restored;
   let discovery: DiscoveryResult | undefined;
   let plan: AcquisitionPlan | undefined;
   let acquiredMetadata: readonly AcquiredArtifact[] = [];
-  let mutations: readonly CanonicalMutation[] = [];
+  let acquiredReferences: readonly DurableAcquiredArtifactReference[] = [];
+  let mutations = emptyChunkSequence<CanonicalMutation>();
+  let validationIssues = emptyChunkSequence<ValidationIssue>();
   let summary: SourceRunSummary | undefined;
   const descriptor = source.adapter.describe();
+  const streamingAdapter = descriptor.contractVersion.startsWith('2.')
+    ? (source.adapter as StreamingSourceAdapter)
+    : undefined;
   const startedAt = configuration.requestedAt;
 
   try {
@@ -634,107 +712,510 @@ async function runSource(
     const acquisitionPlan = plan;
 
     if (phaseCompleted(state, 'acquire')) {
-      acquiredMetadata = await loadRequired(dependencies, state.acquiredArtifact, 'acquisition');
+      acquiredReferences = await loadRequired(dependencies, state.acquiredArtifact, 'acquisition');
+      if (state.acquisitionLogicalSha256 === null) {
+        throw new AcquisitionReplayIncompatibleError(
+          descriptor.sourceId,
+          'completed acquisition checkpoint omitted its logical hash',
+        );
+      }
+      const acquiredSequence = await openChunkSequence<DurableAcquiredArtifactReference>(
+        dependencies.artifactStore,
+        state.acquisitionChunks,
+        {
+          recordCount: state.acquisitionRecords,
+          logicalSha256: state.acquisitionLogicalSha256,
+        },
+      );
+      const chunkReferences: DurableAcquiredArtifactReference[] = [];
+      for await (const reference of acquiredSequence.read()) chunkReferences.push(reference);
+      if (canonicalJson(chunkReferences) !== canonicalJson(acquiredReferences)) {
+        throw new AcquisitionReplayIncompatibleError(
+          descriptor.sourceId,
+          'completed acquisition artifact disagrees with its verified chunk sequence',
+        );
+      }
+      acquiredMetadata = Object.freeze(acquiredReferences.map(({ metadata }) => metadata));
     } else {
       const request = acquisitionRequest(configuration, source, discovery);
+      const persistedPrefix = await openChunkSequencePrefix<DurableAcquiredArtifactReference>(
+        dependencies.artifactStore,
+        state.acquisitionChunks,
+      );
+      if (persistedPrefix.recordCount !== state.acquisitionRecords) {
+        throw new AcquisitionReplayIncompatibleError(
+          descriptor.sourceId,
+          'checkpoint acquisition record count does not match its verified chunks',
+        );
+      }
+      const logicalPrefix = `runs/${configuration.runId.replace('sc:run:', '')}/${state.sourceId.replaceAll(/[^a-zA-Z0-9._~-]/gu, '-')}`;
+      const acquisitionWriter = new CanonicalChunkWriter<DurableAcquiredArtifactReference>({
+        store: dependencies.artifactStore,
+        logicalPrefix: `${logicalPrefix}/acquire/references`,
+        visibility: descriptor.defaultVisibility,
+        licenseSnapshotRef: descriptor.license.licenseSnapshotId,
+        budget: recordBudget,
+        signal: dependencies.signal,
+        maximumRecordsPerChunk: 1,
+        restoredChunks: state.acquisitionChunks,
+        cursorFor: ({ metadata }) => metadata.artifactId,
+        onChunk: async (chunks) => {
+          const candidate = Object.freeze({
+            ...state,
+            acquisitionChunks: chunks,
+            acquisitionRecords: chunks.reduce((sum, chunk) => sum + chunk.recordCount, 0),
+          });
+          await coordinator.updateSource(candidate);
+          state = candidate;
+        },
+      });
+      await acquisitionWriter.restore();
       const phase = await timedPhase(
         'acquire',
         descriptor.sourceId,
         dependencies,
-        configuration.maximumPhaseAttempts,
+        // Acquisition progress is durable per yield. Any failure unwinds to that durable prefix;
+        // an in-process retry cannot safely assume a provider generator's checkpoint position.
+        1,
         async () => {
-          const output = [];
-          for await (const artifact of source.adapter.acquire(acquisitionPlan, undefined, {
-            http: dependencies.http,
-            artifactStore: dependencies.artifactStore,
-            checkpointStore: dependencies.checkpointStore,
-            ratePolicy: descriptor.ratePolicy,
-            clock: dependencies.clock,
-            delay: dependencies.delay,
-            signal: dependencies.signal,
-          }))
-            output.push(artifact.metadata);
-          return Object.freeze(output);
+          const committed = persistedPrefix.read()[Symbol.asyncIterator]();
+          let emittedOrdinal = 0;
+          try {
+            for await (const artifact of source.adapter.acquire(acquisitionPlan, undefined, {
+              http: dependencies.http,
+              artifactStore: dependencies.artifactStore,
+              checkpointStore: dependencies.checkpointStore,
+              ratePolicy: descriptor.ratePolicy,
+              clock: dependencies.clock,
+              delay: dependencies.delay,
+              signal: dependencies.signal,
+            })) {
+              const reference = durableAcquiredArtifactReference(artifact);
+              const planItem = acquisitionPlan.items[emittedOrdinal];
+              if (reference.metadata.request.requestKey !== planItem?.requestKey) {
+                throw new AcquisitionReplayIncompatibleError(
+                  descriptor.sourceId,
+                  `provider emission ${emittedOrdinal} did not match its deterministic plan request`,
+                );
+              }
+              emittedOrdinal += 1;
+              const expected = await committed.next();
+              if (!expected.done) {
+                if (canonicalJson(expected.value) !== canonicalJson(reference)) {
+                  throw new AcquisitionReplayIncompatibleError(
+                    descriptor.sourceId,
+                    'provider did not re-emit the exact committed acquisition prefix',
+                  );
+                }
+                continue;
+              }
+              await acquisitionWriter.append(reference);
+            }
+            if (!(await committed.next()).done) {
+              throw new AcquisitionReplayIncompatibleError(
+                descriptor.sourceId,
+                'provider omitted one or more committed acquisition artifacts on resume',
+              );
+            }
+            return await acquisitionWriter.finish();
+          } catch (error) {
+            acquisitionWriter.abort();
+            throw error;
+          }
         },
       );
-      acquiredMetadata = phase.value;
+      const acquiredSequence = phase.value;
+      const references: DurableAcquiredArtifactReference[] = [];
+      for await (const reference of acquiredSequence.read()) references.push(reference);
+      acquiredReferences = Object.freeze(references);
+      acquiredMetadata = Object.freeze(acquiredReferences.map(({ metadata }) => metadata));
       state = await persistSourcePhase({
         configuration,
         dependencies,
         coordinator,
         state,
         phase: 'acquire',
-        value: acquiredMetadata,
+        value: acquiredReferences,
         timing: phase.timing,
         artifactField: 'acquiredArtifact',
+        patch: {
+          acquisitionChunks: acquiredSequence.chunks,
+          acquisitionRecords: acquiredSequence.recordCount,
+          acquisitionLogicalSha256: acquiredSequence.logicalSha256,
+        },
       });
       void request;
     }
 
     if (phaseCompleted(state, 'normalize')) {
-      mutations = await loadRequired(dependencies, state.mutationArtifact, 'mutations');
+      if (
+        state.normalizationLogicalSha256 === null ||
+        state.mutationLogicalSha256 === null ||
+        state.validationIssueLogicalSha256 === null
+      ) {
+        throw new Error(`Checkpoint omitted v2 chunk identities for ${state.sourceId}`);
+      }
+      const events = await openChunkSequence<NormalizationEvent>(
+        dependencies.artifactStore,
+        state.normalizationChunks,
+        {
+          recordCount: state.normalizationEventRecords,
+          logicalSha256: state.normalizationLogicalSha256,
+        },
+      );
+      mutations = await projectNormalizationEvents(events, 'mutation', {
+        recordCount: state.mutationRecords,
+        logicalSha256: state.mutationLogicalSha256,
+      });
+      validationIssues = await projectNormalizationEvents(events, 'validation_issue', {
+        recordCount: state.validationIssueRecords,
+        logicalSha256: state.validationIssueLogicalSha256,
+      });
     } else {
-      const records = { decoded: 0, accepted: 0, rejected: 0 };
-      const issues: ValidationIssue[] = [];
-      const normalized: CanonicalMutation[] = [];
+      const records = {
+        decoded: state.decodedRecords,
+        accepted: state.acceptedRecords,
+        rejected: state.rejectedRecords,
+      };
+      const resume = state.normalizationCursor;
+      const repeatableAcquiredArtifacts = createRepeatableAcquiredArtifacts(
+        acquiredReferences,
+        dependencies,
+      );
+      validateNormalizationResume(state.normalizationChunks, resume);
       const cap = configuration.profile.recordCap;
+      const logicalPrefix = `runs/${configuration.runId.replace('sc:run:', '')}/${state.sourceId.replaceAll(/[^a-zA-Z0-9._~-]/gu, '-')}`;
+      const licenseSnapshotRef =
+        acquiredMetadata[0]?.licenseSnapshotRef ?? `descriptor:${descriptor.sourceId}`;
+      const eventWriter = new CanonicalChunkWriter<NormalizationEvent>({
+        store: dependencies.artifactStore,
+        logicalPrefix: `${logicalPrefix}/normalize/events`,
+        visibility: descriptor.defaultVisibility,
+        licenseSnapshotRef,
+        budget: recordBudget,
+        signal: dependencies.signal,
+        maximumRecordsPerChunk: configuration.profile.maxBufferedRecords,
+        onBufferedRecordDelta: onBufferedEventDelta,
+        restoredChunks: state.normalizationChunks,
+        cursorFor: ({ cursor }) => canonicalJson(cursor),
+        onChunk: async (chunks) => {
+          const cursor = parseNormalizationCursor(chunks.at(-1)?.resumeCursor ?? null);
+          if (cursor === null) throw new Error('Normalization chunk omitted its resume cursor');
+          const candidate = Object.freeze({
+            ...state,
+            normalizationChunks: chunks,
+            normalizationCursor: cursor,
+            decodedRecords: cursor.decodedRecords,
+            acceptedRecords: cursor.acceptedRecords,
+            rejectedRecords: cursor.rejectedRecords,
+          });
+          await coordinator.updateSource(candidate);
+          state = candidate;
+        },
+      });
+      await eventWriter.restore();
+      const acquireActiveRecordLease = async (): Promise<RecordBudgetLease> => {
+        if (
+          recordBudget.metrics().inUse >= recordBudget.capacity &&
+          eventWriter.bufferedRecordCount > 0
+        ) {
+          await eventWriter.flush();
+        }
+        const lease = await recordBudget.acquire(dependencies.signal);
+        onActiveRecordDelta(1);
+        let released = false;
+        return Object.freeze({
+          release: () => {
+            if (released) return;
+            released = true;
+            onActiveRecordDelta(-1);
+            lease.release();
+          },
+        });
+      };
+      const appendNormalizationEvent = async (event: NormalizationEvent): Promise<void> => {
+        let eventLease = recordBudget.tryAcquire();
+        if (eventLease === undefined && eventWriter.bufferedRecordCount > 0) {
+          await eventWriter.flush();
+          eventLease = recordBudget.tryAcquire();
+        }
+        if (eventLease === undefined) {
+          // Every permit is an active record (not buffered state). Spill this one event
+          // immediately while borrowing the current record's already-counted slot.
+          await eventWriter.append(event, BORROWED_RECORD_LEASE);
+          await eventWriter.flush();
+          return;
+        }
+        await eventWriter.append(event, eventLease);
+      };
       const phase = await timedPhase(
         'decode',
         descriptor.sourceId,
         dependencies,
-        configuration.maximumPhaseAttempts,
+        // A failed normalization attempt must unwind to the durable chunk cursor. Reusing an
+        // in-memory writer after a partial hash/write would make retry identity ambiguous.
+        1,
         async () => {
-          outer: for (const metadata of acquiredMetadata) {
-            const raw = await collectStoreBytes(dependencies, metadata.rawUri);
-            const artifact = createAcquiredByteArtifact(metadata, raw);
-            for await (const decoded of source.adapter.decode(artifact, {
-              artifactStore: dependencies.artifactStore,
-              analyticalRuntime: dependencies.analyticalRuntime,
-              clock: dependencies.clock,
-              signal: dependencies.signal,
-            })) {
-              if (cap !== null && records.decoded >= cap) break outer;
-              records.decoded += 1;
-              const result = await source.adapter.validate(decoded, {
-                clock: dependencies.clock,
-                signal: dependencies.signal,
-              });
-              issues.push(...result.issues);
-              if (result.status === 'rejected') {
-                records.rejected += 1;
-                continue;
+          outer: for (const [artifactIndex, reference] of acquiredReferences.entries()) {
+            if (resume !== null && artifactIndex < resume.artifactIndex) continue;
+            const artifact = await openAcquiredReference(reference, dependencies);
+            const decoded =
+              streamingAdapter === undefined
+                ? (source.adapter as SourceAdapter).decode(
+                    requireLegacyAcquiredArtifact(artifact),
+                    {
+                      artifactStore: dependencies.artifactStore,
+                      analyticalRuntime: dependencies.analyticalRuntime,
+                      clock: dependencies.clock,
+                      signal: dependencies.signal,
+                    },
+                  )
+                : streamingAdapter.decode(artifact, {
+                    artifactStore: dependencies.artifactStore,
+                    analyticalRuntime: dependencies.analyticalRuntime,
+                    recordBudget,
+                    clock: dependencies.clock,
+                    signal: dependencies.signal,
+                  });
+            const decodedIterator = decoded[Symbol.asyncIterator]();
+            let recordOrdinal = 0;
+            let decodedDone = false;
+            try {
+              for (;;) {
+                if (cap !== null && records.decoded >= cap) break outer;
+                const activeLease = await acquireActiveRecordLease();
+                try {
+                  const next = await decodedIterator.next();
+                  if (next.done) {
+                    decodedDone = true;
+                    break;
+                  }
+                  recordOrdinal += 1;
+                  const resumeThisRecord =
+                    resume !== null &&
+                    artifactIndex === resume.artifactIndex &&
+                    recordOrdinal === resume.recordOrdinal;
+                  if (
+                    resume !== null &&
+                    artifactIndex === resume.artifactIndex &&
+                    (recordOrdinal < resume.recordOrdinal ||
+                      (recordOrdinal === resume.recordOrdinal && resume.recordComplete))
+                  ) {
+                    continue;
+                  }
+                  if (!resumeThisRecord) {
+                    await appendNormalizationEvent(
+                      Object.freeze({
+                        schemaVersion: '2.0.0',
+                        kind: 'record_start',
+                        cursor: normalizationCursor({
+                          artifactIndex,
+                          recordOrdinal,
+                          issueOffset: 0,
+                          mutationOffset: 0,
+                          records,
+                          recordComplete: false,
+                        }),
+                      }),
+                    );
+                  }
+                  const result = await source.adapter.validate(next.value, {
+                    clock: dependencies.clock,
+                    signal: dependencies.signal,
+                  });
+                  let issueOffset = 0;
+                  const resumeIssueOffset = resumeThisRecord ? resume.issueOffset : 0;
+                  const resumeMutationOffset = resumeThisRecord ? resume.mutationOffset : 0;
+                  for (const issue of result.issues) {
+                    issueOffset += 1;
+                    if (issueOffset <= resumeIssueOffset) continue;
+                    const cursor = normalizationCursor({
+                      artifactIndex,
+                      recordOrdinal,
+                      issueOffset,
+                      mutationOffset: resumeMutationOffset,
+                      records,
+                      recordComplete: false,
+                    });
+                    await appendNormalizationEvent(
+                      Object.freeze({
+                        schemaVersion: '2.0.0',
+                        kind: 'validation_issue',
+                        cursor,
+                        value: issue,
+                      }),
+                    );
+                  }
+                  let mutationOffset = 0;
+                  if (result.status === 'accepted') {
+                    const context = {
+                      analyticalRuntime: dependencies.analyticalRuntime,
+                      recordBudget,
+                      clock: dependencies.clock,
+                      signal: dependencies.signal,
+                    };
+                    for await (const mutation of source.adapter.normalize(result.record, context)) {
+                      mutationOffset += 1;
+                      if (mutationOffset <= resumeMutationOffset) continue;
+                      const cursor = normalizationCursor({
+                        artifactIndex,
+                        recordOrdinal,
+                        issueOffset,
+                        mutationOffset,
+                        records,
+                        recordComplete: false,
+                      });
+                      await appendNormalizationEvent(
+                        Object.freeze({
+                          schemaVersion: '2.0.0',
+                          kind: 'mutation',
+                          cursor,
+                          value: mutation,
+                        }),
+                      );
+                    }
+                  }
+                  const completedRecords = {
+                    decoded: records.decoded + 1,
+                    accepted: records.accepted + (result.status === 'accepted' ? 1 : 0),
+                    rejected: records.rejected + (result.status === 'rejected' ? 1 : 0),
+                  };
+                  const completeCursor = normalizationCursor({
+                    artifactIndex,
+                    recordOrdinal,
+                    issueOffset,
+                    mutationOffset,
+                    records: completedRecords,
+                    recordComplete: true,
+                  });
+                  await appendNormalizationEvent(
+                    Object.freeze({
+                      schemaVersion: '2.0.0',
+                      kind: 'record_complete',
+                      cursor: completeCursor,
+                    }),
+                  );
+                  records.decoded = completedRecords.decoded;
+                  records.accepted = completedRecords.accepted;
+                  records.rejected = completedRecords.rejected;
+                } finally {
+                  activeLease.release();
+                }
               }
-              records.accepted += 1;
-              for await (const mutation of source.adapter.normalize(result.record, {
-                analyticalRuntime: dependencies.analyticalRuntime,
-                clock: dependencies.clock,
-                signal: dependencies.signal,
-              }))
-                normalized.push(mutation);
+            } finally {
+              if (!decodedDone) await decodedIterator.return?.();
             }
           }
-          return Object.freeze(normalized);
+
+          if (
+            streamingAdapter?.finalizeFromAcquiredArtifacts !== undefined &&
+            !(
+              resume?.artifactIndex === acquiredMetadata.length &&
+              resume.recordOrdinal === 1 &&
+              resume.recordComplete
+            )
+          ) {
+            const artifactIndex = acquiredMetadata.length;
+            const recordOrdinal = 1;
+            const resumeFinalizeMutationOffset =
+              resume?.artifactIndex === artifactIndex ? resume.mutationOffset : 0;
+            let mutationOffset = 0;
+            const finalization = streamingAdapter.finalizeFromAcquiredArtifacts(
+              repeatableAcquiredArtifacts,
+              {
+                analyticalRuntime: dependencies.analyticalRuntime,
+                recordBudget,
+                clock: dependencies.clock,
+                signal: dependencies.signal,
+              },
+            );
+            const finalizationIterator = finalization[Symbol.asyncIterator]();
+            let finalizationDone = false;
+            try {
+              for (;;) {
+                const activeFinalizeLease = await acquireActiveRecordLease();
+                try {
+                  const next = await finalizationIterator.next();
+                  if (next.done) {
+                    finalizationDone = true;
+                    break;
+                  }
+                  mutationOffset += 1;
+                  if (mutationOffset <= resumeFinalizeMutationOffset) continue;
+                  const cursor = normalizationCursor({
+                    artifactIndex,
+                    recordOrdinal,
+                    issueOffset: 0,
+                    mutationOffset,
+                    records,
+                    recordComplete: false,
+                  });
+                  await appendNormalizationEvent(
+                    Object.freeze({
+                      schemaVersion: '2.0.0',
+                      kind: 'mutation',
+                      cursor,
+                      value: next.value,
+                    }),
+                  );
+                  // Each finalizer offset is independently durable for reconstruction in a fresh process.
+                  await eventWriter.flush();
+                } finally {
+                  activeFinalizeLease.release();
+                }
+              }
+            } finally {
+              if (!finalizationDone) await finalizationIterator.return?.();
+            }
+            const finalCompleteLease = await acquireActiveRecordLease();
+            try {
+              await appendNormalizationEvent(
+                Object.freeze({
+                  schemaVersion: '2.0.0',
+                  kind: 'record_complete',
+                  cursor: normalizationCursor({
+                    artifactIndex,
+                    recordOrdinal,
+                    issueOffset: 0,
+                    mutationOffset,
+                    records,
+                    recordComplete: true,
+                  }),
+                }),
+              );
+            } finally {
+              finalCompleteLease.release();
+            }
+          }
+
+          return eventWriter.finish();
         },
-      );
+      ).catch((error: unknown) => {
+        eventWriter.abort();
+        throw error;
+      });
       const decodeTiming: PhaseTiming = Object.freeze({ ...phase.timing, phase: 'decode' });
       const validateTiming: PhaseTiming = Object.freeze({ ...phase.timing, phase: 'validate' });
       const normalizeTiming: PhaseTiming = Object.freeze({ ...phase.timing, phase: 'normalize' });
-      mutations = phase.value;
-      const artifact = await writeJsonArtifact({
-        store: dependencies.artifactStore,
-        runId: configuration.runId,
-        owner: state.sourceId,
-        phase: 'normalize',
-        value: mutations,
-      });
+      const events = phase.value;
+      mutations = await projectNormalizationEvents(events, 'mutation');
+      validationIssues = await projectNormalizationEvents(events, 'validation_issue');
       state = Object.freeze({
         ...state,
-        mutationArtifact: artifact,
         completedPhase: 'normalize',
         decodedRecords: records.decoded,
         acceptedRecords: records.accepted,
         rejectedRecords: records.rejected,
-        validationIssues: Object.freeze(issues),
+        normalizationChunks: events.chunks,
+        normalizationEventRecords: events.recordCount,
+        normalizationLogicalSha256: events.logicalSha256,
+        normalizationCursor: parseNormalizationCursor(events.chunks.at(-1)?.resumeCursor ?? null),
+        mutationChunks: events.chunks,
+        validationIssueChunks: events.chunks,
+        mutationLogicalSha256: mutations.logicalSha256,
+        validationIssueLogicalSha256: validationIssues.logicalSha256,
+        mutationRecords: mutations.recordCount,
+        validationIssueRecords: validationIssues.recordCount,
         timings: Object.freeze([...state.timings, decodeTiming, validateTiming, normalizeTiming]),
       });
       await coordinator.updateSource(state);
@@ -746,7 +1227,7 @@ async function runSource(
       const completedAt = dependencies.clock.now();
       const request = acquisitionRequest(configuration, source, discovery);
       const finalCheckpoint = finalSourceCheckpoint(source, plan, acquiredMetadata, completedAt);
-      const observation: SourceRunObservation = Object.freeze({
+      const observation: SourceRunObservationV2 = Object.freeze({
         descriptor,
         runId: configuration.runId,
         request,
@@ -758,8 +1239,16 @@ async function runSource(
         decodedRecords: state.decodedRecords,
         acceptedRecords: state.acceptedRecords,
         rejectedRecords: state.rejectedRecords,
-        mutations,
-        validationIssues: state.validationIssues as readonly ValidationIssue[],
+        mutations: Object.freeze({
+          count: mutations.recordCount,
+          logicalSha256: mutations.logicalSha256,
+          read: mutations.read,
+        }),
+        validationIssues: Object.freeze({
+          count: validationIssues.recordCount,
+          logicalSha256: validationIssues.logicalSha256,
+          read: validationIssues.read,
+        }),
         aborted: false,
       });
       const phase = await timedPhase(
@@ -767,13 +1256,24 @@ async function runSource(
         descriptor.sourceId,
         dependencies,
         configuration.maximumPhaseAttempts,
-        () =>
-          Promise.resolve(
-            source.adapter.summarize(observation, {
-              clock: dependencies.clock,
-              signal: dependencies.signal,
-            }),
-          ),
+        async () => {
+          const context = { clock: dependencies.clock, signal: dependencies.signal };
+          if (streamingAdapter !== undefined) {
+            return streamingAdapter.summarize(observation, context);
+          }
+          if (
+            mutations.recordCount > LEGACY_OBSERVATION_MAX_VALUES ||
+            validationIssues.recordCount > LEGACY_OBSERVATION_MAX_VALUES
+          ) {
+            throw new LegacyObservationLimitError(descriptor.sourceId);
+          }
+          const legacy: SourceRunObservation = Object.freeze({
+            ...observation,
+            mutations: await collectSmallSequence(mutations),
+            validationIssues: await collectSmallSequence(validationIssues),
+          });
+          return (source.adapter as SourceAdapter).summarize(legacy, context);
+        },
       );
       summary = phase.value;
       state = await persistSourcePhase({
@@ -813,23 +1313,186 @@ async function runSource(
   return Object.freeze({ state, mutations, manifest });
 }
 
-async function collectStoreBytes(
+function normalizationCursor(
+  input: Readonly<{
+    artifactIndex: number;
+    recordOrdinal: number;
+    issueOffset: number;
+    mutationOffset: number;
+    records: Readonly<{ decoded: number; accepted: number; rejected: number }>;
+    recordComplete: boolean;
+  }>,
+): NormalizationCursor {
+  return Object.freeze({
+    artifactIndex: input.artifactIndex,
+    recordOrdinal: input.recordOrdinal,
+    issueOffset: input.issueOffset,
+    mutationOffset: input.mutationOffset,
+    recordComplete: input.recordComplete,
+    decodedRecords: input.records.decoded,
+    acceptedRecords: input.records.accepted,
+    rejectedRecords: input.records.rejected,
+  });
+}
+
+function parseNormalizationCursor(value: string | null): NormalizationCursor | null {
+  if (value === null || value.length === 0) return null;
+  const parsed: unknown = JSON.parse(value);
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new TypeError('Invalid normalization resume cursor');
+  }
+  const cursor = parsed as Record<string, unknown>;
+  for (const key of [
+    'artifactIndex',
+    'recordOrdinal',
+    'issueOffset',
+    'mutationOffset',
+    'decodedRecords',
+    'acceptedRecords',
+    'rejectedRecords',
+  ] as const) {
+    if (!Number.isSafeInteger(cursor[key]) || (cursor[key] as number) < 0) {
+      throw new TypeError(`Invalid normalization resume cursor ${key}`);
+    }
+  }
+  if (typeof cursor.recordComplete !== 'boolean') {
+    throw new TypeError('Invalid normalization resume cursor recordComplete');
+  }
+  return Object.freeze(cursor) as NormalizationCursor;
+}
+
+function validateNormalizationResume(
+  chunks: readonly ChunkReference[],
+  cursor: NormalizationCursor | null,
+): void {
+  const persisted = parseNormalizationCursor(chunks.at(-1)?.resumeCursor ?? null);
+  if (canonicalJson(persisted) !== canonicalJson(cursor)) {
+    throw new Error('Normalization checkpoint cursor does not match its final chunk reference');
+  }
+}
+
+async function projectNormalizationEvents<TKind extends 'mutation' | 'validation_issue'>(
+  events: ChunkSequence<NormalizationEvent>,
+  kind: TKind,
+  expected?: Readonly<{ recordCount: number; logicalSha256: string }>,
+): Promise<
+  ChunkSequence<
+    Extract<NormalizationEvent, { kind: TKind }> extends { value: infer TValue } ? TValue : never
+  >
+> {
+  type TValue =
+    Extract<NormalizationEvent, { kind: TKind }> extends { value: infer Value } ? Value : never;
+  const hash = createHash('sha256');
+  let recordCount = 0;
+  for await (const event of events.read()) {
+    if (event.kind !== kind) continue;
+    hash.update(`${canonicalJson(event.value)}\n`);
+    recordCount += 1;
+  }
+  const logicalSha256 = hash.digest('hex');
+  if (
+    expected !== undefined &&
+    (expected.recordCount !== recordCount || expected.logicalSha256 !== logicalSha256)
+  ) {
+    throw new Error(`Projected ${kind} logical identity mismatch`);
+  }
+  return Object.freeze({
+    schemaVersion: '2.0.0' as const,
+    recordCount,
+    logicalSha256,
+    chunks: events.chunks,
+    read: async function* () {
+      for await (const event of events.read()) {
+        if (event.kind === kind) yield event.value as TValue;
+      }
+    },
+  });
+}
+
+async function collectLegacyArtifact(
   dependencies: OrchestrationDependencies,
   uri: string,
 ): Promise<Uint8Array> {
   const chunks: Uint8Array[] = [];
   let total = 0;
   for await (const chunk of dependencies.artifactStore.read(uri)) {
-    chunks.push(chunk);
     total += chunk.byteLength;
+    if (total > LEGACY_WHOLE_COPY_MAX_BYTES) {
+      throw new Error(
+        `Legacy artifact ${uri} exceeds ${LEGACY_WHOLE_COPY_MAX_BYTES} bytes; v2 streaming is required`,
+      );
+    }
+    chunks.push(Uint8Array.from(chunk));
   }
-  const bytes = new Uint8Array(total);
+  const output = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) {
-    bytes.set(chunk, offset);
+    output.set(chunk, offset);
     offset += chunk.byteLength;
   }
-  return bytes;
+  return output;
+}
+
+async function openAcquiredReference(
+  reference: DurableAcquiredArtifactReference,
+  dependencies: OrchestrationDependencies,
+): Promise<AcquiredArtifactSource> {
+  if (reference.formatVersion === '2.0.0') {
+    return openDurableAcquiredArtifactReference(reference, dependencies.artifactStore);
+  }
+  return createAcquiredByteArtifact(
+    reference.metadata,
+    await collectLegacyArtifact(dependencies, reference.metadata.rawUri),
+  );
+}
+
+function requireLegacyAcquiredArtifact(artifact: AcquiredArtifactSource): AcquiredByteArtifact {
+  if (artifact.bytes === undefined) {
+    throw new TypeError('Legacy adapter received a streaming acquired-artifact reference');
+  }
+  return artifact;
+}
+
+function createRepeatableAcquiredArtifacts(
+  references: readonly DurableAcquiredArtifactReference[],
+  dependencies: OrchestrationDependencies,
+): RepeatableAcquiredArtifactSources {
+  const frozen = Object.freeze([...references]);
+  return Object.freeze({
+    count: frozen.length,
+    metadata: Object.freeze(frozen.map(({ metadata }) => metadata)),
+    read: async function* () {
+      for (const reference of frozen) yield await openAcquiredReference(reference, dependencies);
+    },
+  });
+}
+
+export class AcquisitionReplayIncompatibleError extends Error {
+  public readonly code = 'ACQUISITION_REPLAY_INCOMPATIBLE';
+
+  public constructor(sourceId: SourceId, detail: string) {
+    super(
+      `Source ${sourceId} cannot resume its durable acquisition prefix: ${detail}. Streaming v2 acquire() must re-emit every committed artifact in exact deterministic order before new artifacts.`,
+    );
+    this.name = 'AcquisitionReplayIncompatibleError';
+  }
+}
+
+class LegacyObservationLimitError extends Error {
+  public readonly code = 'LEGACY_OBSERVATION_LIMIT';
+
+  public constructor(sourceId: SourceId) {
+    super(
+      `Legacy v1 summary for ${sourceId} exceeded the reviewed small-run bound; implement StreamingSourceAdapter v2.`,
+    );
+    this.name = 'LegacyObservationLimitError';
+  }
+}
+
+async function collectSmallSequence<T>(sequence: ChunkSequence<T>): Promise<readonly T[]> {
+  const values: T[] = [];
+  for await (const value of sequence.read()) values.push(value);
+  return Object.freeze(values);
 }
 
 async function concurrentMap<T, U>(
@@ -951,6 +1614,19 @@ export async function runPipeline(
   }
   const coordinator = new RunCheckpointCoordinator(run, dependencies);
   if (loaded.state === undefined) await coordinator.updateRun({});
+  const recordBudget = createSharedRecordBudget(configuration.profile.maxBufferedRecords);
+  let activeRecords = 0;
+  let highWaterActiveRecords = 0;
+  const onActiveRecordDelta = (delta: number): void => {
+    activeRecords += delta;
+    highWaterActiveRecords = Math.max(highWaterActiveRecords, activeRecords);
+  };
+  let bufferedEvents = 0;
+  let highWaterBufferedEvents = 0;
+  const onBufferedEventDelta = (delta: number): void => {
+    bufferedEvents += delta;
+    highWaterBufferedEvents = Math.max(highWaterBufferedEvents, bufferedEvents);
+  };
 
   const sourceResults = await concurrentMap(
     configuration.sources,
@@ -967,6 +1643,9 @@ export async function runPipeline(
         restored,
         dependencies,
         coordinator,
+        recordBudget,
+        onActiveRecordDelta,
+        onBufferedEventDelta,
         () => run.envelope?.revision ?? null,
       );
     },
@@ -975,12 +1654,13 @@ export async function runPipeline(
   let reconcileArtifact = run.state.reconcileArtifact;
   let featureArtifact = run.state.featureArtifact;
   let martArtifact = run.state.martArtifact;
-  const allMutations = Object.freeze(sourceResults.flatMap(({ mutations }) => mutations));
+  const allMutations = await combineChunkSequences(sourceResults.map(({ mutations }) => mutations));
   const processorSourceManifests = Object.freeze(sourceResults.map(({ manifest }) => manifest));
   if (
     configuration.profile.name !== 'discovery' &&
     sourceResults.some(({ state }) => state.terminalState !== 'failed')
   ) {
+    assertCountyProcessorProfile(configuration.profile.name, dependencies.processors.memoryProfile);
     let reconciled: ReconciliationOutput;
     if (reconcileArtifact === null) {
       const phase = await timedPhase(
@@ -1096,6 +1776,13 @@ export async function runPipeline(
     backpressure: Object.freeze({
       maxConcurrentSources: configuration.profile.maxConcurrentSources,
       maxBufferedRecords: configuration.profile.maxBufferedRecords,
+      observedHighWaterRecords: recordBudget.metrics().highWaterRecords,
+      observedHighWaterActiveRecords: highWaterActiveRecords,
+      observedHighWaterBufferedEvents: highWaterBufferedEvents,
+      observedHighWaterCombinedRecordsAndEvents: recordBudget.metrics().highWaterRecords,
+      activeRecordsAtCompletion: activeRecords,
+      bufferedEventsAtCompletion: bufferedEvents,
+      totalBudgetAcquisitions: recordBudget.metrics().totalAcquired,
     }),
     sources: Object.freeze(sourceManifests),
     artifacts: Object.freeze(globalArtifacts),
@@ -1114,4 +1801,24 @@ export async function runPipeline(
     throw new Error('Final manifest disappeared after immutable write');
   await coordinator.updateRun({ manifestArtifact: manifestPhase, completedPhase: 'finalize' });
   return Object.freeze({ manifest, manifestArtifact });
+}
+
+export class UnboundedCountyPhaseError extends Error {
+  public readonly code = 'UNBOUNDED_COUNTY_PHASE';
+
+  public constructor(public readonly phase: 'reconcile' | 'derive_features' | 'build_marts') {
+    super(
+      `Full profile stopped before ${phase}: configured processor is not bounded_streaming_v2 and no county-completion claim was written.`,
+    );
+    this.name = 'UnboundedCountyPhaseError';
+  }
+}
+
+export function assertCountyProcessorProfile(
+  profile: PipelineConfiguration['profile']['name'],
+  memoryProfile: OrchestrationDependencies['processors']['memoryProfile'],
+): void {
+  if (profile === 'full' && memoryProfile !== 'bounded_streaming_v2') {
+    throw new UnboundedCountyPhaseError('reconcile');
+  }
 }

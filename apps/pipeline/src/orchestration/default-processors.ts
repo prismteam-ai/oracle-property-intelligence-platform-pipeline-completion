@@ -623,14 +623,23 @@ function releaseInput(
 
 export function createDefaultPipelineProcessors(): PipelineProcessors {
   return Object.freeze({
-    reconcile: (mutations: readonly CanonicalMutation[], signal: AbortSignal) => {
+    memoryProfile: 'small_run_only_v1' as const,
+    reconcile: async (
+      mutationSource: Parameters<PipelineProcessors['reconcile']>[0],
+      signal: AbortSignal,
+    ) => {
       signal.throwIfAborted();
+      const mutations: CanonicalMutation[] = [];
+      for await (const mutation of mutationSource.read()) {
+        signal.throwIfAborted();
+        mutations.push(mutation);
+      }
       const canonical = reduceCanonicalMutations(completeImmutableObservations(mutations));
       const output: DefaultReconciliation = Object.freeze({
         canonical,
         links: reconcile(canonical),
       });
-      return Promise.resolve(output);
+      return output;
     },
     deriveFeatures: (input: ReconciliationOutput, signal: AbortSignal) => {
       signal.throwIfAborted();

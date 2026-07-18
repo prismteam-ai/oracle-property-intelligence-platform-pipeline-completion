@@ -1,4 +1,4 @@
-import type { ArtifactStore, StoredArtifact } from '@oracle/artifacts/artifact-store';
+import type { RecoverableArtifactStore, StoredArtifact } from '@oracle/artifacts/artifact-store';
 import type { CheckpointStore } from '@oracle/artifacts/checkpoint-store';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
 import type { RunId, SnapshotId, SourceId } from '@oracle/contracts/ids';
@@ -8,9 +8,11 @@ import type {
   Clock,
   Delay,
   DiscoveryResult,
-  SourceAdapter,
+  AnySourceAdapter,
 } from '@oracle/source-adapters/spi/adapter';
 import type { HttpTransport } from '@oracle/source-adapters/spi/http';
+
+import type { ChunkReference, ChunkSequence } from './chunks.js';
 
 export const ORCHESTRATION_PHASES = Object.freeze([
   'discover',
@@ -41,7 +43,7 @@ export type RunProfile = Readonly<{
 }>;
 
 export type SourceConfiguration = Readonly<{
-  adapter: SourceAdapter;
+  adapter: AnySourceAdapter;
   snapshotId: SnapshotId;
   scope: string;
   capability: string;
@@ -138,6 +140,13 @@ export type PipelineRunManifest = Readonly<{
   backpressure: Readonly<{
     maxConcurrentSources: number;
     maxBufferedRecords: number;
+    observedHighWaterRecords: number;
+    observedHighWaterActiveRecords: number;
+    observedHighWaterBufferedEvents: number;
+    observedHighWaterCombinedRecordsAndEvents: number;
+    activeRecordsAtCompletion: number;
+    bufferedEventsAtCompletion: number;
+    totalBudgetAcquisitions: number;
   }>;
   sources: readonly SourceExecutionManifest[];
   artifacts: readonly PhaseArtifact[];
@@ -164,8 +173,10 @@ export type ReconciliationOutput = Readonly<{
 }>;
 
 export interface PipelineProcessors {
+  /** Default v1 reducers are small-run-only; full runs fail before invoking them. */
+  readonly memoryProfile: 'bounded_streaming_v2' | 'small_run_only_v1';
   reconcile(
-    mutations: readonly CanonicalMutation[],
+    mutations: ChunkSequence<CanonicalMutation>,
     signal: AbortSignal,
   ): Promise<ReconciliationOutput>;
   deriveFeatures(reconciled: ReconciliationOutput, signal: AbortSignal): Promise<unknown>;
@@ -187,7 +198,7 @@ export interface PipelineProcessors {
 }
 
 export type OrchestrationDependencies = Readonly<{
-  artifactStore: ArtifactStore;
+  artifactStore: RecoverableArtifactStore;
   checkpointStore: CheckpointStore;
   analyticalRuntime: AnalyticalRuntime;
   http: HttpTransport;
@@ -205,21 +216,44 @@ export type PersistedSourceState = Readonly<{
   discoveryArtifact: PhaseArtifact | null;
   planArtifact: PhaseArtifact | null;
   acquiredArtifact: PhaseArtifact | null;
+  acquisitionChunks: readonly ChunkReference[];
+  acquisitionRecords: number;
+  acquisitionLogicalSha256: string | null;
   mutationArtifact: PhaseArtifact | null;
+  mutationChunks: readonly ChunkReference[];
+  validationIssueChunks: readonly ChunkReference[];
+  mutationLogicalSha256: string | null;
+  validationIssueLogicalSha256: string | null;
+  normalizationChunks: readonly ChunkReference[];
+  normalizationEventRecords: number;
+  normalizationLogicalSha256: string | null;
+  normalizationCursor: NormalizationCursor | null;
   summaryArtifact: PhaseArtifact | null;
   manifestArtifact: PhaseArtifact | null;
   decodedRecords: number;
   acceptedRecords: number;
   rejectedRecords: number;
-  validationIssues: readonly unknown[];
+  mutationRecords: number;
+  validationIssueRecords: number;
   timings: readonly PhaseTiming[];
   terminalState: SourceTerminalState | null;
   limitations: readonly string[];
   errorCodes: readonly string[];
 }>;
 
+export type NormalizationCursor = Readonly<{
+  artifactIndex: number;
+  recordOrdinal: number;
+  issueOffset: number;
+  mutationOffset: number;
+  recordComplete: boolean;
+  decodedRecords: number;
+  acceptedRecords: number;
+  rejectedRecords: number;
+}>;
+
 export type PersistedRunState = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   runId: RunId;
   configurationHash: string;
   sources: readonly PersistedSourceState[];
@@ -233,6 +267,6 @@ export type PersistedRunState = Readonly<{
 export type SourceRuntimeData = Readonly<{
   discovery: DiscoveryResult;
   acquired: readonly AcquiredArtifact[];
-  mutations: readonly CanonicalMutation[];
+  mutations: ChunkSequence<CanonicalMutation>;
   summary: SourceRunSummary;
 }>;

@@ -34,6 +34,19 @@ export interface ArtifactStore {
   read(uri: string, range?: ArtifactByteRange): AsyncIterable<Uint8Array>;
 }
 
+export type StreamingImmutableArtifactWrite = Omit<ImmutableArtifactWrite, 'expectedSha256'> &
+  Readonly<{ expectedSha256?: string }>;
+
+export interface RecoverableArtifactStore extends ArtifactStore {
+  putImmutableStreaming(request: StreamingImmutableArtifactWrite): Promise<StoredArtifact>;
+  /**
+   * Resolves the canonical immutable object for a confined logical key. Implementations verify
+   * persisted metadata and the complete body hash before returning, so callers may safely adopt a
+   * byte-identical write-before-checkpoint orphan without weakening putImmutable conflicts.
+   */
+  headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined>;
+}
+
 export function assertSha256(value: string): asserts value is string {
   sha256Schema.parse(value);
 }

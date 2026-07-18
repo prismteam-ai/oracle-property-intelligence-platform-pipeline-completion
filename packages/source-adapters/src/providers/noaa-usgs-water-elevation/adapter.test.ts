@@ -1,6 +1,9 @@
 import type {
-  ArtifactStore,
+  ArtifactBody,
+  ArtifactByteRange,
   ImmutableArtifactWrite,
+  RecoverableArtifactStore,
+  StreamingImmutableArtifactWrite,
   StoredArtifact,
 } from '@oracle/artifacts/artifact-store';
 import type {
@@ -19,8 +22,9 @@ import type {
 import { describe, expect, it } from 'vitest';
 
 import { sha256Hex } from '../../spi/bytes.js';
-import type { AcquiredByteArtifact } from '../../spi/acquired-artifact.js';
+import type { AcquiredArtifactSource } from '../../spi/acquired-artifact.js';
 import type { HttpRequest, HttpResponse, HttpTransport } from '../../spi/http.js';
+import { createSharedRecordBudget } from '../../spi/record-budget.js';
 import {
   WATER_VIEW_LIMITATIONS,
   assertWaterViewClaim,
@@ -32,6 +36,7 @@ import {
   type WaterElevationDecodedRecord,
 } from './adapter.js';
 import { NOAA_CUSP_SHORELINE } from './catalog.js';
+import { decodeNoaaShorelineArchiveStream } from './formats.js';
 
 const NOW = '2026-07-17T13:00:00.000Z';
 const clock = { now: () => NOW };
@@ -68,33 +73,99 @@ class QueueTransport implements HttpTransport {
   }
 }
 
-class MemoryArtifactStore implements ArtifactStore {
+async function collectArtifactBody(value: ArtifactBody): Promise<Uint8Array> {
+  if (value instanceof Uint8Array) return Uint8Array.from(value);
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  for await (const chunk of value) {
+    chunks.push(Uint8Array.from(chunk));
+    length += chunk.byteLength;
+  }
+  const bytes = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+class MemoryArtifactStore implements RecoverableArtifactStore {
   public readonly writes: ImmutableArtifactWrite[] = [];
+  readonly #stored = new Map<string, { metadata: StoredArtifact; bytes: Uint8Array }>();
 
   public putImmutable(request: ImmutableArtifactWrite): Promise<StoredArtifact> {
-    if (!(request.body instanceof Uint8Array))
-      throw new TypeError('Test store requires byte bodies');
-    expect(sha256Hex(request.body)).toBe(request.expectedSha256);
-    this.writes.push(request);
-    return Promise.resolve({
+    return this.putImmutableStreaming(request);
+  }
+
+  public async putImmutableStreaming(
+    request: StreamingImmutableArtifactWrite,
+  ): Promise<StoredArtifact> {
+    const bytes = await collectArtifactBody(request.body);
+    const sha256 = sha256Hex(bytes);
+    if (request.expectedSha256 !== undefined && sha256 !== request.expectedSha256) {
+      throw new Error('INTEGRITY: streamed bytes drifted');
+    }
+    this.writes.push(request as ImmutableArtifactWrite);
+    const stored = Object.freeze({
       logicalKey: request.logicalKey,
       uri: `file://test-artifacts/${encodeURIComponent(request.logicalKey)}`,
       mediaType: request.mediaType,
-      byteSize: request.body.byteLength,
-      sha256: request.expectedSha256,
+      byteSize: bytes.byteLength,
+      sha256,
       storedAt: NOW,
       metadata: request.metadata,
     });
+    this.#stored.set(stored.uri, { metadata: stored, bytes });
+    return stored;
   }
 
-  public head(): Promise<StoredArtifact | undefined> {
-    return Promise.resolve(undefined);
+  public head(uri: string): Promise<StoredArtifact | undefined> {
+    return Promise.resolve(this.#stored.get(uri)?.metadata);
   }
 
-  public async *read(): AsyncIterable<Uint8Array> {
+  public headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined> {
+    const stored = [...this.#stored.values()].find(
+      ({ metadata }) => metadata.logicalKey === logicalKey,
+    );
+    if (stored !== undefined && sha256Hex(stored.bytes) !== stored.metadata.sha256) {
+      throw new Error(`test artifact integrity mismatch: ${logicalKey}`);
+    }
+    return Promise.resolve(stored?.metadata);
+  }
+
+  public removeByLogicalKey(logicalKey: string): void {
+    for (const [uri, stored] of this.#stored) {
+      if (stored.metadata.logicalKey === logicalKey) this.#stored.delete(uri);
+    }
+  }
+
+  public corruptByLogicalKey(logicalKey: string): void {
+    for (const stored of this.#stored.values()) {
+      if (stored.metadata.logicalKey !== logicalKey || stored.bytes.byteLength === 0) continue;
+      stored.bytes[0] = (stored.bytes[0] ?? 0) ^ 1;
+    }
+  }
+
+  public async *read(uri: string, range?: ArtifactByteRange): AsyncIterable<Uint8Array> {
     await Promise.resolve();
-    yield new Uint8Array();
+    const stored = this.#stored.get(uri);
+    if (stored === undefined) throw new Error('missing test artifact');
+    yield range === undefined
+      ? Uint8Array.from(stored.bytes)
+      : stored.bytes.slice(range.start, range.endInclusive + 1);
   }
+}
+
+function repeatable<T>(values: readonly T[]) {
+  return Object.freeze({
+    count: values.length,
+    logicalSha256: '0'.repeat(64),
+    read: async function* () {
+      await Promise.resolve();
+      for (const value of values) yield value;
+    },
+  });
 }
 
 class MemoryCheckpointStore implements CheckpointStore {
@@ -314,22 +385,67 @@ describe('NOAA/USGS water and elevation adapter lifecycle', () => {
           void artifact;
         }
       })(),
-    ).rejects.toThrow(/Checkpoint ownership/u);
+    ).rejects.toThrow(/exact contiguous acquisition prefix/u);
 
-    const resumed: AcquiredByteArtifact[] = [];
-    for await (const artifact of adapter.acquire(
-      plan,
-      checkpoints.value?.payload as SourceCheckpoint,
-      context,
-    )) {
+    const resumed: AcquiredArtifactSource[] = [];
+    const freshAdapter = createUsgs3dhpHydrographyAdapter({
+      bounds: [-122, 37.4, -121.9, 37.5],
+      hydroPageSize: 1,
+    });
+    for await (const artifact of freshAdapter.acquire(plan, undefined, context)) {
       resumed.push(artifact);
     }
-    expect(resumed).toHaveLength(1);
-    const resumedArtifact = resumed[0];
+    expect(resumed.map(({ metadata }) => metadata.request.requestKey)).toEqual([
+      'layer-50-page-0',
+      'layer-50-page-1',
+    ]);
+    expect(resumed[0]?.metadata).toEqual(firstArtifact.metadata);
+    const resumedArtifact = resumed[1];
     if (resumedArtifact === undefined) throw new Error('Expected resumed artifact');
     expect(resumedArtifact.metadata.request.requestKey).toBe('layer-50-page-1');
     expect((checkpoints.value?.payload as SourceCheckpoint).complete).toBe(true);
     expect(artifacts.writes).toHaveLength(2);
+    const replayTransport = new QueueTransport([]);
+    const replayed = [];
+    for await (const artifact of createUsgs3dhpHydrographyAdapter({
+      bounds: [-122, 37.4, -121.9, 37.5],
+      hydroPageSize: 1,
+    }).acquire(plan, undefined, { ...context, http: replayTransport })) {
+      replayed.push(artifact);
+    }
+    expect(replayed.map(({ metadata }) => metadata)).toEqual(
+      resumed.map(({ metadata }) => metadata),
+    );
+    expect(replayTransport.requests).toHaveLength(0);
+
+    const completeEnvelope = checkpoints.value;
+    if (completeEnvelope === undefined) throw new Error('Expected complete provider checkpoint');
+    const completeCheckpoint = completeEnvelope.payload as SourceCheckpoint;
+    expect(completeCheckpoint.acquiredArtifactIds).toHaveLength(2);
+    const reversedCheckpoints = new MemoryCheckpointStore();
+    reversedCheckpoints.value = Object.freeze({
+      ...completeEnvelope,
+      payload: Object.freeze({
+        ...completeCheckpoint,
+        acquiredArtifactIds: Object.freeze([...completeCheckpoint.acquiredArtifactIds].reverse()),
+      }),
+    });
+    const reversedTransport = new QueueTransport([]);
+    const reversedReplay = createUsgs3dhpHydrographyAdapter({
+      bounds: [-122, 37.4, -121.9, 37.5],
+      hydroPageSize: 1,
+    }).acquire(plan, undefined, {
+      ...context,
+      http: reversedTransport,
+      checkpointStore: reversedCheckpoints,
+    });
+    await expect(reversedReplay[Symbol.asyncIterator]().next()).rejects.toMatchObject({
+      code: 'SCHEMA_DRIFT',
+      retryable: false,
+      phase: 'acquire',
+      message: expect.stringMatching(/ordered raw prefix/u),
+    });
+    expect(reversedTransport.requests).toHaveLength(0);
 
     const decoded: WaterElevationDecodedRecord[] = [];
     for await (const record of adapter.decode(firstArtifact, {
@@ -337,6 +453,7 @@ describe('NOAA/USGS water and elevation adapter lifecycle', () => {
       signal,
       artifactStore: artifacts,
       analyticalRuntime,
+      recordBudget: createSharedRecordBudget(1),
     })) {
       decoded.push(record);
     }
@@ -356,6 +473,7 @@ describe('NOAA/USGS water and elevation adapter lifecycle', () => {
       clock,
       signal,
       analyticalRuntime,
+      recordBudget: createSharedRecordBudget(1),
     })) {
       mutations.push(mutation);
     }
@@ -364,6 +482,7 @@ describe('NOAA/USGS water and elevation adapter lifecycle', () => {
       clock,
       signal,
       analyticalRuntime,
+      recordBudget: createSharedRecordBudget(1),
     })) {
       repeated.push(mutation);
     }
@@ -390,11 +509,11 @@ describe('NOAA/USGS water and elevation adapter lifecycle', () => {
       decodedRecords: 2,
       acceptedRecords: 2,
       rejectedRecords: 0,
-      mutations,
-      validationIssues: issues,
+      mutations: repeatable(mutations),
+      validationIssues: repeatable(issues),
       aborted: false,
     } as const;
-    const summary = adapter.summarize(observation, { clock, signal });
+    const summary = await adapter.summarize(observation, { clock, signal });
     expect(summary).toMatchObject({
       status: 'succeeded',
       artifactsAcquired: 2,
@@ -404,27 +523,168 @@ describe('NOAA/USGS water and elevation adapter lifecycle', () => {
       warningCount: 1,
       errorCount: 0,
     });
-    expect(() =>
+    await expect(
       adapter.summarize(
         { ...observation, acceptedRecords: 1, rejectedRecords: 0 },
         { clock, signal },
       ),
-    ).toThrow(/accounting mismatch/u);
+    ).rejects.toThrow(/accounting mismatch/u);
     expect(
-      adapter.summarize(
+      await adapter.summarize(
         { ...observation, acceptedRecords: 1, rejectedRecords: 1 },
         { clock, signal },
-      ).status,
-    ).toBe('partial');
+      ),
+    ).toMatchObject({ status: 'partial' });
 
     const authenticatedMutations = [];
     for await (const authenticatedMutation of adapter.normalize(
       { ...validation.record, visibility: 'authenticated' },
-      { clock, signal, analyticalRuntime },
+      { clock, signal, analyticalRuntime, recordBudget: createSharedRecordBudget(1) },
     )) {
       authenticatedMutations.push(authenticatedMutation);
     }
     expect(authenticatedMutations[0]?.visibility).toBe('authenticated');
+  });
+
+  it('replays an exact persisted hydro prefix before HTTP and deduplicates identical bodies', async () => {
+    const signal = new AbortController().signal;
+    const adapter = createUsgs3dhpHydrographyAdapter({
+      bounds: [-122, 37.4, -121.9, 37.5],
+      hydroPageSize: 1,
+    });
+    const descriptor = adapter.describe();
+    const discovery = await adapter.discover({
+      clock,
+      signal,
+      http: new QueueTransport([
+        { status: 200, bytes: new TextEncoder().encode('{"count":2}') },
+        { status: 200, bytes: new TextEncoder().encode('{"count":0}') },
+      ]),
+      ratePolicy: descriptor.ratePolicy,
+      delay: immediateDelay,
+    });
+    const plan = await adapter.plan(requestFor(descriptor.sourceId), discovery, { clock, signal });
+    const identicalBody = hydroFeature('11JSF');
+    const seed = async () => {
+      const artifactStore = new MemoryArtifactStore();
+      const checkpointStore = new MemoryCheckpointStore();
+      const transport = new QueueTransport([
+        {
+          status: 200,
+          headers: { 'content-type': 'application/geo+json' },
+          bytes: identicalBody,
+        },
+        {
+          status: 200,
+          headers: { 'content-type': 'application/geo+json' },
+          bytes: identicalBody,
+        },
+      ]);
+      const acquired: AcquiredArtifactSource[] = [];
+      for await (const artifact of createUsgs3dhpHydrographyAdapter({
+        bounds: [-122, 37.4, -121.9, 37.5],
+        hydroPageSize: 1,
+      }).acquire(plan, undefined, {
+        clock,
+        signal,
+        http: transport,
+        artifactStore,
+        checkpointStore,
+        ratePolicy: descriptor.ratePolicy,
+        delay: immediateDelay,
+      })) {
+        acquired.push(artifact);
+      }
+      return { acquired, artifactStore, checkpointStore };
+    };
+
+    const seeded = await seed();
+    const persisted = seeded.checkpointStore.value?.payload as SourceCheckpoint;
+    expect(persisted.completedRequestKeys).toEqual(['layer-50-page-0', 'layer-50-page-1']);
+    expect(persisted.acquiredArtifactIds).toHaveLength(1);
+    expect(seeded.acquired.map(({ metadata }) => metadata.artifactId)).toEqual([
+      persisted.acquiredArtifactIds[0],
+      persisted.acquiredArtifactIds[0],
+    ]);
+
+    const replayTransport = new QueueTransport([]);
+    const replayed: AcquiredArtifactSource[] = [];
+    for await (const artifact of createUsgs3dhpHydrographyAdapter({
+      bounds: [-122, 37.4, -121.9, 37.5],
+      hydroPageSize: 1,
+    }).acquire(plan, undefined, {
+      clock,
+      signal,
+      http: replayTransport,
+      artifactStore: seeded.artifactStore,
+      checkpointStore: seeded.checkpointStore,
+      ratePolicy: descriptor.ratePolicy,
+      delay: immediateDelay,
+    })) {
+      replayed.push(artifact);
+    }
+    expect(replayed.map(({ metadata }) => metadata)).toEqual(
+      seeded.acquired.map(({ metadata }) => metadata),
+    );
+    expect(replayed.map(({ metadata }) => metadata.request.requestKey)).toEqual([
+      'layer-50-page-0',
+      'layer-50-page-1',
+    ]);
+    expect(replayTransport.requests).toHaveLength(0);
+
+    const mismatchTransport = new QueueTransport([]);
+    const mismatch = adapter.acquire(
+      plan,
+      { ...persisted, updatedAt: '2026-07-17T13:00:01.000Z' },
+      {
+        clock,
+        signal,
+        http: mismatchTransport,
+        artifactStore: seeded.artifactStore,
+        checkpointStore: seeded.checkpointStore,
+        ratePolicy: descriptor.ratePolicy,
+        delay: immediateDelay,
+      },
+    );
+    await expect(mismatch[Symbol.asyncIterator]().next()).rejects.toThrow(
+      /provider checkpoints disagree/u,
+    );
+    expect(mismatchTransport.requests).toHaveLength(0);
+
+    const firstLogicalKey = `raw/${plan.sourceId}/${plan.snapshotId}/0-layer-50-page-0`;
+    const missing = await seed();
+    missing.artifactStore.removeByLogicalKey(firstLogicalKey);
+    const missingTransport = new QueueTransport([]);
+    const missingRun = adapter.acquire(plan, undefined, {
+      clock,
+      signal,
+      http: missingTransport,
+      artifactStore: missing.artifactStore,
+      checkpointStore: missing.checkpointStore,
+      ratePolicy: descriptor.ratePolicy,
+      delay: immediateDelay,
+    });
+    await expect(missingRun[Symbol.asyncIterator]().next()).rejects.toThrow(
+      /missing raw artifact layer-50-page-0/u,
+    );
+    expect(missingTransport.requests).toHaveLength(0);
+
+    const corrupt = await seed();
+    corrupt.artifactStore.corruptByLogicalKey(firstLogicalKey);
+    const corruptTransport = new QueueTransport([]);
+    const corruptRun = adapter.acquire(plan, undefined, {
+      clock,
+      signal,
+      http: corruptTransport,
+      artifactStore: corrupt.artifactStore,
+      checkpointStore: corrupt.checkpointStore,
+      ratePolicy: descriptor.ratePolicy,
+      delay: immediateDelay,
+    });
+    await expect(corruptRun[Symbol.asyncIterator]().next()).rejects.toThrow(
+      /artifact integrity mismatch/u,
+    );
+    expect(corruptTransport.requests).toHaveLength(0);
   });
 
   it('keeps unknown-rights NOAA bytes authenticated and fails closed on frozen identity drift', async () => {
@@ -538,6 +798,15 @@ describe('NOAA/USGS water and elevation adapter lifecycle', () => {
         delay: immediateDelay,
       }),
     ).rejects.toThrow('operator abort');
+    const shoreline = decodeNoaaShorelineArchiveStream(
+      (async function* () {
+        await Promise.resolve();
+        yield new Uint8Array();
+      })(),
+      [-122, 37.4, -121.9, 37.5],
+      controller.signal,
+    );
+    await expect(shoreline[Symbol.asyncIterator]().next()).rejects.toThrow('operator abort');
     expect(transport.requests).toHaveLength(0);
     expect(() => assertWaterViewClaim('verified_view')).toThrow(/never verified views/i);
     expect(WATER_VIEW_LIMITATIONS).toHaveLength(3);

@@ -6,7 +6,13 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { collectResponseHeaders, isWithinAuthorizationScope, runCommand } from './run.js';
+import {
+  collectResponseHeaders,
+  FetchTransport,
+  isWithinAuthorizationScope,
+  RedirectRejectedError,
+  runCommand,
+} from './run.js';
 
 const temporaryDirectories: string[] = [];
 const WORKSPACE_DIRECTORY = fileURLToPath(new URL('../../../../', import.meta.url));
@@ -55,6 +61,48 @@ describe('executable pipeline commands', () => {
     expect(
       isWithinAuthorizationScope('https://unrelated.example.test/transit/datafeeds', scope),
     ).toBe(false);
+  });
+
+  it('uses manual redirects, rejects 3xx, and reports the transport final URL', async () => {
+    const originalFetch = globalThis.fetch;
+    const calls: RequestInit[] = [];
+    try {
+      globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+        calls.push(init ?? {});
+        return Promise.resolve({
+          status: 302,
+          headers: new Headers({ location: '/moved' }),
+          body: null,
+          url: 'https://source.example.test/original',
+        });
+      }) as typeof fetch;
+      const transport = new FetchTransport([], 1_000);
+      await expect(
+        transport.send(
+          { method: 'GET', url: 'https://source.example.test/original', headers: {} },
+          new AbortController().signal,
+        ),
+      ).rejects.toBeInstanceOf(RedirectRejectedError);
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.redirect).toBe('manual');
+
+      globalThis.fetch = ((_input: string | URL | Request, init?: RequestInit) => {
+        calls.push(init ?? {});
+        return Promise.resolve({
+          status: 200,
+          headers: new Headers(),
+          body: null,
+          url: 'https://source.example.test/canonical',
+        });
+      }) as typeof fetch;
+      const response = await transport.send(
+        { method: 'GET', url: 'https://source.example.test/original', headers: {} },
+        new AbortController().signal,
+      );
+      expect(response.finalUrl).toBe('https://source.example.test/canonical');
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 
   it('runs every real parcel-adapter phase and the real reducer, reconciliation, feature, and mart processors', async () => {
@@ -194,6 +242,13 @@ describe('executable pipeline commands', () => {
     expect(first.manifest.backpressure).toEqual({
       maxConcurrentSources: 2,
       maxBufferedRecords: 50,
+      observedHighWaterRecords: 50,
+      observedHighWaterActiveRecords: 1,
+      observedHighWaterBufferedEvents: 49,
+      observedHighWaterCombinedRecordsAndEvents: 50,
+      activeRecordsAtCompletion: 0,
+      bufferedEventsAtCompletion: 0,
+      totalBudgetAcquisitions: 62,
     });
   });
 

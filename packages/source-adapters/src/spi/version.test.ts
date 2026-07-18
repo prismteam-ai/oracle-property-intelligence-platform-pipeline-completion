@@ -4,7 +4,7 @@ import { SOURCE_ADAPTER_CONTRACT_VERSION, parseSourceAdapterContractVersion } fr
 
 describe('source adapter contract versions', () => {
   it('accepts the frozen semantic version', () => {
-    expect(parseSourceAdapterContractVersion(SOURCE_ADAPTER_CONTRACT_VERSION)).toBe('1.0.0');
+    expect(parseSourceAdapterContractVersion(SOURCE_ADAPTER_CONTRACT_VERSION)).toBe('2.0.0');
     expect(parseSourceAdapterContractVersion('0.1.0')).toBe('0.1.0');
   });
 

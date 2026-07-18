@@ -1,5 +1,10 @@
 import type { SourceId } from '@oracle/contracts/ids';
-import type { LicenseSnapshot, RatePolicy, SourceAsOf } from '@oracle/contracts/source';
+import type {
+  LicenseSnapshot,
+  RatePolicy,
+  SourceAsOf,
+  ValidationIssue,
+} from '@oracle/contracts/source';
 import type { Visibility } from '@oracle/contracts/visibility';
 import type { ZipDecodedRecord } from '../../spi/decode.js';
 
@@ -38,11 +43,30 @@ export interface TransitFeedSnapshotConfig {
 
 export type GtfsRow = Readonly<Record<string, string>>;
 
+export interface StreamingGtfsMember {
+  readonly name: string;
+  readonly uri: string;
+  readonly byteSize: number;
+  readonly sha256: string;
+}
+
+export interface StreamingGtfsManifest {
+  readonly formatVersion: '1.0.0';
+  readonly uri: string;
+  readonly sha256: string;
+  readonly byteSize: number;
+  readonly totalMemberBytes: number;
+  readonly members: Readonly<Record<string, StreamingGtfsMember>>;
+}
+
 export interface GtfsDecodedFeed extends ZipDecodedRecord {
   readonly entryPath: '/';
   readonly mediaType: 'application/zip';
   readonly members: Readonly<Record<string, readonly GtfsRow[]>>;
   readonly memberNames: readonly string[];
+  /** Present only for v2 production streams; legacy fixture feeds retain in-memory members. */
+  readonly streamingManifest?: StreamingGtfsManifest;
+  readonly streamingValidationIssues?: readonly ValidationIssue[];
 }
 
 export interface ValidatedGtfsFeed extends GtfsDecodedFeed {

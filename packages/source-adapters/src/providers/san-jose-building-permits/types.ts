@@ -10,6 +10,10 @@ export interface SanJoseBuildingPermitAdapterOptions {
   readonly normalizationTimestamp: string;
   /** A source-lock count. Omit when no independent snapshot denominator exists. */
   readonly expectedRecordCounts?: Readonly<Partial<Record<SanJosePermitFeed, number>>>;
+  /** Hard ceiling for each production feed response. */
+  readonly maximumResponseBytes?: number;
+  /** Hard csv-parse ceiling for one logical CSV record, including quoted embedded newlines. */
+  readonly maximumRecordBytes?: number;
 }
 
 export interface SanJoseDecodedPermitRecord extends CsvDecodedRecord {

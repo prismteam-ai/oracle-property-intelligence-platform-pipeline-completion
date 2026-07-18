@@ -50,6 +50,7 @@ describe('LocalArtifactStore', () => {
     }).putImmutable(request);
     const reopened = new LocalArtifactStore({ rootDirectory: root, now: () => 'never-used' });
     expect(await reopened.head(stored.uri)).toEqual(stored);
+    expect(await reopened.headByLogicalKey(request.logicalKey)).toEqual(stored);
     expect((await collect(reopened.read(stored.uri))).toString()).toBe('0123456789');
     expect(
       (await collect(reopened.read(stored.uri, { start: 2, endInclusive: 5 }))).toString(),
@@ -98,6 +99,7 @@ describe('LocalArtifactStore', () => {
       ifAbsent: true,
     });
     await writeFile(fileURLToPath(stored.uri), 'evil');
+    await expect(store.headByLogicalKey('good/body')).rejects.toThrow('SHA-256 mismatch');
     await expect(collect(store.read(stored.uri))).rejects.toThrow('SHA-256 mismatch');
   });
 

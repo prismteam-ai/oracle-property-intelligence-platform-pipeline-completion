@@ -1,7 +1,17 @@
 import { acquiredArtifactSchema } from '@oracle/contracts/source';
 import { describe, expect, it } from 'vitest';
 
-import { createAcquiredByteArtifact } from './acquired-artifact.js';
+import type { RecoverableArtifactStore } from '@oracle/artifacts/artifact-store';
+
+import {
+  ANALYTICAL_SNAPSHOT_MANIFEST_MEDIA_TYPE,
+  encodeAnalyticalSnapshotManifest,
+  createAcquiredByteArtifact,
+  createStreamingAcquiredArtifact,
+  LegacyWholeCopyLimitError,
+  parseAnalyticalSnapshotManifest,
+  resolveAnalyticalSnapshotReference,
+} from './acquired-artifact.js';
 import { createImmutableBytes } from './bytes.js';
 
 const HASH = 'b'.repeat(64);
@@ -63,5 +73,93 @@ describe('acquired byte artifact boundary', () => {
     expect(() => createAcquiredByteArtifact(metadata(SOURCE_BYTES), changed)).toThrow(
       'integrity mismatch',
     );
+  });
+
+  it('rejects legacy whole-copy artifacts above the reviewed fixture bound', () => {
+    expect(() => createAcquiredByteArtifact(metadata(SOURCE_BYTES), SOURCE_BYTES, 1)).toThrow(
+      LegacyWholeCopyLimitError,
+    );
+  });
+
+  it('opens repeatable bounded streaming reads after verifying stored metadata', async () => {
+    const artifactMetadata = metadata(SOURCE_BYTES);
+    const store = {
+      head: () =>
+        Promise.resolve({
+          logicalKey: 'raw/source',
+          uri: artifactMetadata.rawUri,
+          mediaType: artifactMetadata.mediaType,
+          byteSize: artifactMetadata.byteSize,
+          sha256: artifactMetadata.sha256,
+          storedAt: artifactMetadata.retrievedAt,
+          metadata: {},
+        }),
+      read: async function* () {
+        yield await Promise.resolve(SOURCE_BYTES);
+      },
+    } as unknown as RecoverableArtifactStore;
+    const artifact = await createStreamingAcquiredArtifact(artifactMetadata, store);
+    const collect = async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const chunk of artifact.content.read({ maxChunkBytes: 3 })) chunks.push(chunk);
+      return Buffer.concat(chunks);
+    };
+    expect((await collect()).equals(SOURCE_BYTES)).toBe(true);
+    expect((await collect()).equals(SOURCE_BYTES)).toBe(true);
+    const lengths: number[] = [];
+    for await (const chunk of artifact.content.read({ maxChunkBytes: 3 })) {
+      lengths.push(chunk.byteLength);
+    }
+    expect(Math.max(...lengths)).toBeLessThanOrEqual(3);
+  });
+
+  it('encodes and strictly validates tiny analytical snapshot manifests', () => {
+    const bytes = encodeAnalyticalSnapshotManifest({
+      formatVersion: '1.0.0',
+      dataArtifacts: [
+        { uri: 'file:///raw/data.parquet', byteLength: 775_000_000, sha256: '1'.repeat(64) },
+      ],
+      scanBytesByOperation: {
+        decode_gtfs_bounded_finalize: 12_000_000,
+        decode_overture_santa_clara_starbucks_candidates: 775_000_000,
+      },
+    });
+    const manifest = parseAnalyticalSnapshotManifest(JSON.parse(new TextDecoder().decode(bytes)));
+    expect(manifest.dataArtifacts[0]?.byteLength).toBe(775_000_000);
+    expect(ANALYTICAL_SNAPSHOT_MANIFEST_MEDIA_TYPE).toContain('version=1');
+    expect(() =>
+      parseAnalyticalSnapshotManifest({
+        ...manifest,
+        unexpected: true,
+      }),
+    ).toThrow('invalid');
+  });
+
+  it('resolves only a verified, bounded derived analytical manifest by logical key', async () => {
+    const stored = {
+      logicalKey: 'derived/source/analytical-manifest.json',
+      uri: 'file:///derived/analytical-manifest.json',
+      mediaType: ANALYTICAL_SNAPSHOT_MANIFEST_MEDIA_TYPE,
+      byteSize: 128,
+      sha256: '2'.repeat(64),
+      storedAt: '2026-07-18T00:00:00.000Z',
+      metadata: {},
+    };
+    const store = {
+      headByLogicalKey: () => Promise.resolve(stored),
+    } as unknown as RecoverableArtifactStore;
+    await expect(resolveAnalyticalSnapshotReference(store, stored.logicalKey)).resolves.toEqual({
+      formatVersion: '1.0.0',
+      manifestUri: stored.uri,
+      manifestSha256: stored.sha256,
+      byteLength: stored.byteSize,
+    });
+    const oversized = {
+      ...store,
+      headByLogicalKey: () => Promise.resolve({ ...stored, byteSize: 1024 * 1024 + 1 }),
+    } as unknown as RecoverableArtifactStore;
+    await expect(
+      resolveAnalyticalSnapshotReference(oversized, stored.logicalKey),
+    ).rejects.toBeInstanceOf(LegacyWholeCopyLimitError);
   });
 });

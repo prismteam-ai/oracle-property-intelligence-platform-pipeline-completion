@@ -40,7 +40,7 @@ export const SANTA_CLARA_PARCELS_CRS = 'urn:ogc:def:crs:OGC:1.3:CRS84';
 
 export const SANTA_CLARA_PARCELS_DESCRIPTOR = sourceDescriptorSchema.parse({
   sourceId: SANTA_CLARA_PARCELS_SOURCE_ID,
-  contractVersion: '1.0.0',
+  contractVersion: '2.0.0',
   name: 'Santa Clara County Parcels (Socrata ubcd-cewv)',
   authority: {
     authorityType: 'official_government',

@@ -3,9 +3,11 @@ import { describe, expect, it } from 'vitest';
 
 import {
   assertConfiguration,
+  assertCountyProcessorProfile,
   countyCompletion,
   REQUIRED_COUNTY_CAPABILITIES,
   selectDiscoveryDenominator,
+  UnboundedCountyPhaseError,
 } from './runner.js';
 import type {
   PipelineConfiguration,
@@ -105,6 +107,28 @@ describe('source coverage denominator selection', () => {
 });
 
 describe('full county completion guard', () => {
+  it('allows the exact full inventory to retain reviewed tiny legacy capability lanes', () => {
+    const configuration: PipelineConfiguration = {
+      runId: runIdSchema.parse(`sc:run:${'c'.repeat(64)}`),
+      pipelineVersion: 'test',
+      requestedAt: '2026-07-17T00:00:00.000Z',
+      profile: {
+        name: 'full',
+        recordCap: null,
+        maxConcurrentSources: 2,
+        maxBufferedRecords: 1,
+      },
+      sources: REQUIRED_COUNTY_CAPABILITIES.map((capability) =>
+        configuredSource(capability.replaceAll('_', '-'), capability),
+      ),
+      maximumPhaseAttempts: 1,
+    };
+    expect(() => assertConfiguration(configuration)).not.toThrow();
+    expect(() => assertCountyProcessorProfile('full', 'small_run_only_v1')).toThrow(
+      UnboundedCountyPhaseError,
+    );
+  });
+
   it('rejects a parcel-only full configuration', () => {
     const configuration: PipelineConfiguration = {
       runId: runIdSchema.parse(`sc:run:${HASH}`),

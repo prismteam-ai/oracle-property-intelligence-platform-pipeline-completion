@@ -5,7 +5,13 @@ import { VTA_2026_07_15_SNAPSHOT } from '@oracle/source-adapters/providers/vta-c
 import { describe, expect, it } from 'vitest';
 
 import { readPipelineSourceConfig, sourceConfigFingerprint } from './source-config.js';
-import { composeProductionSources, resolveWorkspaceModulePath } from './source-registry.js';
+import {
+  assertBoundedOsmDecoderContract,
+  BOUNDED_OSM_DECODER_CONTRACT,
+  composeProductionSources,
+  resolveWorkspaceModulePath,
+  UnsupportedOsmDecoderContractError,
+} from './source-registry.js';
 
 async function composition(requestedAt: string) {
   const config = await readPipelineSourceConfig(undefined);
@@ -142,6 +148,19 @@ describe('production source registry', () => {
     );
     expect(() => resolveWorkspaceModulePath(workspace, '../outside.js')).toThrow(
       'stay inside the workspace',
+    );
+  });
+
+  it('rejects OSM decoder modules without the exact bounded streaming attestation', () => {
+    expect(() => assertBoundedOsmDecoderContract(BOUNDED_OSM_DECODER_CONTRACT)).not.toThrow();
+    expect(() =>
+      assertBoundedOsmDecoderContract({
+        ...BOUNDED_OSM_DECODER_CONTRACT,
+        noWholeCopy: false,
+      }),
+    ).toThrow(UnsupportedOsmDecoderContractError);
+    expect(() => assertBoundedOsmDecoderContract(undefined)).toThrow(
+      UnsupportedOsmDecoderContractError,
     );
   });
 });

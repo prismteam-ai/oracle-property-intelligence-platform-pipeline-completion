@@ -1,4 +1,4 @@
-import type { ArtifactStore, StoredArtifact } from '@oracle/artifacts/artifact-store';
+import type { RecoverableArtifactStore, StoredArtifact } from '@oracle/artifacts/artifact-store';
 
 import { canonicalBytes, parseJsonBytes } from './canonical-json.js';
 import type { OrchestrationPhase, PhaseArtifact } from './types.js';
@@ -22,7 +22,7 @@ export async function collectBytes(bytes: AsyncIterable<Uint8Array>): Promise<Ui
 
 export async function writeJsonArtifact(
   input: Readonly<{
-    store: ArtifactStore;
+    store: RecoverableArtifactStore;
     runId: string;
     owner: string;
     phase: OrchestrationPhase;
@@ -35,24 +35,41 @@ export async function writeJsonArtifact(
     .then((digest) => Buffer.from(digest).toString('hex'));
   const owner = input.owner.replaceAll(/[^a-zA-Z0-9._~-]/gu, '-');
   const logicalKey = `runs/${input.runId.replace('sc:run:', '')}/${owner}/${input.phase}/${sha256}.json`;
-  const stored = await input.store.putImmutable({
-    logicalKey,
-    mediaType: 'application/json',
-    body: bytes,
-    expectedSha256: sha256,
-    metadata: Object.freeze({
-      runId: input.runId,
-      owner: input.owner,
-      phase: input.phase,
-      canonicalization: 'oracle-canonical-json-v1',
-    }),
-    ifAbsent: true,
+  const metadata = Object.freeze({
+    runId: input.runId,
+    owner: input.owner,
+    phase: input.phase,
+    canonicalization: 'oracle-canonical-json-v1',
   });
+  let stored: StoredArtifact;
+  try {
+    stored = await input.store.putImmutable({
+      logicalKey,
+      mediaType: 'application/json',
+      body: bytes,
+      expectedSha256: sha256,
+      metadata,
+      ifAbsent: true,
+    });
+  } catch (error) {
+    const orphan = await input.store.headByLogicalKey(logicalKey);
+    if (orphan === undefined) throw error;
+    stored = orphan;
+  }
+  if (
+    stored.logicalKey !== logicalKey ||
+    stored.mediaType !== 'application/json' ||
+    stored.byteSize !== bytes.byteLength ||
+    stored.sha256 !== sha256 ||
+    Object.entries(metadata).some(([key, value]) => stored.metadata[key] !== value)
+  ) {
+    throw new Error(`Immutable phase artifact orphan mismatch: ${logicalKey}`);
+  }
   return phaseArtifact(input.phase, stored);
 }
 
 export async function readJsonArtifact(
-  store: ArtifactStore,
+  store: RecoverableArtifactStore,
   artifact: PhaseArtifact,
 ): Promise<unknown> {
   const stored = await store.head(artifact.uri);

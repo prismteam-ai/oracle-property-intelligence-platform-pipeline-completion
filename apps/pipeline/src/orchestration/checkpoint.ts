@@ -34,7 +34,7 @@ export async function commitRunState(
     scope: runCheckpointScope(input.state.runId),
     previousRevision: input.previous?.revision ?? null,
     writtenAt: input.writtenAt,
-    payload: input.state as unknown as CheckpointValue,
+    payload: input.state,
   });
   const result = await input.store.commit({
     expectedRevision: input.previous?.revision ?? null,
@@ -52,12 +52,32 @@ function parseRunState(payload: CheckpointValue): PersistedRunState {
   }
   const value = payload as Readonly<Record<string, CheckpointValue>>;
   if (
-    value.schemaVersion !== 1 ||
+    (value.schemaVersion !== 1 && value.schemaVersion !== 2) ||
     typeof value.runId !== 'string' ||
     typeof value.configurationHash !== 'string' ||
     !Array.isArray(value.sources)
   ) {
     throw new TypeError('Unsupported orchestration checkpoint payload');
   }
+  if (value.schemaVersion === 1) {
+    const manifestArtifact = value.manifestArtifact;
+    if (manifestArtifact === null || manifestArtifact === undefined) {
+      throw new LegacyCheckpointIncompatibleError(value.runId);
+    }
+    // Finalized v1 is immutable/readable. Its manifest short-circuits execution before v2 fields
+    // are observed, so it is safe to retain only as a compatibility view.
+    return payload as unknown as PersistedRunState;
+  }
   return payload as unknown as PersistedRunState;
+}
+
+export class LegacyCheckpointIncompatibleError extends Error {
+  public readonly code = 'LEGACY_INCOMPLETE_CHECKPOINT';
+
+  public constructor(public readonly runId: string) {
+    super(
+      `Incomplete orchestration checkpoint v1 for ${runId} cannot resume safely. Preserve it for evidence and start a new v2 run; no source was reacquired.`,
+    );
+    this.name = 'LegacyCheckpointIncompatibleError';
+  }
 }
