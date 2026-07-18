@@ -37,6 +37,7 @@ import {
 } from '@oracle/source-adapters/spi/acquired-artifact';
 
 import { createDefaultPipelineProcessors } from '../orchestration/default-processors.js';
+import { createBoundedPipelineProcessors } from '../orchestration/bounded-processors.js';
 import { createRunProfile } from '../orchestration/profiles.js';
 import { runPipeline } from '../orchestration/runner.js';
 import type {
@@ -561,7 +562,13 @@ export async function runCommand(options: RunCommandOptions): Promise<PipelineRe
           : new FixtureParcelTransport(fixture),
       clock,
       delay: new AbortableDelay(),
-      processors: createDefaultPipelineProcessors(),
+      processors:
+        options.profile === 'full' || options.profile === 'incremental'
+          ? createBoundedPipelineProcessors({
+              outputDirectory,
+              scratchDirectory: resolve(outputDirectory, 'bounded-processing'),
+            })
+          : createDefaultPipelineProcessors(),
       signal: controller.signal,
       ...(options.beforePhase === undefined ? {} : { beforePhase: options.beforePhase }),
     }),

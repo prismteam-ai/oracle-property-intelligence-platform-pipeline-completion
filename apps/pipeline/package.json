@@ -7,13 +7,15 @@
     "oracle-pipeline": "./dist/cli.js"
   },
   "scripts": {
-    "build": "esbuild src/cli.ts --bundle --format=esm --platform=node --target=node22 --sourcemap --banner:js=\"#!/usr/bin/env node\" --outfile=dist/cli.js",
+    "build": "esbuild src/cli.ts --bundle --format=esm --platform=node --target=node22 --external:@duckdb/node-api --sourcemap --banner:js=\"#!/usr/bin/env node\" --outfile=dist/cli.js",
     "check": "node dist/cli.js --check",
     "lint": "eslint src",
+    "stress:bounded-county": "esbuild src/orchestration/bounded-county-stress.ts --bundle --format=esm --platform=node --target=node22 --external:@duckdb/node-api --outfile=dist/bounded-county-stress.js && node --max-old-space-size=256 dist/bounded-county-stress.js",
     "test": "vitest run src",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@duckdb/node-api": "1.4.5-r.1",
     "@oracle/artifacts": "workspace:*",
     "@oracle/canonical-model": "workspace:*",
     "@oracle/contracts": "workspace:*",

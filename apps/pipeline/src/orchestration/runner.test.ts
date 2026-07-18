@@ -127,6 +127,10 @@ describe('full county completion guard', () => {
     expect(() => assertCountyProcessorProfile('full', 'small_run_only_v1')).toThrow(
       UnboundedCountyPhaseError,
     );
+    expect(() => assertCountyProcessorProfile('incremental', 'small_run_only_v1')).toThrow(
+      UnboundedCountyPhaseError,
+    );
+    expect(() => assertCountyProcessorProfile('pilot', 'small_run_only_v1')).not.toThrow();
   });
 
   it('rejects a parcel-only full configuration', () => {

@@ -52,8 +52,11 @@ const multivaluedPaths = new Set([
   '/categories',
   '/brandIdentifiers',
 ]);
+const MAX_CANONICAL_GROUP_MUTATIONS = 4_096;
+const MAX_CANONICAL_REDUCTION_MUTATIONS = 65_536;
 
 function mostRestrictiveVisibility(values: readonly Visibility[]): Visibility {
+  assertBoundedArray(values, MAX_CANONICAL_GROUP_MUTATIONS, 'visibility values');
   const selected = [...values].sort(
     (left, right) => visibilityRank[right] - visibilityRank[left],
   )[0];
@@ -86,6 +89,7 @@ function assertDuplicateIdentity(
 }
 
 function chooseBase(upserts: readonly EntityUpsertMutation[]): EntityUpsertMutation {
+  assertBoundedArray(upserts, MAX_CANONICAL_GROUP_MUTATIONS, 'entity upserts');
   const ordered = [...upserts].sort(
     (left, right) =>
       right.entity.version - left.entity.version ||
@@ -100,6 +104,7 @@ function chooseBase(upserts: readonly EntityUpsertMutation[]): EntityUpsertMutat
 }
 
 function precedence(observations: readonly FieldObservation[]): PrecedenceDecision {
+  assertBoundedArray(observations, MAX_CANONICAL_GROUP_MUTATIONS, 'field observations');
   return selectByCanonicalPrecedence(
     observations.map((observation) => ({
       observationId: observation.observationId,
@@ -113,6 +118,7 @@ function precedence(observations: readonly FieldObservation[]): PrecedenceDecisi
 }
 
 function mergeMultivalued(observations: readonly FieldObservation[]): CanonicalValue[] {
+  assertBoundedArray(observations, MAX_CANONICAL_GROUP_MUTATIONS, 'multivalue observations');
   const values = new Map<string, CanonicalValue>();
   for (const observation of observations) {
     if (!Array.isArray(observation.value)) {
@@ -185,6 +191,8 @@ function reduceEntity(
   upserts: readonly EntityUpsertMutation[],
   observationMutations: readonly ObservationMutation[],
 ): CanonicalEntityAggregate {
+  assertBoundedArray(upserts, MAX_CANONICAL_GROUP_MUTATIONS, 'entity upserts');
+  assertBoundedArray(observationMutations, MAX_CANONICAL_GROUP_MUTATIONS, 'observation mutations');
   const base = chooseBase(upserts);
   if (upserts.some(({ entity }) => entity.entityKind !== base.entity.entityKind)) {
     throw new Error(`Entity ${base.entity.id} has conflicting entity kinds`);
@@ -308,7 +316,44 @@ function reduceEntity(
   });
 }
 
+/**
+ * Reduces one semantic entity group. County processing calls this only after the
+ * durable partitioner has ordered and grouped mutations by entity identity.
+ * Keeping this primitive separate from the legacy corpus reducer allows the
+ * bounded path to retain the exact canonical precedence implementation while
+ * holding no more than one explicitly budgeted entity group in memory.
+ */
+export function reduceCanonicalEntityGroup(input: readonly unknown[]): CanonicalEntityAggregate {
+  assertBoundedArray(input, MAX_CANONICAL_GROUP_MUTATIONS, 'canonical entity group');
+  const mutationIdentity = new Map<string, string>();
+  const upserts: EntityUpsertMutation[] = [];
+  const observations: ObservationMutation[] = [];
+  let entityId: string | null = null;
+  for (const value of input) {
+    const mutation = canonicalMutationSchema.parse(value);
+    if (mutation.kind !== 'entity_upsert' && mutation.kind !== 'field_observation') {
+      throw new TypeError('Canonical entity groups may contain only upserts and observations');
+    }
+    if (assertDuplicateIdentity(mutationIdentity, mutation.mutationId, mutation, 'Mutation ID')) {
+      continue;
+    }
+    const candidateId =
+      mutation.kind === 'entity_upsert' ? mutation.entity.id : mutation.observation.entityId;
+    if (entityId !== null && candidateId !== entityId) {
+      throw new Error(`Canonical entity group mixed ${entityId} with ${candidateId}`);
+    }
+    entityId = candidateId;
+    if (mutation.kind === 'entity_upsert') upserts.push(mutation);
+    else observations.push(mutation);
+  }
+  if (entityId === null || upserts.length === 0) {
+    throw new Error('Canonical entity group requires at least one entity upsert');
+  }
+  return reduceEntity(upserts, observations);
+}
+
 export function reduceCanonicalMutations(input: readonly unknown[]): CanonicalReduction {
+  assertBoundedArray(input, MAX_CANONICAL_REDUCTION_MUTATIONS, 'canonical reduction input');
   const mutationIdentity = new Map<string, string>();
   const mutations = input
     .map((mutation) => canonicalMutationSchema.parse(mutation))
@@ -354,4 +399,10 @@ export function reduceCanonicalMutations(input: readonly unknown[]): CanonicalRe
       ),
     ),
   });
+}
+
+function assertBoundedArray(values: readonly unknown[], maximum: number, label: string): void {
+  if (values.length > maximum) {
+    throw new RangeError(`${label} exceeds the bounded maximum of ${maximum}`);
+  }
 }

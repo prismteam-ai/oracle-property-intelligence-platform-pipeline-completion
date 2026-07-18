@@ -326,7 +326,9 @@ try {
   const sourceResult = result.manifest.sources[0];
   process.stdout.write(
     `${JSON.stringify({
-      schemaVersion: 'oracle-streaming-runner-stress-v2',
+      schemaVersion: 'oracle-streaming-runner-foundation-stress-v3',
+      proofScope: 'foundation_only_acquisition_normalization_runner',
+      downstreamCountyProof: false,
       logicalRecords: adapter.decodedRecords,
       normalizedMutations: adapter.normalizedMutations,
       reconciledMutations,

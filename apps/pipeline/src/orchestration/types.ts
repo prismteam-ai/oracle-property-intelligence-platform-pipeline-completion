@@ -172,9 +172,44 @@ export type ReconciliationOutput = Readonly<{
   links: unknown;
 }>;
 
+export type BoundedCountyProcessingRequest = Readonly<{
+  configuration: PipelineConfiguration;
+  mutationSources: readonly Readonly<{
+    sourceId: SourceId;
+    snapshotId: SnapshotId;
+    sequence: ChunkSequence<CanonicalMutation>;
+  }>[];
+  acquiredSources: readonly Readonly<{
+    sourceId: SourceId;
+    artifacts: readonly AcquiredArtifact[];
+  }>[];
+  sources: readonly SourceExecutionManifest[];
+  existing: Readonly<{
+    reconcileArtifact: PhaseArtifact | null;
+    featureArtifact: PhaseArtifact | null;
+    martArtifact: PhaseArtifact | null;
+  }>;
+  artifactStore: RecoverableArtifactStore;
+  checkpointStore: CheckpointStore;
+  clock: Clock;
+  signal: AbortSignal;
+  beforePhase?: (phase: OrchestrationPhase) => void | Promise<void>;
+}>;
+
+export type BoundedCountyProcessingResult = Readonly<{
+  reconcileArtifact: PhaseArtifact;
+  featureArtifact: PhaseArtifact;
+  martArtifact: PhaseArtifact;
+  countyCompletionClaim: boolean;
+}>;
+
 export interface PipelineProcessors {
   /** Default v1 reducers are small-run-only; full runs fail before invoking them. */
   readonly memoryProfile: 'bounded_streaming_v2' | 'small_run_only_v1';
+  /** Required for bounded_streaming_v2. It owns all row-bearing spill and durable stage state. */
+  processBoundedCounty?(
+    request: BoundedCountyProcessingRequest,
+  ): Promise<BoundedCountyProcessingResult>;
   reconcile(
     mutations: ChunkSequence<CanonicalMutation>,
     signal: AbortSignal,

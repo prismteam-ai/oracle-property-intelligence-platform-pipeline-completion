@@ -3,7 +3,6 @@ import { createHash } from 'node:crypto';
 import type { CheckpointEnvelope } from '@oracle/artifacts/checkpoint-store';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
 import type { SourceId } from '@oracle/contracts/ids';
-import { snapshotIdSchema } from '@oracle/contracts/ids';
 import { sourceCheckpointSchema } from '@oracle/contracts/source';
 import type {
   AcquisitionPlan,
@@ -81,6 +80,7 @@ type SourceRuntime = Readonly<{
   state: PersistedSourceState;
   mutations: ChunkSequence<CanonicalMutation>;
   manifest: SourceExecutionManifest;
+  acquired: readonly AcquiredArtifact[];
 }>;
 
 type NormalizationEvent =
@@ -506,18 +506,11 @@ function sourceManifest(
   ].filter((artifact): artifact is PhaseArtifact => artifact !== null);
   const acquired = input.acquired ?? [];
   const sourceCoverage = coverage(input.source, input.discovery, input.state);
-  const observedContentId =
-    acquired.length === 0
-      ? null
-      : snapshotIdSchema.parse(
-          `sc:snapshot:${input.state.sourceId.replace('sc:source:', '')}:${sha256(
-            acquired.map((artifact) => ({
-              sha256: artifact.sha256,
-              schemaFingerprint: artifact.schemaFingerprint.value,
-              sourceAsOf: artifact.sourceAsOf,
-            })),
-          )}`,
-        );
+  const acquiredSnapshotIds = [...new Set(acquired.map(({ snapshotId }) => snapshotId))];
+  if (acquiredSnapshotIds.length > 1) {
+    throw new Error(`Acquisition mixed snapshots for ${input.state.sourceId}`);
+  }
+  const observedContentId = acquiredSnapshotIds[0] ?? null;
   const sourceAsOf =
     [
       ...acquired.map(({ sourceAsOf: value }) => value),
@@ -653,6 +646,7 @@ async function runSource(
       return Object.freeze({
         state,
         mutations,
+        acquired: Object.freeze([]),
         manifest: sourceManifest({
           source,
           state,
@@ -1310,7 +1304,7 @@ async function runSource(
     summary,
     checkpointRevision: checkpointRevision(),
   });
-  return Object.freeze({ state, mutations, manifest });
+  return Object.freeze({ state, mutations, manifest, acquired: acquiredMetadata });
 }
 
 function normalizationCursor(
@@ -1654,84 +1648,143 @@ export async function runPipeline(
   let reconcileArtifact = run.state.reconcileArtifact;
   let featureArtifact = run.state.featureArtifact;
   let martArtifact = run.state.martArtifact;
-  const allMutations = await combineChunkSequences(sourceResults.map(({ mutations }) => mutations));
+  let boundedCountyCompletionClaim: boolean | null = null;
   const processorSourceManifests = Object.freeze(sourceResults.map(({ manifest }) => manifest));
   if (
     configuration.profile.name !== 'discovery' &&
     sourceResults.some(({ state }) => state.terminalState !== 'failed')
   ) {
     assertCountyProcessorProfile(configuration.profile.name, dependencies.processors.memoryProfile);
-    let reconciled: ReconciliationOutput;
-    if (reconcileArtifact === null) {
-      const phase = await timedPhase(
-        'reconcile',
-        null,
-        dependencies,
-        configuration.maximumPhaseAttempts,
-        () => dependencies.processors.reconcile(allMutations, dependencies.signal),
-      );
-      reconcileArtifact = await writeJsonArtifact({
-        store: dependencies.artifactStore,
-        runId: configuration.runId,
-        owner: 'pipeline',
-        phase: 'reconcile',
-        value: phase.value,
-      });
-      await coordinator.updateRun({ reconcileArtifact, completedPhase: 'reconcile' });
-      reconciled = phase.value;
-    } else reconciled = await loadRequired(dependencies, reconcileArtifact, 'reconciliation');
-
-    let features: unknown;
-    if (featureArtifact === null) {
-      const phase = await timedPhase(
-        'derive_features',
-        null,
-        dependencies,
-        configuration.maximumPhaseAttempts,
-        () => dependencies.processors.deriveFeatures(reconciled, dependencies.signal),
-      );
-      featureArtifact = await writeJsonArtifact({
-        store: dependencies.artifactStore,
-        runId: configuration.runId,
-        owner: 'pipeline',
-        phase: 'derive_features',
-        value: phase.value,
-      });
-      await coordinator.updateRun({ featureArtifact, completedPhase: 'derive_features' });
-      features = phase.value;
-    } else features = await loadRequired(dependencies, featureArtifact, 'features');
-
-    if (martArtifact === null) {
-      const phase = await timedPhase(
-        'build_marts',
-        null,
-        dependencies,
-        configuration.maximumPhaseAttempts,
-        () =>
-          dependencies.processors.buildMarts(
-            {
-              reconciled,
-              features,
-              run: Object.freeze({
-                runId: configuration.runId,
-                pipelineVersion: configuration.pipelineVersion,
-                profile: configuration.profile.name,
-                requestedAt: configuration.requestedAt,
-                completedAt: dependencies.clock.now(),
-              }),
-              sources: processorSourceManifests,
-            },
-            dependencies.signal,
+    if (
+      (configuration.profile.name === 'full' || configuration.profile.name === 'incremental') &&
+      dependencies.processors.memoryProfile === 'bounded_streaming_v2'
+    ) {
+      if (dependencies.processors.processBoundedCounty === undefined) {
+        throw new UnboundedCountyPhaseError('reconcile');
+      }
+      const acquiredSourceResults = sourceResults.filter(({ acquired }) => acquired.length > 0);
+      if (acquiredSourceResults.length === 0) {
+        throw new UnboundedCountyPhaseError('reconcile');
+      }
+      const result = await dependencies.processors.processBoundedCounty({
+        configuration,
+        mutationSources: Object.freeze(
+          acquiredSourceResults.map(({ manifest, mutations }) =>
+            Object.freeze({
+              sourceId: manifest.sourceId,
+              snapshotId:
+                manifest.snapshotIdentity.observedContentId ?? manifest.snapshotIdentity.intentId,
+              sequence: mutations,
+            }),
           ),
-      );
-      martArtifact = await writeJsonArtifact({
-        store: dependencies.artifactStore,
-        runId: configuration.runId,
-        owner: 'pipeline',
-        phase: 'build_marts',
-        value: phase.value,
+        ),
+        acquiredSources: Object.freeze(
+          acquiredSourceResults.map(({ manifest, acquired }) =>
+            Object.freeze({
+              sourceId: manifest.sourceId,
+              artifacts: acquired,
+            }),
+          ),
+        ),
+        // Preserve every configured lane, including failed/blocked/no-artifact sources.
+        // The bounded processor uses acquiredSources only as the byte-bearing closure and
+        // this complete inventory for fail-closed county eligibility and coverage rows.
+        sources: processorSourceManifests,
+        existing: Object.freeze({ reconcileArtifact, featureArtifact, martArtifact }),
+        artifactStore: dependencies.artifactStore,
+        checkpointStore: dependencies.checkpointStore,
+        clock: dependencies.clock,
+        signal: dependencies.signal,
+        ...(dependencies.beforePhase === undefined
+          ? {}
+          : { beforePhase: (phase) => dependencies.beforePhase?.(phase, null) }),
       });
-      await coordinator.updateRun({ martArtifact, completedPhase: 'build_marts' });
+      reconcileArtifact = result.reconcileArtifact;
+      featureArtifact = result.featureArtifact;
+      martArtifact = result.martArtifact;
+      boundedCountyCompletionClaim = result.countyCompletionClaim;
+      await coordinator.updateRun({
+        reconcileArtifact,
+        featureArtifact,
+        martArtifact,
+        completedPhase: 'build_marts',
+      });
+    } else {
+      const allMutations = await combineChunkSequences(
+        sourceResults.map(({ mutations }) => mutations),
+      );
+      let reconciled: ReconciliationOutput;
+      if (reconcileArtifact === null) {
+        const phase = await timedPhase(
+          'reconcile',
+          null,
+          dependencies,
+          configuration.maximumPhaseAttempts,
+          () => dependencies.processors.reconcile(allMutations, dependencies.signal),
+        );
+        reconcileArtifact = await writeJsonArtifact({
+          store: dependencies.artifactStore,
+          runId: configuration.runId,
+          owner: 'pipeline',
+          phase: 'reconcile',
+          value: phase.value,
+        });
+        await coordinator.updateRun({ reconcileArtifact, completedPhase: 'reconcile' });
+        reconciled = phase.value;
+      } else reconciled = await loadRequired(dependencies, reconcileArtifact, 'reconciliation');
+
+      let features: unknown;
+      if (featureArtifact === null) {
+        const phase = await timedPhase(
+          'derive_features',
+          null,
+          dependencies,
+          configuration.maximumPhaseAttempts,
+          () => dependencies.processors.deriveFeatures(reconciled, dependencies.signal),
+        );
+        featureArtifact = await writeJsonArtifact({
+          store: dependencies.artifactStore,
+          runId: configuration.runId,
+          owner: 'pipeline',
+          phase: 'derive_features',
+          value: phase.value,
+        });
+        await coordinator.updateRun({ featureArtifact, completedPhase: 'derive_features' });
+        features = phase.value;
+      } else features = await loadRequired(dependencies, featureArtifact, 'features');
+
+      if (martArtifact === null) {
+        const phase = await timedPhase(
+          'build_marts',
+          null,
+          dependencies,
+          configuration.maximumPhaseAttempts,
+          () =>
+            dependencies.processors.buildMarts(
+              {
+                reconciled,
+                features,
+                run: Object.freeze({
+                  runId: configuration.runId,
+                  pipelineVersion: configuration.pipelineVersion,
+                  profile: configuration.profile.name,
+                  requestedAt: configuration.requestedAt,
+                  completedAt: dependencies.clock.now(),
+                }),
+                sources: processorSourceManifests,
+              },
+              dependencies.signal,
+            ),
+        );
+        martArtifact = await writeJsonArtifact({
+          store: dependencies.artifactStore,
+          runId: configuration.runId,
+          owner: 'pipeline',
+          phase: 'build_marts',
+          value: phase.value,
+        });
+        await coordinator.updateRun({ martArtifact, completedPhase: 'build_marts' });
+      }
     }
   }
 
@@ -1762,7 +1815,16 @@ export async function runPipeline(
   const globalArtifacts = [reconcileArtifact, featureArtifact, martArtifact].filter(
     (artifact): artifact is PhaseArtifact => artifact !== null,
   );
-  const completion = countyCompletion(configuration.profile, sourceManifests);
+  const sourceCompletion = countyCompletion(configuration.profile, sourceManifests);
+  const completion =
+    boundedCountyCompletionClaim === false && sourceCompletion.state === 'complete'
+      ? Object.freeze({
+          ...sourceCompletion,
+          state: 'partial' as const,
+          claim:
+            'County completion is not claimed because bounded downstream semantic readiness or release gates remain incomplete.',
+        })
+      : sourceCompletion;
   const manifest: PipelineRunManifest = Object.freeze({
     schemaVersion: '2.0.0',
     runId: configuration.runId,
@@ -1808,7 +1870,7 @@ export class UnboundedCountyPhaseError extends Error {
 
   public constructor(public readonly phase: 'reconcile' | 'derive_features' | 'build_marts') {
     super(
-      `Full profile stopped before ${phase}: configured processor is not bounded_streaming_v2 and no county-completion claim was written.`,
+      `County profile stopped before ${phase}: configured processor is not a complete bounded_streaming_v2 implementation and no county-completion claim was written.`,
     );
     this.name = 'UnboundedCountyPhaseError';
   }
@@ -1818,7 +1880,10 @@ export function assertCountyProcessorProfile(
   profile: PipelineConfiguration['profile']['name'],
   memoryProfile: OrchestrationDependencies['processors']['memoryProfile'],
 ): void {
-  if (profile === 'full' && memoryProfile !== 'bounded_streaming_v2') {
+  if (
+    (profile === 'full' || profile === 'incremental') &&
+    memoryProfile !== 'bounded_streaming_v2'
+  ) {
     throw new UnboundedCountyPhaseError('reconcile');
   }
 }
