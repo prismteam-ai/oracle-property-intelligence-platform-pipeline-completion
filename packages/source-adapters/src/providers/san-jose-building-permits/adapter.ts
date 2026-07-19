@@ -82,7 +82,7 @@ import type {
 } from './types.js';
 
 const CONTRACT_VERSION = '2.0.0';
-const TRANSFORM_VERSION = '1.0.0';
+const TRANSFORM_VERSION = '1.1.0';
 const MAX_METADATA_BYTES = 2 * 1024 * 1024;
 const CSV_STREAM_CHUNK_BYTES = 64 * 1024;
 const DEFAULT_MAXIMUM_RESPONSE_BYTES = 256 * 1024 * 1024;
@@ -915,34 +915,59 @@ function createMutations(
   );
 
   const observations = [
-    ['feed_identity', record.feed, 'public' as const],
-    ['feed_status', record.raw.Status, 'public' as const],
-    ['source_row_id', record.sourceRowId, 'public' as const],
-    ['source_apn', record.sourceApn, 'public' as const],
-    ['normalized_apn', record.normalizedApn, 'public' as const],
-    ['source_location', record.raw.gx_location, 'public' as const],
-    ['folder_description', record.raw.FOLDERDESC, 'public' as const],
-    ['folder_name', record.raw.FOLDERNAME, 'public' as const],
-    ['subtype_description', record.raw.SUBTYPEDESCRIPTION, 'public' as const],
-    ['work_description', record.raw.WORKDESCRIPTION, 'public' as const],
-    ['permit_approvals', record.raw.PERMITAPPROVALS, 'public' as const],
-    ['issued_at', record.issuedAt, 'public' as const],
-    ['finaled_at', record.finaledAt, 'public' as const],
-    ['valuation', record.valuation, 'public' as const],
-    ['applicant_text', record.applicant, textVisibility(record.applicant)],
-    ['owner_text', record.owner, textVisibility(record.owner)],
-    ['contractor_text', record.contractor, textVisibility(record.contractor)],
+    ['/permitNumber', 'permit-number', entity.permitNumber, 'public' as const],
+    ['/jurisdiction', 'jurisdiction', entity.jurisdiction, 'public' as const],
+    ['/permitType', 'permit-type', entity.permitType, 'public' as const],
+    ['/status', 'status', entity.status, 'public' as const],
+    ['/statusAsOf', 'status-as-of', entity.statusAsOf, 'public' as const],
+    ['/description', 'description', entity.description, 'public' as const],
+    ['/issuedAt', 'issued-at', entity.issuedAt, 'public' as const],
+    ['/completedAt', 'completed-at', entity.completedAt, 'public' as const],
+    ['/propertyLinks', 'property-links', entity.propertyLinks, 'public' as const],
+    ['/contractorIds', 'contractor-ids', entity.contractorIds, 'public' as const],
+    ['/source/feed_identity', 'feed_identity', record.feed, 'public' as const],
+    ['/source/feed_status', 'feed_status', record.raw.Status, 'public' as const],
+    ['/source/source_row_id', 'source_row_id', record.sourceRowId, 'public' as const],
+    ['/source/source_apn', 'source_apn', record.sourceApn, 'public' as const],
+    ['/source/normalized_apn', 'normalized_apn', record.normalizedApn, 'public' as const],
+    ['/source/source_location', 'source_location', record.raw.gx_location, 'public' as const],
+    ['/source/folder_description', 'folder_description', record.raw.FOLDERDESC, 'public' as const],
+    ['/source/folder_name', 'folder_name', record.raw.FOLDERNAME, 'public' as const],
+    [
+      '/source/subtype_description',
+      'subtype_description',
+      record.raw.SUBTYPEDESCRIPTION,
+      'public' as const,
+    ],
+    ['/source/work_description', 'work_description', record.raw.WORKDESCRIPTION, 'public' as const],
+    ['/source/permit_approvals', 'permit_approvals', record.raw.PERMITAPPROVALS, 'public' as const],
+    ['/source/issued_at', 'issued_at', record.issuedAt, 'public' as const],
+    ['/source/finaled_at', 'finaled_at', record.finaledAt, 'public' as const],
+    ['/source/valuation', 'valuation', record.valuation, 'public' as const],
+    [
+      '/source/applicant_text',
+      'applicant_text',
+      record.applicant,
+      textVisibility(record.applicant),
+    ],
+    ['/source/owner_text', 'owner_text', record.owner, textVisibility(record.owner)],
+    [
+      '/source/contractor_text',
+      'contractor_text',
+      record.contractor,
+      textVisibility(record.contractor),
+    ],
   ] as const;
-  for (const [index, [fieldName, value, visibility]] of observations.entries()) {
-    const fieldLineage = lineage(record, fieldName, value, options.normalizationTimestamp);
+  for (const [index, [fieldPath, lineageName, value, visibility]] of observations.entries()) {
+    const fieldLineage = lineage(record, lineageName, value, options.normalizationTimestamp);
     const observationId = observationIdSchema.parse(
-      `sc:observation:${hashParts(permitId, fieldName, fieldLineage.lineageSha256)}`,
+      `sc:observation:${hashParts(permitId, fieldPath, fieldLineage.lineageSha256)}`,
     );
     const observation = {
       observationId,
       entityId: permitId,
       entityKind: 'permit' as const,
-      fieldPath: `/source/${fieldName}`,
+      fieldPath,
       value,
       observedAt: options.normalizationTimestamp,
       sourceAsOf: sourceAsOfInstant(record),
@@ -955,7 +980,7 @@ function createMutations(
       canonicalMutationSchema.parse({
         kind: 'field_observation',
         mutationId: mutationIdSchema.parse(
-          `sc:mutation:${hashParts(record.recordKey, fieldName, canonicalJson(observation))}`,
+          `sc:mutation:${hashParts(record.recordKey, fieldPath, canonicalJson(observation))}`,
         ),
         runId: options.runId,
         sourceId: SAN_JOSE_BUILDING_PERMIT_SOURCE_ID,

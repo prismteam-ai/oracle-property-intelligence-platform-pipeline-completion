@@ -864,6 +864,29 @@ describe('San Jose building permit source family', () => {
     expect(inspectionEntity.entity.status).toBe('UnderInspection');
     expect(activeEntity.entity.completedAt).toBeNull();
     expect(inspectionEntity.entity.completedAt).toBeNull();
+    const immutableDomainPaths = [
+      '/permitNumber',
+      '/jurisdiction',
+      '/permitType',
+      '/status',
+      '/statusAsOf',
+      '/description',
+      '/issuedAt',
+      '/completedAt',
+      '/propertyLinks',
+      '/contractorIds',
+    ];
+    for (const fieldPath of immutableDomainPaths) {
+      expect(
+        active.filter(
+          (mutation) =>
+            mutation.kind === 'field_observation' &&
+            mutation.observation.entityId === activeEntity.entity.id &&
+            mutation.observation.fieldPath === fieldPath,
+        ),
+        `${fieldPath} must have one immutable observation`,
+      ).toHaveLength(1);
+    }
     expect(
       active.find(
         (mutation) =>
@@ -1008,7 +1031,7 @@ describe('San Jose building permit source family', () => {
     const first = await mutationsFor(validated, selectedAdapter);
     const second = await mutationsFor(validated, selectedAdapter);
     expect(first).toEqual(second);
-    expect(first).toHaveLength(18);
+    expect(first).toHaveLength(28);
     expect(
       first.every((mutation) =>
         mutation.kind === 'entity_upsert'
