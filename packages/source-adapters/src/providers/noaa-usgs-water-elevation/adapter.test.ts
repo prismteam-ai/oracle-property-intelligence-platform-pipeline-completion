@@ -35,7 +35,7 @@ import {
   createUsgs3dhpHydrographyAdapter,
   type WaterElevationDecodedRecord,
 } from './adapter.js';
-import { NOAA_CUSP_SHORELINE } from './catalog.js';
+import { NOAA_CUSP_SHORELINE, USGS_3DEP_ELEVATION } from './catalog.js';
 import { decodeNoaaShorelineArchiveStream } from './formats.js';
 
 const NOW = '2026-07-17T13:00:00.000Z';
@@ -495,6 +495,19 @@ describe('NOAA/USGS water and elevation adapter lifecycle', () => {
     expect(mutation.entity.lineage[0]?.sourceRecord.artifactId).toBe(
       firstArtifact.metadata.artifactId,
     );
+    const hydroObservations = mutations.filter(
+      (candidate) => candidate.kind === 'field_observation',
+    );
+    expect(hydroObservations.map(({ observation }) => observation.fieldPath)).toEqual([
+      '/name',
+      '/featureType',
+      '/geometry',
+    ]);
+    expect(
+      hydroObservations.every(({ observation }) =>
+        observation.lineage.transformations.every(({ version }) => version === '1.1.0'),
+      ),
+    ).toBe(true);
 
     const issues: ValidationIssue[] = validation.issues.slice();
     const observation = {
@@ -519,7 +532,7 @@ describe('NOAA/USGS water and elevation adapter lifecycle', () => {
       artifactsAcquired: 2,
       decodedRecords: 2,
       acceptedRecords: 2,
-      normalizedMutations: 1,
+      normalizedMutations: 4,
       warningCount: 1,
       errorCount: 0,
     });
@@ -782,6 +795,66 @@ describe('NOAA/USGS water and elevation adapter lifecycle', () => {
         }
       })(),
     ).rejects.toThrow(/bytes drifted/u);
+  });
+
+  it('emits immutable observations for every elevation domain field', async () => {
+    const adapter = createUsgs3depElevationAdapter({ bounds: [-122, 37.4, -121.9, 37.5] });
+    const record = Object.freeze({
+      productKind: 'elevation' as const,
+      productVersion: USGS_3DEP_ELEVATION.productVersion,
+      sourceId: USGS_3DEP_ELEVATION.descriptor.sourceId,
+      snapshotId: snapshotIdSchema.parse(`sc:snapshot:usgs-3dep-elevation:${'e'.repeat(64)}`),
+      retrievedAt: NOW,
+      sourceAsOfAt: USGS_3DEP_ELEVATION.serviceAsOf,
+      recordKey: 'image-0-tile-0-0',
+      artifactId: `sc:artifact:sha256:${'d'.repeat(64)}`,
+      artifactSha256: 'd'.repeat(64),
+      attribution: USGS_3DEP_ELEVATION.attribution,
+      limitations: USGS_3DEP_ELEVATION.limitations,
+      ordinal: 0,
+      visibility: 'public' as const,
+      format: 'geotiff' as const,
+      imageIndex: 0,
+      tile: Object.freeze({ x: 0, y: 0, width: 1, height: 1 }),
+      bands: Object.freeze([1]),
+      samples: Object.freeze([10]),
+      noDataValue: null,
+      bounds: Object.freeze([-122, 37.4, -121.9, 37.5]),
+      resolutionDegrees: Object.freeze([0.00001, 0.00001]),
+      horizontalCrs: USGS_3DEP_ELEVATION.horizontalCrs,
+      horizontalUnits: USGS_3DEP_ELEVATION.horizontalUnits,
+      verticalCrs: USGS_3DEP_ELEVATION.verticalCrs ?? 'unknown',
+      verticalUnits: USGS_3DEP_ELEVATION.verticalUnits ?? 'unknown',
+    }) as WaterElevationDecodedRecord;
+    const validation = await adapter.validate(record, {
+      clock,
+      signal: new AbortController().signal,
+    });
+    expect(validation.status).toBe('accepted');
+    if (validation.status !== 'accepted') throw new Error('Expected accepted elevation record');
+
+    const mutations = [];
+    for await (const mutation of adapter.normalize(validation.record, {
+      clock,
+      signal: new AbortController().signal,
+      analyticalRuntime,
+      recordBudget: createSharedRecordBudget(1),
+    })) {
+      mutations.push(mutation);
+    }
+    expect(
+      mutations
+        .filter((mutation) => mutation.kind === 'field_observation')
+        .map(({ observation }) => observation.fieldPath),
+    ).toEqual([
+      '/artifactId',
+      '/bounds',
+      '/horizontalResolutionMeters',
+      '/verticalDatum',
+      '/sourceAsOf',
+    ]);
+    expect(new Set(mutations.map(({ sequence }) => sequence)).size).toBe(6);
+    expect(new Set(mutations.map(({ mutationId }) => mutationId)).size).toBe(6);
   });
 
   it('aborts before transport and refuses a verified-view claim', async () => {

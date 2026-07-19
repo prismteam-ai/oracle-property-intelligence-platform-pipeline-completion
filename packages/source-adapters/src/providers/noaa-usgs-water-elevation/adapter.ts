@@ -74,6 +74,9 @@ export const WATER_VIEW_LIMITATIONS = Object.freeze([
   'Windows, observer height, orientation, and on-site obstructions are not represented.',
 ]);
 
+const WATER_ELEVATION_TRANSFORM_VERSION = '1.1.0';
+const WATER_ELEVATION_MUTATIONS_PER_RECORD = 8;
+
 export type WaterViewClaim = 'candidate' | 'verified_view';
 
 export function assertWaterViewClaim(claim: WaterViewClaim): void {
@@ -972,7 +975,7 @@ class WaterElevationAdapter implements StreamingSourceAdapter<
       record.format === 'geotiff'
         ? `sc:entity:elevation-raster-ref:${entityKey}`
         : `sc:entity:hydro-feature:${entityKey}`;
-    const outputSha256 = hash(`${entityId}|${recordSha256}|1.0.0`);
+    const outputSha256 = hash(`${entityId}|${recordSha256}|${WATER_ELEVATION_TRANSFORM_VERSION}`);
     const lineageCore = {
       sourceRecord: {
         sourceId: record.sourceId,
@@ -985,7 +988,7 @@ class WaterElevationAdapter implements StreamingSourceAdapter<
       transformations: [
         {
           name: `normalize-${record.productKind}`,
-          version: '1.0.0',
+          version: WATER_ELEVATION_TRANSFORM_VERSION,
           appliedAt: record.retrievedAt,
           inputSha256: recordSha256,
           outputSha256,
@@ -1006,11 +1009,9 @@ class WaterElevationAdapter implements StreamingSourceAdapter<
       sourceIds: [record.sourceId],
       lineage: [lineage],
     };
-    const entity =
+    const domainValues =
       record.format === 'geotiff'
         ? {
-            ...metadata,
-            entityKind: 'elevation-raster-ref',
             artifactId: record.artifactId,
             bounds: record.bounds,
             horizontalResolutionMeters: degreesToApproximateMeters(
@@ -1022,8 +1023,6 @@ class WaterElevationAdapter implements StreamingSourceAdapter<
             sourceAsOf: record.sourceAsOfAt,
           }
         : {
-            ...metadata,
-            entityKind: 'hydro-feature',
             name:
               typeof record.properties.gnisidlabel === 'string' &&
               record.properties.gnisidlabel.length > 0
@@ -1032,18 +1031,72 @@ class WaterElevationAdapter implements StreamingSourceAdapter<
             featureType: featureType(record),
             geometry: record.geometry,
           };
-    const runHash = hash(`${record.sourceId}|${record.snapshotId}|normalize-water-elevation`);
+    const entity = {
+      ...metadata,
+      entityKind: record.format === 'geotiff' ? 'elevation-raster-ref' : 'hydro-feature',
+      ...domainValues,
+    };
+    const runHash = hash(
+      `${record.sourceId}|${record.snapshotId}|normalize-water-elevation|${WATER_ELEVATION_TRANSFORM_VERSION}`,
+    );
+    const baseSequence = record.ordinal * WATER_ELEVATION_MUTATIONS_PER_RECORD;
     yield canonicalMutationSchema.parse({
       kind: 'entity_upsert',
-      mutationId: `sc:mutation:${hash(`${runHash}|${record.ordinal}|${entityId}`)}`,
+      mutationId: `sc:mutation:${hash(`${runHash}|${record.ordinal}|${entityId}|entity`)}`,
       runId: `sc:run:${runHash}`,
       sourceId: record.sourceId,
       snapshotId: record.snapshotId,
-      sequence: record.ordinal,
+      sequence: baseSequence,
       emittedAt: record.retrievedAt,
       visibility: record.visibility,
       entity,
     });
+    const fields = Object.entries(domainValues) as readonly (readonly [string, unknown])[];
+    for (const [index, [field, value]] of fields.entries()) {
+      context.signal.throwIfAborted();
+      const fieldPath = `/${field}`;
+      const fieldOutputSha256 = hash(stableJson(value));
+      const fieldLineageCore = {
+        sourceRecord: lineageCore.sourceRecord,
+        transformations: [
+          {
+            name: `normalize-${record.productKind}-field`,
+            version: WATER_ELEVATION_TRANSFORM_VERSION,
+            appliedAt: record.retrievedAt,
+            inputSha256: recordSha256,
+            outputSha256: fieldOutputSha256,
+          },
+        ],
+      };
+      yield canonicalMutationSchema.parse({
+        kind: 'field_observation',
+        mutationId: `sc:mutation:${hash(`${runHash}|${record.ordinal}|${entityId}|${fieldPath}`)}`,
+        runId: `sc:run:${runHash}`,
+        sourceId: record.sourceId,
+        snapshotId: record.snapshotId,
+        sequence: baseSequence + index + 1,
+        emittedAt: record.retrievedAt,
+        visibility: record.visibility,
+        observation: {
+          observationId: `sc:observation:${hash(
+            `${record.snapshotId}|${record.artifactId}|${record.recordKey}|${fieldPath}|${WATER_ELEVATION_TRANSFORM_VERSION}`,
+          )}`,
+          entityId,
+          entityKind: entity.entityKind,
+          fieldPath,
+          value,
+          observedAt: record.sourceAsOfAt,
+          sourceAsOf: record.sourceAsOfAt,
+          authorityRank: this.#product.descriptor.authority.authorityRank,
+          confidence: 1,
+          visibility: record.visibility,
+          lineage: {
+            ...fieldLineageCore,
+            lineageSha256: hash(stableJson(fieldLineageCore)),
+          },
+        },
+      });
+    }
   }
 
   public async summarize(
