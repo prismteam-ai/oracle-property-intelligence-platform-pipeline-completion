@@ -1677,7 +1677,7 @@ async function materializeAllMutationPartitions(
     } else {
       artifact = JSON.parse(prior) as ImmutableBoundedArtifact;
       const file = await hashFile(
-        artifactPath(artifact),
+        artifactPath(request.artifactStore, artifact),
         sharedBudget,
         processing.budget.maxBufferedBytes,
       );
@@ -1773,7 +1773,10 @@ async function reduceCanonical(
         maximumMutationBytes,
         maximumAggregateBytes: Math.max(1, Math.floor(processing.budget.maxBufferedBytes / 2)),
       }),
-      mutations: readReservedNdjsonFile(artifactPath(artifact), maximumMutationBytes),
+      mutations: readReservedNdjsonFile(
+        artifactPath(request.artifactStore, artifact),
+        maximumMutationBytes,
+      ),
       transaction,
       sharedBudget,
     });
@@ -2629,7 +2632,7 @@ async function deriveFeatures(
         : (JSON.parse(checkpointText) as BoundedFeatureDurableCheckpoint);
     if (resume !== undefined) {
       const file = await hashFile(
-        artifactPath(resume.lastArtifact),
+        artifactPath(request.artifactStore, resume.lastArtifact),
         sharedBudget,
         processing.budget.maxBufferedBytes,
       );
@@ -3760,7 +3763,7 @@ async function buildMarts(
       'key',
     )) {
       for await (const value of readNdjsonFile(
-        artifactPath(artifact),
+        artifactPath(request.artifactStore, artifact),
         processing.budget.maxBufferedBytes,
         sharedBudget,
       )) {
@@ -5889,7 +5892,7 @@ async function createRootedStageManifest(
     throw new BoundedPipelineIntegrityError(`Stage ${stage} has no artifacts`);
   const first = JSON.parse(firstText) as ImmutableBoundedArtifact;
   const inventoryDirectory = confinedChild(
-    dirname(artifactPath(first)),
+    dirname(artifactPath(request.artifactStore, first)),
     `inventory-${stage}-${partitionId === undefined ? 'complete' : partitionId.toString().padStart(8, '0')}`,
   );
   await mkdir(inventoryDirectory, { recursive: true });
@@ -6919,10 +6922,29 @@ function portableRelative(root: string, child: string): string {
   return value;
 }
 
-function artifactPath(artifact: ImmutableBoundedArtifact): string {
-  const parsed = new URL(artifact.uri);
+function artifactPath(
+  artifactStore: BoundedCountyProcessingRequest['artifactStore'],
+  artifact: ImmutableBoundedArtifact,
+): string {
+  let uri = artifact.uri;
+  const portable = new URL(uri);
+  if (portable.protocol === 'file:' && portable.hostname === 'oracle-artifact') {
+    const physicalUri = (artifactStore as { physicalUri?: unknown }).physicalUri;
+    if (typeof physicalUri !== 'function') {
+      throw new BoundedPipelineIntegrityError(
+        'Portable local artifact store cannot resolve a physical artifact URI',
+      );
+    }
+    uri = (physicalUri as (value: string) => string).call(artifactStore, uri);
+  }
+  const parsed = new URL(uri);
   if (parsed.protocol !== 'file:')
     throw new BoundedPipelineIntegrityError(`Expected file artifact: ${artifact.uri}`);
+  if (parsed.hostname === 'oracle-artifact') {
+    throw new BoundedPipelineIntegrityError(
+      'Portable artifact URI did not resolve to physical storage',
+    );
+  }
   return fileURLToPath(parsed);
 }
 

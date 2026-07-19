@@ -710,7 +710,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
 
     const firstCompletedStage = checkpoint?.completedStages[0];
     if (firstCompletedStage === undefined) throw new Error('completed stage is missing');
-    const persistedStage = await artifactStore.headByLogicalKey(
+    const persistedStage = await localArtifactStore.headByLogicalKey(
       `bsm/${firstCompletedStage.outputManifestSha256}.json`,
     );
     if (persistedStage === undefined) throw new Error('persisted stage object is missing');
@@ -1082,6 +1082,7 @@ function createOpaqueMartArtifactStore(delegate: LocalArtifactStore): Readonly<{
     string,
     Readonly<{ logicalKey: string; uri: string; byteSize: number; sha256: string }>
   >();
+  const physicalUris = new Map<string, string>();
   const readUris: string[] = [];
   const isMartKey = (logicalKey: string): boolean => logicalKey.startsWith('bm/');
   const opaqueUri = (logicalKey: string): string =>
@@ -1101,17 +1102,19 @@ function createOpaqueMartArtifactStore(delegate: LocalArtifactStore): Readonly<{
   >(
     stored: T,
   ): T => {
-    if (!isMartKey(stored.logicalKey)) return stored;
     const restored = Object.freeze({ ...stored, uri: opaqueUri(stored.logicalKey) }) as T;
-    descriptors.set(
-      stored.logicalKey,
-      Object.freeze({
-        logicalKey: restored.logicalKey,
-        uri: restored.uri,
-        byteSize: restored.byteSize,
-        sha256: restored.sha256,
-      }),
-    );
+    physicalUris.set(restored.uri, stored.uri);
+    if (isMartKey(stored.logicalKey)) {
+      descriptors.set(
+        stored.logicalKey,
+        Object.freeze({
+          logicalKey: restored.logicalKey,
+          uri: restored.uri,
+          byteSize: restored.byteSize,
+          sha256: restored.sha256,
+        }),
+      );
+    }
     return restored;
   };
   const physicalUri = async (uri: string): Promise<string> => {
@@ -1140,6 +1143,7 @@ function createOpaqueMartArtifactStore(delegate: LocalArtifactStore): Readonly<{
         if (logicalKeyFromOpaqueUri(uri) !== null) readUris.push(uri);
         yield* delegate.read(await physicalUri(uri), range);
       })(),
+    physicalUri: (uri: string): string => physicalUris.get(uri) ?? uri,
   });
   return Object.freeze({
     store,
