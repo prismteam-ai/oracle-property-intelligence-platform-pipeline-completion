@@ -1068,8 +1068,10 @@ describe('executable pipeline commands', () => {
       activeRecordsAtCompletion: 0,
       bufferedEventsAtCompletion: 0,
       // Includes permits used to materialize the truthful mutation/validation physical projections,
-      // not only the canonical normalization-event stream.
-      totalBudgetAcquisitions: 116,
+      // not only the canonical normalization-event stream. Re-baselined 116 -> 136 after
+      // 8d1d64e switched reducer row ingestion to readNdjsonFile, which charges exact
+      // pending/parsed row bytes as additional (deterministic) shared-budget acquisitions.
+      totalBudgetAcquisitions: 136,
     });
   });
 
