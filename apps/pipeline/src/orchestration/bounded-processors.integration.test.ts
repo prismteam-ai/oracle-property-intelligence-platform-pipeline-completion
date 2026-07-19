@@ -101,7 +101,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     const scratchDirectory = join(root, 'scratch');
     const partitionCount = 16;
     expect(longScratchDirectory.length).toBeGreaterThanOrEqual(129);
-    const mutations = normalizePropertyRecord(
+    const normalizedMutations = normalizePropertyRecord(
       {
         apn: '123-45-678',
         jurisdiction: 'Santa Clara',
@@ -117,6 +117,24 @@ describe('bounded_streaming_v2 pipeline composition', () => {
         runId: RUN_ID,
       }),
     );
+    const mutations = Object.freeze(
+      normalizedMutations.map((mutation) =>
+        mutation.kind === 'field_observation' && mutation.observation.fieldPath === '/jurisdiction'
+          ? canonicalMutationSchema.parse({
+              ...mutation,
+              observation: {
+                ...mutation.observation,
+                // Regression: the county reducer must accept a valid canonical NDJSON row above
+                // the former maxBufferedBytes/64 composition cap while remaining budget-accounted.
+                value: 'x'.repeat(48 * 1024),
+              },
+            })
+          : mutation,
+      ),
+    );
+    expect(
+      Math.max(...mutations.map((mutation) => Buffer.byteLength(canonicalJson(mutation)))),
+    ).toBeGreaterThan(16 * 1024);
     const sequence = chunkSequence(mutations);
     const failedMutations = normalizePropertyRecord(
       {

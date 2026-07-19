@@ -1977,9 +1977,13 @@ async function reduceCanonical(
       partitionId,
     );
     await transaction.begin();
+    // County source records can legitimately produce canonical mutations larger than 64 KiB
+    // (for example, bounded geometry/proxy values). Keep one validation lease small relative to
+    // the process-wide budget while allowing those already-bounded rows through. The NDJSON
+    // reader additionally accounts for its exact pending/parsed row bytes.
     const maximumMutationBytes = Math.max(
       1,
-      Math.min(64 * 1024, Math.floor(processing.budget.maxBufferedBytes / 64)),
+      Math.min(1024 * 1024, Math.floor(processing.budget.maxBufferedBytes / 16)),
     );
     const summary = await reduceBoundedCanonicalPartition({
       generationId: processing.generationId,
@@ -1991,9 +1995,10 @@ async function reduceCanonical(
         maximumMutationBytes,
         maximumAggregateBytes: Math.max(1, Math.floor(processing.budget.maxBufferedBytes / 2)),
       }),
-      mutations: readReservedNdjsonFile(
+      mutations: readNdjsonFile(
         artifactPath(request.artifactStore, artifact),
         maximumMutationBytes,
+        sharedBudget,
       ),
       transaction,
       sharedBudget,
