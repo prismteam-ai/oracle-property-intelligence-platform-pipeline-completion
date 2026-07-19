@@ -59,6 +59,7 @@ import {
 } from './chunks.js';
 import type {
   OrchestrationDependencies,
+  OrchestrationPhase,
   PipelineConfiguration,
   PipelineProcessors,
   PersistedSourceState,
@@ -698,6 +699,106 @@ describe('streaming runner restart and budget contracts', () => {
     });
     const resumed = await runPipeline(
       configuration('8'.repeat(64), [resumedSource]),
+      dependencies(store, resumedController),
+    );
+    expect(resumed.manifest).toEqual(first.manifest);
+  });
+
+  it('migrates and resumes a legacy discover-only skipped-normalization zero state', async () => {
+    const store = await stores('legacy-discover-only-zero-state');
+    const interruptedController = new AbortController();
+    const interruptedAdapter = new GeneratedAdapter(
+      'legacy-discover-only-zero-state',
+      interruptedController,
+      counters(),
+    );
+    const interruptedSource = Object.freeze({
+      ...source(interruptedAdapter),
+      executionMode: 'discover_only' as const,
+    });
+    const config = configuration('7'.repeat(64), [interruptedSource]);
+    const interruptedDependencies = Object.freeze({
+      ...dependencies(store, interruptedController),
+      beforePhase: (phase: OrchestrationPhase) => {
+        if (phase === 'reconcile') throw new Error('stop after discover-only source checkpoint');
+        return Promise.resolve();
+      },
+    });
+    await expect(runPipeline(config, interruptedDependencies)).rejects.toThrow(
+      'stop after discover-only source checkpoint',
+    );
+
+    const scope = `pipeline-run:${config.runId}`;
+    const current = await store.checkpoints.load(scope);
+    if (current === undefined) throw new Error('Expected discover-only run checkpoint');
+    const currentPayload = current.payload as unknown as Record<string, unknown>;
+    const currentSource = (currentPayload.sources as Record<string, unknown>[])[0];
+    if (currentSource === undefined) throw new Error('Expected discover-only source checkpoint');
+    const legacySource = { ...currentSource };
+    delete legacySource.normalizationLedger;
+    delete legacySource.mutationLedger;
+    delete legacySource.validationIssueLedger;
+    legacySource.normalizationChunks = [];
+    legacySource.mutationChunks = [];
+    legacySource.validationIssueChunks = [];
+    const legacy = createCheckpointEnvelope({
+      scope,
+      previousRevision: current.revision,
+      writtenAt: INSTANT,
+      payload: {
+        ...currentPayload,
+        sources: [legacySource],
+      } as CheckpointValue,
+    });
+    expect(
+      (await store.checkpoints.commit({ expectedRevision: current.revision, checkpoint: legacy }))
+        .status,
+    ).toBe('committed');
+
+    const resumedController = new AbortController();
+    const resumedAdapter = new GeneratedAdapter(
+      'legacy-discover-only-zero-state',
+      resumedController,
+      counters(),
+    );
+    const resumed = await runPipeline(
+      configuration('7'.repeat(64), [
+        Object.freeze({
+          ...source(resumedAdapter),
+          executionMode: 'discover_only' as const,
+        }),
+      ]),
+      dependencies(store, resumedController),
+    );
+    expect(resumed.manifest.sources[0]).toMatchObject({
+      terminalState: 'partial',
+      executionMode: 'discover_only',
+      summary: null,
+    });
+  });
+
+  it('resumes a current discovery-profile checkpoint with skipped normalization', async () => {
+    const store = await stores('discovery-profile-zero-state-resume');
+    const makeConfiguration = (controller: AbortController): PipelineConfiguration => {
+      const adapter = new GeneratedAdapter(
+        'discovery-profile-zero-state-resume',
+        controller,
+        counters(),
+      );
+      const base = configuration('6'.repeat(64), [source(adapter)]);
+      return Object.freeze({
+        ...base,
+        profile: Object.freeze({ ...base.profile, name: 'discovery' as const }),
+      });
+    };
+    const firstController = new AbortController();
+    const first = await runPipeline(
+      makeConfiguration(firstController),
+      dependencies(store, firstController),
+    );
+    const resumedController = new AbortController();
+    const resumed = await runPipeline(
+      makeConfiguration(resumedController),
       dependencies(store, resumedController),
     );
     expect(resumed.manifest).toEqual(first.manifest);

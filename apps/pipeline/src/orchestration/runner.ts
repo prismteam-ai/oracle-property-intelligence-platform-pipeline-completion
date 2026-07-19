@@ -405,6 +405,13 @@ function assertLegacyMigrationPreconditions(
     if (source.sourceId !== expected?.sourceId || source.snapshotId !== expected.snapshotId) {
       throw new Error('Legacy checkpoint source order or snapshot identity changed');
     }
+    const configuredSource = configuration.sources[index];
+    if (configuredSource === undefined) {
+      throw new Error('Legacy checkpoint source configuration is incomplete');
+    }
+    const normalizationSkipped =
+      configuration.profile.name === 'discovery' ||
+      configuredSource.executionMode === 'discover_only';
     for (const key of [
       'acquisitionRecords',
       'normalizationEventRecords',
@@ -421,15 +428,21 @@ function assertLegacyMigrationPreconditions(
     if (source.acceptedRecords + source.rejectedRecords !== source.decodedRecords) {
       throw new Error(`Legacy checkpoint record balance changed for ${source.sourceId}`);
     }
+    const missingNormalizationIdentity =
+      source.normalizationLogicalSha256 === null &&
+      source.mutationLogicalSha256 === null &&
+      source.validationIssueLogicalSha256 === null;
     if (
-      (source.normalizationLogicalSha256 === null) !== !phaseCompleted(source, 'normalize') ||
-      (source.mutationLogicalSha256 === null) !== !phaseCompleted(source, 'normalize') ||
-      (source.validationIssueLogicalSha256 === null) !== !phaseCompleted(source, 'normalize')
+      normalizationSkipped
+        ? !missingNormalizationIdentity
+        : (source.normalizationLogicalSha256 === null) !== !phaseCompleted(source, 'normalize') ||
+          (source.mutationLogicalSha256 === null) !== !phaseCompleted(source, 'normalize') ||
+          (source.validationIssueLogicalSha256 === null) !== !phaseCompleted(source, 'normalize')
     ) {
       throw new Error(`Legacy normalization identity state is inconsistent for ${source.sourceId}`);
     }
     if (
-      !phaseCompleted(source, 'normalize') &&
+      (normalizationSkipped || !phaseCompleted(source, 'normalize')) &&
       (source.normalizationEventRecords !== 0 ||
         source.mutationRecords !== 0 ||
         source.validationIssueRecords !== 0)
