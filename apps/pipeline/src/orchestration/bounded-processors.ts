@@ -569,11 +569,20 @@ function assertReleaseableSourceInventory(
   const unbound = sources
     .filter((source) => {
       const bound = trustedStates.get(source.sourceId);
+      const expectedTerminalState =
+        source.executionMode === 'discover_only' &&
+        source.terminalState === 'partial' &&
+        source.coverage.observedRecords === 0 &&
+        source.coverage.acceptedRecords === 0 &&
+        bound?.acquiredArtifacts.length === 0
+          ? 'blocked'
+          : source.terminalState === 'complete'
+            ? 'succeeded'
+            : source.terminalState;
       return (
         bound?.snapshotId !==
           (source.snapshotIdentity.observedContentId ?? source.snapshotIdentity.intentId) ||
-        bound.terminalState !==
-          (source.terminalState === 'complete' ? 'succeeded' : source.terminalState)
+        bound.terminalState !== expectedTerminalState
       );
     })
     .map(({ sourceId }) => sourceId)
@@ -1219,9 +1228,16 @@ async function materializeTrustedAcquisition(
       );
       const snapshotId =
         source.snapshotIdentity.observedContentId ?? source.snapshotIdentity.intentId;
+      const zeroByteDiscoverOnlyLane =
+        source.executionMode === 'discover_only' &&
+        source.terminalState === 'partial' &&
+        source.coverage.observedRecords === 0 &&
+        source.coverage.acceptedRecords === 0 &&
+        acquiredArtifacts.length === 0;
       if (
         ((source.terminalState === 'complete' || source.terminalState === 'partial') &&
-          acquiredArtifacts.length === 0) ||
+          acquiredArtifacts.length === 0 &&
+          !zeroByteDiscoverOnlyLane) ||
         acquiredArtifacts.some(
           (artifact) => artifact.sourceId !== source.sourceId || artifact.snapshotId !== snapshotId,
         )
@@ -1231,8 +1247,11 @@ async function materializeTrustedAcquisition(
         );
       }
       acquiredBySource.delete(source.sourceId);
-      const terminalState =
-        source.terminalState === 'complete' ? ('succeeded' as const) : source.terminalState;
+      const terminalState = zeroByteDiscoverOnlyLane
+        ? ('blocked' as const)
+        : source.terminalState === 'complete'
+          ? ('succeeded' as const)
+          : source.terminalState;
       const permissionState =
         source.license.redistribution === 'prohibited'
           ? ('prohibited' as const)
@@ -1290,12 +1309,29 @@ async function materializeTrustedAcquisition(
       `Trusted acquisition has undeclared sources: ${[...acquiredBySource.keys()].sort(compareUtf8).join(',')}`,
     );
   }
-  const trustedSourceMap = new Map(trustedSources.map((source) => [source.sourceId, source]));
+  const trustedSourceMap = new Map<string, (typeof trustedSources)[number]>(
+    trustedSources.map((source) => [source.sourceId, source]),
+  );
   const capabilities = capabilityStates(request.sources)
     .map((capability) => {
+      const terminalStates = new Set(
+        capability.sourceIds.map((sourceId) => trustedSourceMap.get(sourceId)?.terminalState),
+      );
+      const state =
+        capability.sourceIds.length === 0
+          ? ('not_configured' as const)
+          : terminalStates.size > 1
+            ? ('partial' as const)
+            : terminalStates.has('succeeded')
+              ? ('succeeded' as const)
+              : terminalStates.has('partial')
+                ? ('partial' as const)
+                : terminalStates.has('blocked')
+                  ? ('blocked' as const)
+                  : ('failed' as const);
       const value = {
         capability: capability.capability,
-        state: capability.state,
+        state,
         sourceIds: [...capability.sourceIds].sort(compareUtf8),
         limitations: [...exactSourceIds(capability.limitations)],
       };

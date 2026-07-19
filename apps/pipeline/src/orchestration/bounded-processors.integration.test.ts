@@ -58,6 +58,10 @@ const BLOCKED_SOURCE_ID = sourceIdSchema.parse('sc:source:test-blocked-source');
 const BLOCKED_SNAPSHOT_ID = snapshotIdSchema.parse(
   `sc:snapshot:test-blocked-source:${'4'.repeat(64)}`,
 );
+const DISCOVER_ONLY_SOURCE_ID = sourceIdSchema.parse('sc:source:test-discover-only-source');
+const DISCOVER_ONLY_SNAPSHOT_ID = snapshotIdSchema.parse(
+  `sc:snapshot:test-discover-only-source:${'6'.repeat(64)}`,
+);
 const FAILED_APN = '999-99-999';
 
 describe('bounded_streaming_v2 pipeline composition', () => {
@@ -152,6 +156,28 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       ]),
       errorCodes: Object.freeze(['FIXTURE_ACQUISITION_BLOCKED']),
     }) satisfies SourceExecutionManifest;
+    const discoverOnlySource = Object.freeze({
+      ...sourceManifestFor(
+        DISCOVER_ONLY_SOURCE_ID,
+        DISCOVER_ONLY_SNAPSHOT_ID,
+        'cslb_contractors',
+        0,
+      ),
+      executionMode: 'discover_only' as const,
+      requiredForCountyCompletion: false,
+      terminalState: 'partial' as const,
+      coverage: Object.freeze({
+        expectedRecords: 1,
+        observedRecords: 0,
+        acceptedRecords: 0,
+        quarantinedRecords: 0,
+        denominatorMethod: 'configured' as const,
+        ratio: 0,
+      }),
+      limitations: Object.freeze([
+        'Fixture lane was intentionally discovery-only and contributed no acquired bytes.',
+      ]),
+    }) satisfies SourceExecutionManifest;
     const trustedArtifact = await acquiredArtifact(artifactStore, SOURCE_ID, SNAPSHOT_ID);
     const configuration = {
       runId: RUN_ID,
@@ -217,13 +243,28 @@ describe('bounded_streaming_v2 pipeline composition', () => {
           artifacts: [trustedArtifact],
         },
       ],
-      sources: [source, blockedSource, failedSource],
+      sources: [source, blockedSource, failedSource, discoverOnlySource],
       existing: { reconcileArtifact: null, featureArtifact: null, martArtifact: null },
       artifactStore,
       checkpointStore,
       clock: { now: () => NOW },
       signal: new AbortController().signal,
     };
+    for (const terminalState of ['partial', 'complete'] as const) {
+      const unclosedExecuteSource = Object.freeze({
+        ...discoverOnlySource,
+        executionMode: 'execute' as const,
+        terminalState,
+      }) satisfies SourceExecutionManifest;
+      await expect(
+        createProcessor().processBoundedCounty?.({
+          ...request,
+          sources: request.sources.map((candidate) =>
+            candidate.sourceId === DISCOVER_ONLY_SOURCE_ID ? unclosedExecuteSource : candidate,
+          ),
+        }),
+      ).rejects.toThrow('Trusted acquisition artifacts do not close');
+    }
     const incrementalConfiguration = {
       ...configuration,
       profile: { ...configuration.profile, name: 'incremental' as const },
@@ -462,6 +503,14 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       ],
     });
     expect(
+      releaseEvidence.sourceStates.find(({ sourceId }) => sourceId === DISCOVER_ONLY_SOURCE_ID),
+    ).toMatchObject({
+      terminalState: 'blocked',
+      limitations: [
+        'Fixture lane was intentionally discovery-only and contributed no acquired bytes.',
+      ],
+    });
+    expect(
       releaseEvidence.capabilities.find(({ capability }) => capability === 'ownership_transfers'),
     ).toMatchObject({
       state: 'blocked',
@@ -474,6 +523,15 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       sourceIds: [FAILED_SOURCE_ID],
       limitations: [
         'Fixture source failed after normalization; its mutation lane must be omitted from release content.',
+      ],
+    });
+    expect(
+      releaseEvidence.capabilities.find(({ capability }) => capability === 'cslb_contractors'),
+    ).toMatchObject({
+      state: 'blocked',
+      sourceIds: [DISCOVER_ONLY_SOURCE_ID],
+      limitations: [
+        'Fixture lane was intentionally discovery-only and contributed no acquired bytes.',
       ],
     });
     expect(
@@ -495,6 +553,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     if (publicPipelineRun === undefined) throw new Error('public pipeline_runs is missing');
     expect(publicPipelineRun.sourceLineage.map(({ sourceId }) => sourceId)).toEqual([
       BLOCKED_SOURCE_ID,
+      DISCOVER_ONLY_SOURCE_ID,
       SOURCE_ID,
     ]);
     const pipelineRows = await readParquetRows(
@@ -504,6 +563,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     expect(pipelineRows[0]?.status).toBe('failed');
     expect(JSON.parse(String(pipelineRows[0]?.source_ids_json))).toEqual([
       BLOCKED_SOURCE_ID,
+      DISCOVER_ONLY_SOURCE_ID,
       SOURCE_ID,
     ]);
     const publicSourceCoverage = manifest.artifacts.find(
