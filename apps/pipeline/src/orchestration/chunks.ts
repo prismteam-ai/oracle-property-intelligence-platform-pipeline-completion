@@ -110,6 +110,8 @@ type Buffered = Readonly<{
   lease: RecordBudgetLease;
 }>;
 
+type RestoreState = 'available' | 'reading' | 'complete' | 'invalid';
+
 export class CanonicalChunkWriter<T> {
   readonly #store: RecoverableArtifactStore;
   readonly #logicalPrefix: string;
@@ -130,6 +132,8 @@ export class CanonicalChunkWriter<T> {
   readonly #buffer: Buffered[] = [];
   #bufferedBytes = 0;
   #recordCount = 0;
+  #restoreState: RestoreState = 'available';
+  #finished = false;
 
   public get bufferedRecordCount(): number {
     return this.#buffer.length;
@@ -200,22 +204,100 @@ export class CanonicalChunkWriter<T> {
   }
 
   public async restore(): Promise<void> {
+    for await (const value of this.restoreAndRead()) void value;
+  }
+
+  /**
+   * Verifies and restores the persisted prefix while exposing its typed values to one consumer.
+   * The writer becomes appendable only after the iterable is exhausted successfully. Returning
+   * early, aborting, or encountering corruption permanently invalidates this writer instance.
+   */
+  public restoreAndRead(): AsyncIterable<T> {
+    if (
+      this.#restoreState !== 'available' ||
+      this.#recordCount !== 0 ||
+      this.#buffer.length !== 0 ||
+      this.#finished
+    ) {
+      throw new Error('Chunk writer restore can only be consumed once before writing');
+    }
+    this.#restoreState = 'reading';
+    const source = this.#readRestoredValues();
+    const invalidateIncompleteRestore = () => {
+      if (this.#restoreState === 'reading') this.#restoreState = 'invalid';
+    };
+    const iterator: AsyncIterator<T> = {
+      next: () => source.next(),
+      return: async () => {
+        try {
+          return await source.return(undefined);
+        } finally {
+          invalidateIncompleteRestore();
+        }
+      },
+      throw: async (error?: unknown) => {
+        try {
+          return await source.throw(error);
+        } finally {
+          invalidateIncompleteRestore();
+        }
+      },
+    };
+    let claimed = false;
+    return Object.freeze({
+      [Symbol.asyncIterator](): AsyncIterator<T> {
+        if (claimed) throw new Error('Restored chunk prefix iterable can only be consumed once');
+        claimed = true;
+        return iterator;
+      },
+    });
+  }
+
+  async *#readRestoredValues(): AsyncGenerator<T, void, unknown> {
+    let completed = false;
+    const decoder = new TextDecoder('utf8', { fatal: true });
     const references =
       this.#ledger === undefined
-        ? arrayReferences(this.#chunks)
+        ? arrayReferences(this.#chunks, this.#logicalPrefix)
         : streamChunkLedgerReferences(this.#store, this.#ledger, this.#logicalPrefix);
-    for await (const reference of references) {
-      const stored = await this.#store.headByLogicalKey(reference.logicalKey);
-      assertChunkStored(reference, stored);
-      let count = 0;
-      for await (const line of readCanonicalLines(this.#store, reference)) {
-        this.#logicalHash.update(line);
-        count += 1;
+    try {
+      this.#signal.throwIfAborted();
+      for await (const reference of references) {
+        this.#signal.throwIfAborted();
+        const stored = await this.#store.headByLogicalKey(reference.logicalKey);
+        assertChunkStored(reference, stored);
+        const bodyHash = createHash('sha256');
+        let byteSize = 0;
+        let count = 0;
+        for await (const line of readCanonicalLines(this.#store, reference)) {
+          this.#signal.throwIfAborted();
+          bodyHash.update(line);
+          byteSize += line.byteLength;
+          this.#logicalHash.update(line);
+          count += 1;
+          let value: T;
+          try {
+            value = JSON.parse(decoder.decode(line)) as T;
+          } catch {
+            throw new ChunkIntegrityError(`Chunk contains invalid JSON: ${reference.logicalKey}`);
+          }
+          yield value;
+          this.#signal.throwIfAborted();
+        }
+        const bodySha256 = bodyHash.digest('hex');
+        if (
+          count !== reference.recordCount ||
+          byteSize !== reference.byteSize ||
+          bodySha256 !== reference.sha256
+        ) {
+          throw new ChunkIntegrityError(`Chunk body identity mismatch: ${reference.logicalKey}`);
+        }
+        this.#recordCount += count;
       }
-      if (count !== reference.recordCount) {
-        throw new ChunkIntegrityError(`Chunk record-count mismatch: ${reference.logicalKey}`);
-      }
-      this.#recordCount += count;
+      completed = true;
+      this.#restoreState = 'complete';
+    } finally {
+      if (!completed && this.#restoreState === 'reading') this.#restoreState = 'invalid';
     }
   }
 
@@ -224,6 +306,7 @@ export class CanonicalChunkWriter<T> {
     transferredLease?: RecordBudgetLease,
     onLeaseTransferred?: () => void,
   ): Promise<void> {
+    this.#assertWritable();
     this.#signal.throwIfAborted();
     const line = new TextEncoder().encode(`${canonicalJson(value)}\n`);
     if (line.byteLength > this.#maximumBytesPerRecord) {
@@ -251,6 +334,7 @@ export class CanonicalChunkWriter<T> {
   }
 
   public async flush(): Promise<void> {
+    this.#assertWritable();
     if (this.#buffer.length === 0) return;
     const buffered = [...this.#buffer];
     const firstOrdinal = this.#recordCount;
@@ -334,6 +418,7 @@ export class CanonicalChunkWriter<T> {
   }
 
   public async finish(): Promise<ChunkSequence<T>> {
+    this.#assertWritable();
     await this.flush();
     if (this.#ledger !== undefined) {
       const completed = await finishChunkLedger(this.#store, this.#ledger);
@@ -341,6 +426,7 @@ export class CanonicalChunkWriter<T> {
         await this.#onLedger?.(completed.ledger);
         this.#ledger = completed.ledger;
       }
+      this.#finished = true;
       const logicalSha256 = this.#logicalHash.digest('hex');
       const store = this.#store;
       const ledger = this.#ledger;
@@ -360,6 +446,7 @@ export class CanonicalChunkWriter<T> {
       });
     }
     const chunks = Object.freeze([...this.#chunks]);
+    this.#finished = true;
     const logicalSha256 = this.#logicalHash.digest('hex');
     const store = this.#store;
     return Object.freeze({
@@ -382,6 +469,18 @@ export class CanonicalChunkWriter<T> {
     this.#bufferedBytes = 0;
     this.#onBufferedRecordDelta?.(-buffered.length);
     for (const { lease } of buffered) lease.release();
+  }
+
+  #assertWritable(): void {
+    if (this.#finished) {
+      throw new Error('Chunk writer is already finished');
+    }
+    if (this.#restoreState === 'reading') {
+      throw new Error('Chunk writer restore must finish before writing');
+    }
+    if (this.#restoreState === 'invalid') {
+      throw new Error('Chunk writer cannot continue after an incomplete or failed restore');
+    }
   }
 }
 
@@ -926,8 +1025,11 @@ async function* readChunkSequence<T>(
   }
 }
 
-async function* arrayReferences(chunks: readonly ChunkReference[]): AsyncIterable<ChunkReference> {
-  validateChunkReferences(chunks);
+async function* arrayReferences(
+  chunks: readonly ChunkReference[],
+  expectedLogicalPrefix?: string,
+): AsyncIterable<ChunkReference> {
+  validateChunkReferences(chunks, expectedLogicalPrefix);
   for (const reference of chunks) yield await Promise.resolve(reference);
 }
 

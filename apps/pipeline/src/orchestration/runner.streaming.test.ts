@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { LocalArtifactStore } from '@oracle/artifacts/implementations/local-artifact-store';
 import { LocalCheckpointStore } from '@oracle/artifacts/implementations/local-checkpoint-store';
@@ -40,7 +41,8 @@ import {
 } from '@oracle/source-adapters/spi/record-budget';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { materializeNormalizationProjection, runPipeline } from './runner.js';
+import { canonicalJson } from './canonical-json.js';
+import { materializeNormalizationProjections, runPipeline } from './runner.js';
 import {
   emptyChunkLedger,
   openLedgerChunkSequence,
@@ -411,6 +413,137 @@ function testMutation(id: string): CanonicalMutation {
   return Object.freeze({ kind: 'generated_test_mutation', id }) as unknown as CanonicalMutation;
 }
 
+function testIssue(id: string): ValidationIssue {
+  return Object.freeze({
+    code: `generated_${id}`,
+    severity: 'warning',
+    message: `Generated issue ${id}`,
+    recordKey: id,
+    fieldPath: 'value',
+  });
+}
+
+type TestProjectionEvent =
+  | Readonly<{ kind: 'mutation'; value: CanonicalMutation }>
+  | Readonly<{ kind: 'validation_issue'; value: ValidationIssue }>;
+
+function projectionEvents(
+  events: readonly TestProjectionEvent[],
+  onRead: () => void = () => undefined,
+): Parameters<typeof materializeNormalizationProjections>[0]['events'] {
+  return Object.freeze({
+    schemaVersion: '2.0.0' as const,
+    recordCount: events.length,
+    logicalSha256: logicalSha256(events),
+    chunks: Object.freeze([]),
+    chunkInventory: null,
+    read: () => {
+      onRead();
+      return (async function* readEvents() {
+        for (const [index, event] of events.entries()) {
+          yield await Promise.resolve({
+            schemaVersion: '2.0.0' as const,
+            ...event,
+            cursor: {
+              artifactIndex: 0,
+              recordOrdinal: index,
+              issueOffset: event.kind === 'validation_issue' ? 1 : 0,
+              mutationOffset: event.kind === 'mutation' ? 1 : 0,
+              recordComplete: false,
+              decodedRecords: 0,
+              acceptedRecords: 0,
+              rejectedRecords: 0,
+            },
+          });
+        }
+      })();
+    },
+  });
+}
+
+function logicalSha256(values: readonly unknown[]): string {
+  const logical = createHash('sha256');
+  for (const value of values) logical.update(`${canonicalJson(value)}\n`);
+  return logical.digest('hex');
+}
+
+async function collect<T>(sequence: Readonly<{ read(): AsyncIterable<T> }>): Promise<readonly T[]> {
+  const values: T[] = [];
+  for await (const value of sequence.read()) values.push(value);
+  return Object.freeze(values);
+}
+
+function requiredFixture<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error('Missing projection test fixture value');
+  return value;
+}
+
+function projectionHarness(
+  store: Awaited<ReturnType<typeof stores>>['artifacts'],
+  label: string,
+  capacity: number,
+  maximumRecordsPerChunk = 3,
+) {
+  const mutationPrefix = `runs/${label}/normalize/mutations`;
+  const validationIssuePrefix = `runs/${label}/normalize/validation-issues`;
+  let mutationLedger = emptyChunkLedger(mutationPrefix);
+  let validationIssueLedger = emptyChunkLedger(validationIssuePrefix);
+  const budget = createSharedRecordBudget(capacity);
+  const signal = new AbortController().signal;
+
+  return {
+    budget,
+    mutationPrefix,
+    validationIssuePrefix,
+    get mutationLedger() {
+      return mutationLedger;
+    },
+    get validationIssueLedger() {
+      return validationIssueLedger;
+    },
+    run: (
+      events: Parameters<typeof materializeNormalizationProjections>[0]['events'],
+      options: Readonly<{
+        expectedMutations?: Readonly<{ recordCount: number; logicalSha256: string }>;
+        expectedValidationIssues?: Readonly<{ recordCount: number; logicalSha256: string }>;
+        onMutationLedger?: (ledger: ChunkLedger) => Promise<void>;
+        onValidationIssueLedger?: (ledger: ChunkLedger) => Promise<void>;
+      }> = {},
+    ) =>
+      materializeNormalizationProjections({
+        events,
+        store,
+        budget,
+        signal,
+        maximumRecordsPerChunk,
+        visibility: 'public',
+        licenseSnapshotRef: 'sc:license:projection:test',
+        mutation: {
+          logicalPrefix: mutationPrefix,
+          restoredLedger: mutationLedger,
+          onLedger: async (ledger) => {
+            await options.onMutationLedger?.(ledger);
+            mutationLedger = ledger;
+          },
+          ...(options.expectedMutations === undefined
+            ? {}
+            : { expected: options.expectedMutations }),
+        },
+        validationIssue: {
+          logicalPrefix: validationIssuePrefix,
+          restoredLedger: validationIssueLedger,
+          onLedger: async (ledger) => {
+            await options.onValidationIssueLedger?.(ledger);
+            validationIssueLedger = ledger;
+          },
+          ...(options.expectedValidationIssues === undefined
+            ? {}
+            : { expected: options.expectedValidationIssues }),
+        },
+      }),
+  };
+}
+
 function counters(): Counters {
   return {
     networkWrites: 0,
@@ -547,75 +680,362 @@ describe('streaming runner restart and budget contracts', () => {
     });
   });
 
-  it('releases projection leases after checkpoint failure and permits exact retry progress', async () => {
+  it('releases both projection leases after checkpoint failure and resumes exactly', async () => {
     const store = await stores('projection-checkpoint-failure');
-    const logicalPrefix = 'runs/projection-failure/normalize/mutations';
-    const restoredLedger = emptyChunkLedger(logicalPrefix);
-    const values = [testMutation('projection-0'), testMutation('projection-1')];
-    const events = Object.freeze({
-      schemaVersion: '2.0.0' as const,
-      recordCount: 2,
-      logicalSha256: '0'.repeat(64),
-      chunks: Object.freeze([]),
-      chunkInventory: null,
-      read: async function* () {
-        for (const [index, value] of values.entries()) {
-          yield await Promise.resolve({
-            schemaVersion: '2.0.0' as const,
-            kind: 'mutation' as const,
-            cursor: {
-              artifactIndex: 0,
-              recordOrdinal: 1,
-              issueOffset: 0,
-              mutationOffset: index + 1,
-              recordComplete: false,
-              decodedRecords: 0,
-              acceptedRecords: 0,
-              rejectedRecords: 0,
-            },
-            value,
-          });
-        }
-      },
-    });
-    const budget = createSharedRecordBudget(2);
+    const harness = projectionHarness(store.artifacts, 'projection-checkpoint-failure', 2, 2);
+    const mutations = [testMutation('projection-0'), testMutation('projection-1')];
+    const issues = [testIssue('projection-0'), testIssue('projection-1')];
+    const mixed = projectionEvents([
+      { kind: 'mutation', value: requiredFixture(mutations[0]) },
+      { kind: 'validation_issue', value: requiredFixture(issues[0]) },
+      { kind: 'mutation', value: requiredFixture(mutations[1]) },
+      { kind: 'validation_issue', value: requiredFixture(issues[1]) },
+    ]);
+    let failCheckpoint = true;
     await expect(
-      materializeNormalizationProjection({
-        events,
-        kind: 'mutation',
-        store: store.artifacts,
-        budget,
-        signal: new AbortController().signal,
-        maximumRecordsPerChunk: 2,
-        logicalPrefix,
-        visibility: 'public',
-        licenseSnapshotRef: 'sc:license:projection:test',
-        restoredLedger,
-        onLedger: () => Promise.reject(new Error('injected projection checkpoint failure')),
+      harness.run(mixed, {
+        onMutationLedger: () => {
+          if (failCheckpoint) {
+            failCheckpoint = false;
+            return Promise.reject(new Error('injected projection checkpoint failure'));
+          }
+          return Promise.resolve();
+        },
       }),
     ).rejects.toThrow('injected projection checkpoint failure');
-    expect(budget.metrics().inUse).toBe(0);
+    expect(harness.budget.metrics()).toMatchObject({ inUse: 0, waiting: 0 });
+    expect(harness.mutationLedger.totalRecords).toBe(0);
+    expect(harness.validationIssueLedger.totalRecords).toBe(1);
 
-    let checkpoint = restoredLedger;
-    const retried = await materializeNormalizationProjection({
-      events,
-      kind: 'mutation',
-      store: store.artifacts,
-      budget,
-      signal: new AbortController().signal,
-      maximumRecordsPerChunk: 2,
-      logicalPrefix,
-      visibility: 'public',
-      licenseSnapshotRef: 'sc:license:projection:test',
-      restoredLedger,
-      onLedger: (ledger) => {
-        checkpoint = ledger;
-        return Promise.resolve();
+    const retried = await harness.run(mixed, {
+      expectedMutations: { recordCount: mutations.length, logicalSha256: logicalSha256(mutations) },
+      expectedValidationIssues: {
+        recordCount: issues.length,
+        logicalSha256: logicalSha256(issues),
       },
     });
-    expect(retried.recordCount).toBe(2);
-    expect(checkpoint.totalRecords).toBe(2);
-    expect(budget.metrics().inUse).toBe(0);
+    expect(await collect(retried.mutations)).toEqual(mutations);
+    expect(await collect(retried.validationIssues)).toEqual(issues);
+    expect(harness.mutationLedger.totalRecords).toBe(2);
+    expect(harness.validationIssueLedger.totalRecords).toBe(2);
+    expect(harness.budget.metrics()).toMatchObject({ inUse: 0, waiting: 0 });
+  });
+
+  it('projects a mixed stream in one read with the prior order, identity, and ledger semantics', async () => {
+    const store = await stores('one-pass-mixed');
+    const harness = projectionHarness(store.artifacts, 'one-pass-mixed', 2, 3);
+    const mutations = [testMutation('mixed-0'), testMutation('mixed-1'), testMutation('mixed-2')];
+    const issues = [testIssue('mixed-0'), testIssue('mixed-1'), testIssue('mixed-2')];
+    let reads = 0;
+    const result = await harness.run(
+      projectionEvents(
+        [
+          { kind: 'validation_issue', value: requiredFixture(issues[0]) },
+          { kind: 'mutation', value: requiredFixture(mutations[0]) },
+          { kind: 'mutation', value: requiredFixture(mutations[1]) },
+          { kind: 'validation_issue', value: requiredFixture(issues[1]) },
+          { kind: 'mutation', value: requiredFixture(mutations[2]) },
+          { kind: 'validation_issue', value: requiredFixture(issues[2]) },
+        ],
+        () => {
+          reads += 1;
+        },
+      ),
+      {
+        expectedMutations: {
+          recordCount: mutations.length,
+          logicalSha256: logicalSha256(mutations),
+        },
+        expectedValidationIssues: {
+          recordCount: issues.length,
+          logicalSha256: logicalSha256(issues),
+        },
+      },
+    );
+
+    expect(reads).toBe(1);
+    expect(await collect(result.mutations)).toEqual(mutations);
+    expect(await collect(result.validationIssues)).toEqual(issues);
+    expect(result.mutations).toMatchObject({
+      recordCount: mutations.length,
+      logicalSha256: logicalSha256(mutations),
+      licenseSnapshotRefs: ['sc:license:projection:test'],
+    });
+    expect(result.validationIssues).toMatchObject({
+      recordCount: issues.length,
+      logicalSha256: logicalSha256(issues),
+      licenseSnapshotRefs: ['sc:license:projection:test'],
+    });
+    expect(harness.mutationLedger).toMatchObject({
+      logicalPrefix: harness.mutationPrefix,
+      totalRecords: mutations.length,
+      resumeCursor: null,
+      licenseSnapshotRefs: ['sc:license:projection:test'],
+    });
+    expect(harness.validationIssueLedger).toMatchObject({
+      logicalPrefix: harness.validationIssuePrefix,
+      totalRecords: issues.length,
+      resumeCursor: null,
+      licenseSnapshotRefs: ['sc:license:projection:test'],
+    });
+  });
+
+  it('resumes independently partial mutation and issue ledgers without replacing committed chunks', async () => {
+    const store = await stores('independent-projection-prefixes');
+    const harness = projectionHarness(store.artifacts, 'independent-projection-prefixes', 2, 1);
+    const mutations = [
+      testMutation('prefix-0'),
+      testMutation('prefix-1'),
+      testMutation('prefix-2'),
+    ];
+    const issues = [testIssue('prefix-0'), testIssue('prefix-1'), testIssue('prefix-2')];
+    let mutationCheckpoints = 0;
+    await expect(
+      harness.run(
+        projectionEvents([
+          { kind: 'mutation', value: requiredFixture(mutations[0]) },
+          { kind: 'validation_issue', value: requiredFixture(issues[0]) },
+          { kind: 'validation_issue', value: requiredFixture(issues[1]) },
+          { kind: 'mutation', value: requiredFixture(mutations[1]) },
+        ]),
+        {
+          onMutationLedger: () => {
+            mutationCheckpoints += 1;
+            return mutationCheckpoints === 1
+              ? Promise.resolve()
+              : Promise.reject(new Error('interrupt independently partial projections'));
+          },
+        },
+      ),
+    ).rejects.toThrow('interrupt independently partial projections');
+    expect(harness.budget.metrics()).toMatchObject({ inUse: 0, waiting: 0 });
+    expect(harness.mutationLedger.totalRecords).toBe(1);
+    expect(harness.validationIssueLedger.totalRecords).toBe(2);
+    const committedMutationReferences: ChunkReference[] = [];
+    for await (const reference of streamChunkLedgerReferences(
+      store.artifacts,
+      harness.mutationLedger,
+      harness.mutationPrefix,
+    )) {
+      committedMutationReferences.push(reference);
+    }
+    const committedIssueReferences: ChunkReference[] = [];
+    for await (const reference of streamChunkLedgerReferences(
+      store.artifacts,
+      harness.validationIssueLedger,
+      harness.validationIssuePrefix,
+    )) {
+      committedIssueReferences.push(reference);
+    }
+
+    let reads = 0;
+    const resumed = await harness.run(
+      projectionEvents(
+        [
+          { kind: 'mutation', value: requiredFixture(mutations[0]) },
+          { kind: 'validation_issue', value: requiredFixture(issues[0]) },
+          { kind: 'mutation', value: requiredFixture(mutations[1]) },
+          { kind: 'validation_issue', value: requiredFixture(issues[1]) },
+          { kind: 'mutation', value: requiredFixture(mutations[2]) },
+          { kind: 'validation_issue', value: requiredFixture(issues[2]) },
+        ],
+        () => {
+          reads += 1;
+        },
+      ),
+    );
+    const resumedMutationReferences: ChunkReference[] = [];
+    for await (const reference of streamChunkLedgerReferences(
+      store.artifacts,
+      harness.mutationLedger,
+      harness.mutationPrefix,
+    )) {
+      resumedMutationReferences.push(reference);
+    }
+    const resumedIssueReferences: ChunkReference[] = [];
+    for await (const reference of streamChunkLedgerReferences(
+      store.artifacts,
+      harness.validationIssueLedger,
+      harness.validationIssuePrefix,
+    )) {
+      resumedIssueReferences.push(reference);
+    }
+
+    expect(reads).toBe(1);
+    expect(resumedMutationReferences.slice(0, committedMutationReferences.length)).toEqual(
+      committedMutationReferences,
+    );
+    expect(resumedIssueReferences.slice(0, committedIssueReferences.length)).toEqual(
+      committedIssueReferences,
+    );
+    expect(await collect(resumed.mutations)).toEqual(mutations);
+    expect(await collect(resumed.validationIssues)).toEqual(issues);
+    expect(harness.budget.metrics()).toMatchObject({ inUse: 0, waiting: 0 });
+  });
+
+  it('rejects a corrupt committed projection while restoring its exact prefix', async () => {
+    const store = await stores('corrupt-projection-prefix');
+    const harness = projectionHarness(store.artifacts, 'corrupt-projection-prefix', 2, 1);
+    const mutation = testMutation('corrupt');
+    const issue = testIssue('corrupt');
+    const events = projectionEvents([
+      { kind: 'mutation', value: mutation },
+      { kind: 'validation_issue', value: issue },
+    ]);
+    await harness.run(events);
+    const references: ChunkReference[] = [];
+    for await (const reference of streamChunkLedgerReferences(
+      store.artifacts,
+      harness.mutationLedger,
+      harness.mutationPrefix,
+    )) {
+      references.push(reference);
+    }
+    const bodyUri = references[0]?.uri;
+    if (bodyUri === undefined) throw new Error('Missing committed mutation projection');
+    await writeFile(fileURLToPath(bodyUri), 'corrupt\n');
+
+    await expect(harness.run(events)).rejects.toThrow(/mismatch|corrupt/iu);
+    expect(harness.budget.metrics()).toMatchObject({ inUse: 0, waiting: 0 });
+  });
+
+  it('rejects a committed projection that exceeds the event source', async () => {
+    const store = await stores('excess-projection-prefix');
+    const harness = projectionHarness(store.artifacts, 'excess-projection-prefix', 2, 1);
+    const first = testMutation('excess-0');
+    await harness.run(
+      projectionEvents([
+        { kind: 'mutation', value: first },
+        { kind: 'mutation', value: testMutation('excess-1') },
+        { kind: 'validation_issue', value: testIssue('excess-0') },
+      ]),
+    );
+
+    await expect(
+      harness.run(
+        projectionEvents([
+          { kind: 'mutation', value: first },
+          { kind: 'validation_issue', value: testIssue('excess-0') },
+        ]),
+      ),
+    ).rejects.toThrow('Persisted mutation projection exceeds its event source');
+    expect(harness.budget.metrics()).toMatchObject({ inUse: 0, waiting: 0 });
+  });
+
+  it('rejects a committed projection that is not the exact event prefix', async () => {
+    const store = await stores('changed-projection-prefix');
+    const harness = projectionHarness(store.artifacts, 'changed-projection-prefix', 2, 1);
+    await harness.run(
+      projectionEvents([
+        { kind: 'mutation', value: testMutation('original') },
+        { kind: 'validation_issue', value: testIssue('original') },
+      ]),
+    );
+
+    await expect(
+      harness.run(
+        projectionEvents([
+          { kind: 'mutation', value: testMutation('changed') },
+          { kind: 'validation_issue', value: testIssue('original') },
+        ]),
+      ),
+    ).rejects.toThrow('Persisted mutation projection is not an exact event prefix');
+    expect(harness.budget.metrics()).toMatchObject({ inUse: 0, waiting: 0 });
+  });
+
+  it('rejects an expected projection SHA-256 mismatch after releasing all leases', async () => {
+    const store = await stores('expected-projection-mismatch');
+    const harness = projectionHarness(store.artifacts, 'expected-projection-mismatch', 2, 2);
+    const mutations = [testMutation('expected-0'), testMutation('expected-1')];
+    await expect(
+      harness.run(
+        projectionEvents(mutations.map((value) => ({ kind: 'mutation' as const, value }))),
+        {
+          expectedMutations: {
+            recordCount: mutations.length,
+            logicalSha256: '0'.repeat(64),
+          },
+        },
+      ),
+    ).rejects.toThrow('Projected mutation logical identity mismatch');
+    expect(harness.budget.metrics()).toMatchObject({ inUse: 0, waiting: 0 });
+  });
+
+  it.each([1, 2])(
+    'coordinates dual writers without deadlock or lease leaks at capacity %i',
+    async (capacity) => {
+      const store = await stores(`projection-capacity-${capacity}`);
+      const harness = projectionHarness(
+        store.artifacts,
+        `projection-capacity-${capacity}`,
+        capacity,
+        8,
+      );
+      const mutations = Array.from({ length: 32 }, (_, index) => testMutation(`capacity-${index}`));
+      const issues = Array.from({ length: 32 }, (_, index) => testIssue(`capacity-${index}`));
+      const events = mutations.flatMap((mutation, index): readonly TestProjectionEvent[] => [
+        { kind: 'mutation', value: mutation },
+        { kind: 'validation_issue', value: requiredFixture(issues[index]) },
+      ]);
+
+      const result = await harness.run(projectionEvents(events));
+      expect(await collect(result.mutations)).toEqual(mutations);
+      expect(await collect(result.validationIssues)).toEqual(issues);
+      expect(harness.budget.metrics()).toMatchObject({
+        capacity,
+        inUse: 0,
+        waiting: 0,
+      });
+      expect(harness.budget.metrics().highWaterRecords).toBeLessThanOrEqual(capacity);
+    },
+    5_000,
+  );
+
+  it('materializes two empty projections from one empty event read', async () => {
+    const store = await stores('empty-projections');
+    const harness = projectionHarness(store.artifacts, 'empty-projections', 1, 1);
+    let reads = 0;
+    const result = await harness.run(
+      projectionEvents([], () => {
+        reads += 1;
+      }),
+    );
+    expect(reads).toBe(1);
+    expect(result.mutations).toMatchObject({ recordCount: 0, logicalSha256: hash('') });
+    expect(result.validationIssues).toMatchObject({ recordCount: 0, logicalSha256: hash('') });
+    expect(harness.mutationLedger).toMatchObject({ totalChunks: 0, totalRecords: 0 });
+    expect(harness.validationIssueLedger).toMatchObject({ totalChunks: 0, totalRecords: 0 });
+    expect(harness.budget.metrics()).toMatchObject({ inUse: 0, waiting: 0 });
+  });
+
+  it('keeps issue-heavy projection order and identity bounded in one event pass', async () => {
+    const store = await stores('issue-heavy-projection');
+    const harness = projectionHarness(store.artifacts, 'issue-heavy-projection', 2, 7);
+    const issues = Array.from({ length: 257 }, (_, index) => testIssue(`heavy-${index}`));
+    const mutations: CanonicalMutation[] = [];
+    const events: TestProjectionEvent[] = [];
+    for (const [index, issue] of issues.entries()) {
+      events.push({ kind: 'validation_issue', value: issue });
+      if (index % 64 === 0) {
+        const mutation = testMutation(`heavy-${index}`);
+        mutations.push(mutation);
+        events.push({ kind: 'mutation', value: mutation });
+      }
+    }
+    let reads = 0;
+    const result = await harness.run(
+      projectionEvents(events, () => {
+        reads += 1;
+      }),
+    );
+
+    expect(reads).toBe(1);
+    expect(await collect(result.mutations)).toEqual(mutations);
+    expect(await collect(result.validationIssues)).toEqual(issues);
+    expect(result.mutations.logicalSha256).toBe(logicalSha256(mutations));
+    expect(result.validationIssues.logicalSha256).toBe(logicalSha256(issues));
+    expect(harness.budget.metrics()).toMatchObject({ inUse: 0, waiting: 0 });
+    expect(harness.budget.metrics().highWaterRecords).toBeLessThanOrEqual(2);
   });
 
   it('persists each yielded acquisition and replays identical-body plan items without reacquiring', async () => {
@@ -955,19 +1375,23 @@ describe('streaming runner restart and budget contracts', () => {
     expect(
       (legacySourceBeforeResume?.normalizationChunks as ChunkReference[]).length,
     ).toBeGreaterThan(0);
-    const downstreamAuthority = createCheckpointEnvelope({
-      scope: `bounded-processing:${config.runId}`,
-      previousRevision: null,
-      writtenAt: INSTANT,
-      payload: Object.freeze({ authority: 'begun' }),
-    });
+    const legacyDownstreamScope = `bounded-processing:${config.runId}`;
+    const downstreamScopePrefix = `${legacyDownstreamScope}:`;
     const downstreamController = new AbortController();
     const downstreamDependencies = Object.freeze({
       ...dependencies(store, downstreamController),
       checkpointStore: Object.freeze({
         load: (requestedScope: string) =>
-          requestedScope === downstreamAuthority.scope
-            ? Promise.resolve(downstreamAuthority)
+          requestedScope === legacyDownstreamScope ||
+          requestedScope.startsWith(downstreamScopePrefix)
+            ? Promise.resolve(
+                createCheckpointEnvelope({
+                  scope: requestedScope,
+                  previousRevision: null,
+                  writtenAt: INSTANT,
+                  payload: Object.freeze({ authority: 'begun' }),
+                }),
+              )
             : store.checkpoints.load(requestedScope),
         commit: store.checkpoints.commit.bind(store.checkpoints),
       }),

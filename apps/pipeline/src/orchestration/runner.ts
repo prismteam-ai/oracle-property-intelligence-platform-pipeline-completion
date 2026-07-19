@@ -1210,52 +1210,45 @@ async function runSource(
           logicalPrefix: eventPrefix,
         },
       );
-      mutations = await materializeNormalizationProjection({
+      const projections = await materializeNormalizationProjections({
         events,
-        kind: 'mutation',
         store: dependencies.artifactStore,
         budget: recordBudget,
         signal: dependencies.signal,
         maximumRecordsPerChunk: configuration.profile.maxBufferedRecords,
         maximumBytesPerRecord: normalizationRecordByteCap(),
         maximumBytesPerChunk: normalizationChunkByteCap(),
-        logicalPrefix: mutationPrefix,
         visibility: descriptor.defaultVisibility,
         licenseSnapshotRef,
-        restoredLedger: state.mutationLedger,
-        onLedger: async (ledger) => {
-          const candidate = Object.freeze({ ...state, mutationLedger: ledger });
-          await coordinator.updateSource(candidate);
-          state = candidate;
+        mutation: {
+          logicalPrefix: mutationPrefix,
+          restoredLedger: state.mutationLedger,
+          onLedger: async (ledger) => {
+            const candidate = Object.freeze({ ...state, mutationLedger: ledger });
+            await coordinator.updateSource(candidate);
+            state = candidate;
+          },
+          expected: {
+            recordCount: state.mutationRecords,
+            logicalSha256: state.mutationLogicalSha256,
+          },
         },
-        expected: {
-          recordCount: state.mutationRecords,
-          logicalSha256: state.mutationLogicalSha256,
-        },
-      });
-      validationIssues = await materializeNormalizationProjection({
-        events,
-        kind: 'validation_issue',
-        store: dependencies.artifactStore,
-        budget: recordBudget,
-        signal: dependencies.signal,
-        maximumRecordsPerChunk: configuration.profile.maxBufferedRecords,
-        maximumBytesPerRecord: normalizationRecordByteCap(),
-        maximumBytesPerChunk: normalizationChunkByteCap(),
-        logicalPrefix: validationPrefix,
-        visibility: descriptor.defaultVisibility,
-        licenseSnapshotRef,
-        restoredLedger: state.validationIssueLedger,
-        onLedger: async (ledger) => {
-          const candidate = Object.freeze({ ...state, validationIssueLedger: ledger });
-          await coordinator.updateSource(candidate);
-          state = candidate;
-        },
-        expected: {
-          recordCount: state.validationIssueRecords,
-          logicalSha256: state.validationIssueLogicalSha256,
+        validationIssue: {
+          logicalPrefix: validationPrefix,
+          restoredLedger: state.validationIssueLedger,
+          onLedger: async (ledger) => {
+            const candidate = Object.freeze({ ...state, validationIssueLedger: ledger });
+            await coordinator.updateSource(candidate);
+            state = candidate;
+          },
+          expected: {
+            recordCount: state.validationIssueRecords,
+            logicalSha256: state.validationIssueLogicalSha256,
+          },
         },
       });
+      mutations = projections.mutations;
+      validationIssues = projections.validationIssues;
     } else {
       const records = {
         decoded: state.decodedRecords,
@@ -1590,44 +1583,37 @@ async function runSource(
       const validateTiming: PhaseTiming = Object.freeze({ ...phase.timing, phase: 'validate' });
       const normalizeTiming: PhaseTiming = Object.freeze({ ...phase.timing, phase: 'normalize' });
       const events = phase.value;
-      mutations = await materializeNormalizationProjection({
+      const projections = await materializeNormalizationProjections({
         events,
-        kind: 'mutation',
         store: dependencies.artifactStore,
         budget: recordBudget,
         signal: dependencies.signal,
         maximumRecordsPerChunk: configuration.profile.maxBufferedRecords,
         maximumBytesPerRecord: normalizationRecordByteCap(),
         maximumBytesPerChunk: normalizationChunkByteCap(),
-        logicalPrefix: mutationPrefix,
         visibility: descriptor.defaultVisibility,
         licenseSnapshotRef,
-        restoredLedger: state.mutationLedger,
-        onLedger: async (ledger) => {
-          const candidate = Object.freeze({ ...state, mutationLedger: ledger });
-          await coordinator.updateSource(candidate);
-          state = candidate;
+        mutation: {
+          logicalPrefix: mutationPrefix,
+          restoredLedger: state.mutationLedger,
+          onLedger: async (ledger) => {
+            const candidate = Object.freeze({ ...state, mutationLedger: ledger });
+            await coordinator.updateSource(candidate);
+            state = candidate;
+          },
+        },
+        validationIssue: {
+          logicalPrefix: validationPrefix,
+          restoredLedger: state.validationIssueLedger,
+          onLedger: async (ledger) => {
+            const candidate = Object.freeze({ ...state, validationIssueLedger: ledger });
+            await coordinator.updateSource(candidate);
+            state = candidate;
+          },
         },
       });
-      validationIssues = await materializeNormalizationProjection({
-        events,
-        kind: 'validation_issue',
-        store: dependencies.artifactStore,
-        budget: recordBudget,
-        signal: dependencies.signal,
-        maximumRecordsPerChunk: configuration.profile.maxBufferedRecords,
-        maximumBytesPerRecord: normalizationRecordByteCap(),
-        maximumBytesPerChunk: normalizationChunkByteCap(),
-        logicalPrefix: validationPrefix,
-        visibility: descriptor.defaultVisibility,
-        licenseSnapshotRef,
-        restoredLedger: state.validationIssueLedger,
-        onLedger: async (ledger) => {
-          const candidate = Object.freeze({ ...state, validationIssueLedger: ledger });
-          await coordinator.updateSource(candidate);
-          state = candidate;
-        },
-      });
+      mutations = projections.mutations;
+      validationIssues = projections.validationIssues;
       state = Object.freeze({
         ...state,
         completedPhase: 'normalize',
@@ -1803,41 +1789,36 @@ function validateNormalizationResume(
   }
 }
 
-export async function materializeNormalizationProjection<
-  TKind extends 'mutation' | 'validation_issue',
->(
+type NormalizationProjectionConfiguration = Readonly<{
+  logicalPrefix: string;
+  restoredLedger: ChunkLedger;
+  onLedger: (ledger: ChunkLedger) => Promise<void>;
+  expected?: Readonly<{ recordCount: number; logicalSha256: string }>;
+}>;
+
+export async function materializeNormalizationProjections(
   input: Readonly<{
     events: ChunkSequence<NormalizationEvent>;
-    kind: TKind;
     store: OrchestrationDependencies['artifactStore'];
     budget: SharedRecordBudget;
     signal: AbortSignal;
     maximumRecordsPerChunk: number;
     maximumBytesPerRecord?: number;
     maximumBytesPerChunk?: number;
-    logicalPrefix: string;
     visibility: string;
     licenseSnapshotRef: string;
-    restoredLedger: ChunkLedger;
-    onLedger: (ledger: ChunkLedger) => Promise<void>;
-    expected?: Readonly<{ recordCount: number; logicalSha256: string }>;
+    mutation: NormalizationProjectionConfiguration;
+    validationIssue: NormalizationProjectionConfiguration;
   }>,
 ): Promise<
-  ChunkSequence<
-    Extract<NormalizationEvent, { kind: TKind }> extends { value: infer TValue } ? TValue : never
-  >
+  Readonly<{
+    mutations: ChunkSequence<CanonicalMutation>;
+    validationIssues: ChunkSequence<ValidationIssue>;
+  }>
 > {
-  type TValue =
-    Extract<NormalizationEvent, { kind: TKind }> extends { value: infer Value } ? Value : never;
-  const persisted = await openLedgerChunkSequencePrefix<TValue>(
-    input.store,
-    input.restoredLedger,
-    input.logicalPrefix,
-  );
-  const committed = persisted.read()[Symbol.asyncIterator]();
-  const writer = new CanonicalChunkWriter<TValue>({
+  const mutationWriter = new CanonicalChunkWriter<CanonicalMutation>({
     store: input.store,
-    logicalPrefix: input.logicalPrefix,
+    logicalPrefix: input.mutation.logicalPrefix,
     visibility: input.visibility,
     licenseSnapshotRef: input.licenseSnapshotRef,
     budget: input.budget,
@@ -1849,38 +1830,93 @@ export async function materializeNormalizationProjection<
     ...(input.maximumBytesPerChunk === undefined
       ? {}
       : { maximumBytesPerChunk: input.maximumBytesPerChunk }),
-    restoredLedger: input.restoredLedger,
-    onLedger: input.onLedger,
+    restoredLedger: input.mutation.restoredLedger,
+    onLedger: input.mutation.onLedger,
   });
-  try {
-    await writer.restore();
-    for await (const event of input.events.read()) {
-      if (event.kind !== input.kind) continue;
-      const value = event.value as TValue;
-      const prior = await committed.next();
-      if (!prior.done) {
-        if (canonicalJson(prior.value) !== canonicalJson(value)) {
-          throw new Error(`Persisted ${input.kind} projection is not an exact event prefix`);
-        }
-        continue;
-      }
-      await writer.append(value);
-    }
-    if (!(await committed.next()).done) {
-      throw new Error(`Persisted ${input.kind} projection exceeds its event source`);
-    }
-    const sequence = await writer.finish();
+  const validationIssueWriter = new CanonicalChunkWriter<ValidationIssue>({
+    store: input.store,
+    logicalPrefix: input.validationIssue.logicalPrefix,
+    visibility: input.visibility,
+    licenseSnapshotRef: input.licenseSnapshotRef,
+    budget: input.budget,
+    signal: input.signal,
+    maximumRecordsPerChunk: input.maximumRecordsPerChunk,
+    ...(input.maximumBytesPerRecord === undefined
+      ? {}
+      : { maximumBytesPerRecord: input.maximumBytesPerRecord }),
+    ...(input.maximumBytesPerChunk === undefined
+      ? {}
+      : { maximumBytesPerChunk: input.maximumBytesPerChunk }),
+    restoredLedger: input.validationIssue.restoredLedger,
+    onLedger: input.validationIssue.onLedger,
+  });
+  const committedMutations = mutationWriter.restoreAndRead()[Symbol.asyncIterator]();
+  const committedValidationIssues = validationIssueWriter.restoreAndRead()[Symbol.asyncIterator]();
+
+  const appendAfterCoordinatedFlush = async <T>(
+    writer: CanonicalChunkWriter<T>,
+    otherWriter: Readonly<{ bufferedRecordCount: number; flush(): Promise<void> }>,
+    value: T,
+  ): Promise<void> => {
     if (
-      input.expected !== undefined &&
-      (input.expected.recordCount !== sequence.recordCount ||
-        input.expected.logicalSha256 !== sequence.logicalSha256)
+      input.budget.metrics().inUse >= input.budget.capacity &&
+      otherWriter.bufferedRecordCount > 0
     ) {
-      throw new Error(`Projected ${input.kind} logical identity mismatch`);
+      // append() can flush only its own buffer; release the opposite projection's blocking lease.
+      await otherWriter.flush();
     }
-    return sequence;
+    await writer.append(value);
+  };
+
+  try {
+    for await (const event of input.events.read()) {
+      if (event.kind === 'mutation') {
+        const prior = await committedMutations.next();
+        if (!prior.done) {
+          if (canonicalJson(prior.value) !== canonicalJson(event.value)) {
+            throw new Error('Persisted mutation projection is not an exact event prefix');
+          }
+        } else {
+          await appendAfterCoordinatedFlush(mutationWriter, validationIssueWriter, event.value);
+        }
+      } else if (event.kind === 'validation_issue') {
+        const prior = await committedValidationIssues.next();
+        if (!prior.done) {
+          if (canonicalJson(prior.value) !== canonicalJson(event.value)) {
+            throw new Error('Persisted validation_issue projection is not an exact event prefix');
+          }
+        } else {
+          await appendAfterCoordinatedFlush(validationIssueWriter, mutationWriter, event.value);
+        }
+      }
+    }
+    if (!(await committedMutations.next()).done) {
+      throw new Error('Persisted mutation projection exceeds its event source');
+    }
+    if (!(await committedValidationIssues.next()).done) {
+      throw new Error('Persisted validation_issue projection exceeds its event source');
+    }
+    const mutations = await mutationWriter.finish();
+    const validationIssues = await validationIssueWriter.finish();
+    if (
+      input.mutation.expected !== undefined &&
+      (input.mutation.expected.recordCount !== mutations.recordCount ||
+        input.mutation.expected.logicalSha256 !== mutations.logicalSha256)
+    ) {
+      throw new Error('Projected mutation logical identity mismatch');
+    }
+    if (
+      input.validationIssue.expected !== undefined &&
+      (input.validationIssue.expected.recordCount !== validationIssues.recordCount ||
+        input.validationIssue.expected.logicalSha256 !== validationIssues.logicalSha256)
+    ) {
+      throw new Error('Projected validation_issue logical identity mismatch');
+    }
+    return Object.freeze({ mutations, validationIssues });
   } catch (error) {
-    writer.abort();
-    await committed.return?.();
+    mutationWriter.abort();
+    validationIssueWriter.abort();
+    await Promise.allSettled([committedMutations.return?.(), committedValidationIssues.return?.()]);
     throw error;
   }
 }

@@ -395,6 +395,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     expect(first?.martArtifact.byteSize).toBeLessThan(64 * 1024);
     if (first === undefined) throw new Error('bounded processor did not return a result');
     const descriptor = (await readJsonArtifact(artifactStore, first.martArtifact)) as Readonly<{
+      generationId: string;
       releaseDirectory: string;
     }>;
     const manifest = JSON.parse(
@@ -599,7 +600,9 @@ describe('bounded_streaming_v2 pipeline composition', () => {
         }
       }
     }
-    const durable = await checkpointStore.load(`bounded-processing:${RUN_ID}`);
+    const durable = await checkpointStore.load(
+      `bounded-processing:${RUN_ID}:${descriptor.generationId}`,
+    );
     const checkpoint = durable?.payload as
       | Readonly<{
           completedStages: readonly Readonly<{
@@ -666,6 +669,45 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     expect(resumed?.reconcileArtifact.sha256).toBe(first.reconcileArtifact.sha256);
     expect(resumed?.martArtifact.sha256).toBe(first.martArtifact.sha256);
 
+    const changedGeneration = await createProcessor().processBoundedCounty?.({
+      ...request,
+      mutationSources: [
+        {
+          sourceId: SOURCE_ID,
+          snapshotId: SNAPSHOT_ID,
+          sequence: chunkSequence([...mutations].reverse()),
+        },
+        {
+          sourceId: FAILED_SOURCE_ID,
+          snapshotId: FAILED_SNAPSHOT_ID,
+          sequence: failedSequence,
+        },
+      ],
+    });
+    if (changedGeneration === undefined) throw new Error('changed generation did not complete');
+    const changedDescriptor = (await readJsonArtifact(
+      artifactStore,
+      changedGeneration.martArtifact,
+    )) as Readonly<{ generationId: string; releaseDirectory: string }>;
+    expect(changedDescriptor.generationId).not.toBe(descriptor.generationId);
+    expect(changedDescriptor.releaseDirectory).not.toBe(descriptor.releaseDirectory);
+    const generationDirectories = (
+      await readdir(join(root, 'scratch', createHash('sha256').update(RUN_ID).digest('hex')), {
+        withFileTypes: true,
+      })
+    )
+      .filter((entry) => entry.isDirectory())
+      .map(({ name }) => name)
+      .sort();
+    expect(generationDirectories).toEqual(
+      [descriptor.generationId, changedDescriptor.generationId]
+        .map((generationId) => generationId.slice(generationId.lastIndexOf(':') + 1, -32))
+        .sort(),
+    );
+    await expect(
+      readFile(join(root, 'output', descriptor.releaseDirectory, 'release-manifest.json'), 'utf8'),
+    ).resolves.toContain('"manifestSha256"');
+
     const firstCompletedStage = checkpoint?.completedStages[0];
     if (firstCompletedStage === undefined) throw new Error('completed stage is missing');
     const persistedStage = await artifactStore.headByLogicalKey(
@@ -674,7 +716,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     if (persistedStage === undefined) throw new Error('persisted stage object is missing');
     await rm(fileURLToPath(persistedStage.uri), { force: true });
     await expect(createProcessor().processBoundedCounty?.(request)).rejects.toThrow();
-  }, 120_000);
+  }, 180_000);
 
   it('emits four honest public proxies and keeps both ownership inquiries unknown on full-profile inputs', async () => {
     const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-inquiries-'));

@@ -289,8 +289,8 @@ async function processBoundedCounty(
   const releaseProcessRun = acquireProcessRun(options.resourceRoots, request.configuration.runId);
   try {
     await Promise.all(options.resourceRoots.map((root) => mkdir(root, { recursive: true })));
-    const confined = confinedRunRoot(options.scratchRoot, request.configuration.runId);
-    await mkdir(confined, { recursive: true });
+    const runRoot = confinedRunRoot(options.scratchRoot, request.configuration.runId);
+    await mkdir(runRoot, { recursive: true });
     const sharedBudget = options.sharedBudget;
     sharedBudget.assertPolicy(options.budget);
     const activeBudget = sharedBudget.snapshot();
@@ -329,6 +329,8 @@ async function processBoundedCounty(
         trustedAcquisition.manifest.manifestSha256,
         boundedTrustedCapabilityStateSha256(trustedAcquisition.manifest),
       );
+      const confined = confinedChild(runRoot, generationPath(processing.generationId));
+      await mkdir(confined, { recursive: true });
       const databasePath = join(confined, 'bounded-county.duckdb');
       const instance = await openDuckDatabase(databasePath, confined, options.budget);
       const connection = await instance.connect();
@@ -3894,10 +3896,12 @@ async function buildMarts(
     permitAuthoritiesCovered === BOUNDED_AUTHORITATIVE_PERMIT_AUTHORITIES.length &&
     trustedAcquisition.manifest.authoritativeCountyRegistry !== undefined &&
     semanticallyReadyOwnershipRows === propertyCount * 2;
-  const releaseDirectory = confinedChild(
+  const releaseGenerationRoot = confinedChild(
     join(outputRoot, 'releases'),
-    processing.release.releaseId,
+    generationPath(processing.generationId),
   );
+  await mkdir(releaseGenerationRoot, { recursive: true });
+  const releaseDirectory = confinedChild(releaseGenerationRoot, processing.release.releaseId);
   await commitBoundedProgress(request, connection, processing, 'build_marts', sharedBudget);
   const buildCheckpoint = (await loadBoundedCheckpoint(request, processing)).checkpoint;
   if (!buildCheckpoint.completedStages.some(({ stage }) => stage === 'build_marts')) {
@@ -3962,7 +3966,7 @@ async function buildMarts(
   // are released before hand-off. County-scale use remains gated on rooted relation input.
   while (relationBudgetReleases.length > 0) relationBudgetReleases.pop()?.();
   try {
-    const releaseScratch = join(outputRoot, '.rs');
+    const releaseScratch = join(root, 'release-scratch');
     await mkdir(releaseScratch, { recursive: true });
     const built = await buildBoundedServingRelease({
       processing,
@@ -6697,7 +6701,7 @@ async function loadBoundedCheckpoint(
     checkpoint: BoundedProcessingCheckpoint;
   }>
 > {
-  const scope = `bounded-processing:${processing.runId}`;
+  const scope = `bounded-processing:${processing.runId}:${processing.generationId}`;
   const current = await request.checkpointStore.load(scope);
   if (current !== undefined) {
     return Object.freeze({

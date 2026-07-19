@@ -23,12 +23,16 @@ import {
 
 class MemoryStore implements RecoverableArtifactStore {
   readonly records = new Map<string, { stored: StoredArtifact; bytes: Uint8Array }>();
+  readonly readCounts = new Map<string, number>();
   failBeforeNextWrite = false;
   failAfterNextWrite = false;
   failBeforeLogicalKey: string | null = null;
   failAfterLogicalKey: string | null = null;
   failHeadLogicalKeyOnce: string | null = null;
   readFragmentBytes: number | null = null;
+  validateBodyOnHead = true;
+  activeReads = 0;
+  finalizedReads = 0;
 
   public putImmutable(request: ImmutableArtifactWrite): Promise<StoredArtifact> {
     return this.putImmutableStreaming(request);
@@ -98,19 +102,28 @@ class MemoryStore implements RecoverableArtifactStore {
     }
     const item = this.records.get(logicalKey);
     if (item === undefined) return Promise.resolve(undefined);
-    const hash = createHash('sha256').update(item.bytes).digest('hex');
-    if (hash !== item.stored.sha256) throw new ChunkIntegrityError('corrupt body');
+    if (this.validateBodyOnHead) {
+      const hash = createHash('sha256').update(item.bytes).digest('hex');
+      if (hash !== item.stored.sha256) throw new ChunkIntegrityError('corrupt body');
+    }
     return Promise.resolve(item.stored);
   }
 
   public async *read(uri: string, range?: ArtifactByteRange): AsyncIterable<Uint8Array> {
+    this.readCounts.set(uri, (this.readCounts.get(uri) ?? 0) + 1);
+    this.activeReads += 1;
     const item = [...this.records.values()].find(({ stored }) => stored.uri === uri);
-    if (item === undefined) throw new Error('missing');
-    const bytes =
-      range === undefined ? item.bytes : item.bytes.slice(range.start, range.endInclusive + 1);
-    const fragmentBytes = this.readFragmentBytes ?? bytes.byteLength;
-    for (let offset = 0; offset < bytes.byteLength; offset += fragmentBytes) {
-      yield await Promise.resolve(bytes.slice(offset, offset + fragmentBytes));
+    try {
+      if (item === undefined) throw new Error('missing');
+      const bytes =
+        range === undefined ? item.bytes : item.bytes.slice(range.start, range.endInclusive + 1);
+      const fragmentBytes = this.readFragmentBytes ?? bytes.byteLength;
+      for (let offset = 0; offset < bytes.byteLength; offset += fragmentBytes) {
+        yield await Promise.resolve(bytes.slice(offset, offset + fragmentBytes));
+      }
+    } finally {
+      this.activeReads -= 1;
+      this.finalizedReads += 1;
     }
   }
 }
@@ -135,6 +148,12 @@ async function write(
   return { sequence: await writer.finish(), metrics: budget.metrics() };
 }
 
+async function collect<T>(values: AsyncIterable<T>): Promise<T[]> {
+  const collected: T[] = [];
+  for await (const value of values) collected.push(value);
+  return collected;
+}
+
 describe('canonical chunk spill and recovery', () => {
   it('enforces independent record/chunk byte caps with explicit transferred-lease ownership', async () => {
     const store = new MemoryStore();
@@ -156,6 +175,15 @@ describe('canonical chunk spill and recovery', () => {
         return Promise.resolve();
       },
     });
+    let callerReleases = 0;
+    const callerLease = { release: () => (callerReleases += 1) };
+    await expect(writer.append('b'.repeat(62), callerLease)).rejects.toThrow(
+      'exceeds 64 byte record budget',
+    );
+    expect(callerReleases).toBe(0);
+    callerLease.release();
+    expect(callerReleases).toBe(1);
+
     const exactBoundary = 'a'.repeat(61);
     await writer.append(exactBoundary);
     await writer.append(exactBoundary);
@@ -170,14 +198,6 @@ describe('canonical chunk spill and recovery', () => {
     for await (const value of reopened.read()) values.push(value);
     expect(values).toEqual([exactBoundary, exactBoundary, exactBoundary]);
 
-    let callerReleases = 0;
-    const callerLease = { release: () => (callerReleases += 1) };
-    await expect(writer.append('b'.repeat(62), callerLease)).rejects.toThrow(
-      'exceeds 64 byte record budget',
-    );
-    expect(callerReleases).toBe(0);
-    callerLease.release();
-    expect(callerReleases).toBe(1);
     expect(budget.metrics().inUse).toBe(0);
   });
 
@@ -348,6 +368,277 @@ describe('canonical chunk spill and recovery', () => {
     expect(offsets).toEqual([1, 2, 3]);
     expect(acquisitions).toBe(1);
     expect(budget.metrics().highWaterRecords).toBe(1);
+  });
+
+  it('restores and yields an array prefix in one scan before exact append and finish', async () => {
+    const store = new MemoryStore();
+    const prefix = [
+      { ordinal: 0, fanout: 2 },
+      { ordinal: 1, fanout: 1 },
+      { ordinal: 2, fanout: 0 },
+    ] as const;
+    const suffix = [
+      { ordinal: 3, fanout: 2 },
+      { ordinal: 4, fanout: 1 },
+    ] as const;
+    const persisted = await write(store, 2, prefix);
+    let checkpoint = persisted.sequence.chunks;
+    const resumed = new CanonicalChunkWriter<(typeof prefix)[number] | (typeof suffix)[number]>({
+      store,
+      logicalPrefix: 'run/source/normalize/chunks',
+      visibility: 'public',
+      licenseSnapshotRef: 'sc:license:test',
+      budget: createSharedRecordBudget(2),
+      signal: new AbortController().signal,
+      maximumRecordsPerChunk: 2,
+      restoredChunks: checkpoint,
+      onChunk: (chunks) => {
+        checkpoint = chunks;
+        return Promise.resolve();
+      },
+    });
+
+    expect(await collect(resumed.restoreAndRead())).toEqual(prefix);
+    for (const reference of persisted.sequence.chunks) {
+      expect(store.readCounts.get(reference.uri)).toBe(1);
+    }
+    for (const value of suffix) await resumed.append(value);
+    const complete = await resumed.finish();
+    const clean = await write(new MemoryStore(), 3, [...prefix, ...suffix]);
+
+    expect(complete.recordCount).toBe(prefix.length + suffix.length);
+    expect(complete.logicalSha256).toBe(clean.sequence.logicalSha256);
+    expect(complete.chunks.slice(0, persisted.sequence.chunks.length)).toEqual(
+      persisted.sequence.chunks,
+    );
+    expect(await collect(complete.read())).toEqual([...prefix, ...suffix]);
+    expect(checkpoint).toEqual(complete.chunks);
+  });
+
+  it('restores a sealed ledger prefix with one read per page and chunk', async () => {
+    type Event = Readonly<{ ordinal: number; fanout: number }>;
+    const store = new MemoryStore();
+    const logicalPrefix = 'run/ledger-single-scan/normalize/events';
+    let checkpoint = emptyChunkLedger(logicalPrefix);
+    const createWriter = () =>
+      new CanonicalChunkWriter<Event>({
+        store,
+        logicalPrefix,
+        visibility: 'public',
+        licenseSnapshotRef: 'sc:license:test',
+        budget: createSharedRecordBudget(1),
+        signal: new AbortController().signal,
+        maximumRecordsPerChunk: 1,
+        restoredLedger: checkpoint,
+        onLedger: (ledger) => {
+          checkpoint = ledger;
+          return Promise.resolve();
+        },
+      });
+    const prefix = Array.from({ length: 257 }, (_, ordinal) => ({ ordinal, fanout: ordinal % 3 }));
+    const interrupted = createWriter();
+    for (const value of prefix) await interrupted.append(value);
+    expect(checkpoint).toMatchObject({ sealedPageCount: 1, totalChunks: prefix.length });
+
+    const resumed = createWriter();
+    expect(await collect(resumed.restoreAndRead())).toEqual(prefix);
+    const page = [...store.records.values()].find(({ stored }) =>
+      stored.logicalKey.includes('/ledger/p/'),
+    );
+    if (page === undefined) throw new Error('missing sealed ledger page fixture');
+    expect(store.readCounts.get(page.stored.uri)).toBe(1);
+    for (const item of store.records.values()) {
+      if (item.stored.mediaType === 'application/x-ndjson') {
+        expect(store.readCounts.get(item.stored.uri)).toBe(1);
+      }
+    }
+
+    const appended = { ordinal: prefix.length, fanout: 2 };
+    await resumed.append(appended);
+    const complete = await resumed.finish();
+    const clean = await write(new MemoryStore(), 7, [...prefix, appended]);
+    expect(complete.recordCount).toBe(prefix.length + 1);
+    expect(complete.logicalSha256).toBe(clean.sequence.logicalSha256);
+    expect(await collect(complete.read())).toEqual([...prefix, appended]);
+  });
+
+  it('rejects corrupt restored bodies, hashes, record counts, and array prefixes', async () => {
+    const fixture = [{ ordinal: 0, fanout: 0 }] as const;
+
+    const bodyStore = new MemoryStore();
+    const bodySequence = (await write(bodyStore, 1, fixture)).sequence;
+    const bodyReference = bodySequence.chunks[0];
+    if (bodyReference === undefined) throw new Error('missing body corruption fixture');
+    const bodyItem = bodyStore.records.get(bodyReference.logicalKey);
+    if (bodyItem === undefined) throw new Error('missing body corruption bytes');
+    bodyStore.validateBodyOnHead = false;
+    const digit = bodyItem.bytes.indexOf(48);
+    if (digit < 0) throw new Error('missing mutable body digit');
+    bodyItem.bytes[digit] = 1 + (bodyItem.bytes[digit] ?? 0);
+    const bodyWriter = new CanonicalChunkWriter<(typeof fixture)[number]>({
+      store: bodyStore,
+      logicalPrefix: 'run/source/normalize/chunks',
+      visibility: 'public',
+      licenseSnapshotRef: 'sc:license:test',
+      budget: createSharedRecordBudget(1),
+      signal: new AbortController().signal,
+      maximumRecordsPerChunk: 1,
+      restoredChunks: bodySequence.chunks,
+      onChunk: () => Promise.resolve(),
+    });
+    await expect(collect(bodyWriter.restoreAndRead())).rejects.toBeInstanceOf(ChunkIntegrityError);
+
+    const hashStore = new MemoryStore();
+    const hashSequence = (await write(hashStore, 1, fixture)).sequence;
+    const hashReference = hashSequence.chunks[0];
+    if (hashReference === undefined) throw new Error('missing hash corruption fixture');
+    const hashWriter = new CanonicalChunkWriter<(typeof fixture)[number]>({
+      store: hashStore,
+      logicalPrefix: 'run/source/normalize/chunks',
+      visibility: 'public',
+      licenseSnapshotRef: 'sc:license:test',
+      budget: createSharedRecordBudget(1),
+      signal: new AbortController().signal,
+      maximumRecordsPerChunk: 1,
+      restoredChunks: [Object.freeze({ ...hashReference, sha256: '0'.repeat(64) })],
+      onChunk: () => Promise.resolve(),
+    });
+    await expect(collect(hashWriter.restoreAndRead())).rejects.toBeInstanceOf(ChunkIntegrityError);
+
+    const countStore = new MemoryStore();
+    const countSequence = (await write(countStore, 1, fixture)).sequence;
+    const countReference = countSequence.chunks[0];
+    if (countReference === undefined) throw new Error('missing count corruption fixture');
+    const countItem = countStore.records.get(countReference.logicalKey);
+    if (countItem === undefined) throw new Error('missing count corruption record');
+    countStore.records.set(countReference.logicalKey, {
+      bytes: countItem.bytes,
+      stored: Object.freeze({
+        ...countItem.stored,
+        metadata: Object.freeze({
+          ...countItem.stored.metadata,
+          lastOrdinal: '1',
+          recordCount: '2',
+        }),
+      }),
+    });
+    const countWriter = new CanonicalChunkWriter<(typeof fixture)[number]>({
+      store: countStore,
+      logicalPrefix: 'run/source/normalize/chunks',
+      visibility: 'public',
+      licenseSnapshotRef: 'sc:license:test',
+      budget: createSharedRecordBudget(1),
+      signal: new AbortController().signal,
+      maximumRecordsPerChunk: 1,
+      restoredChunks: [Object.freeze({ ...countReference, lastOrdinal: 1, recordCount: 2 })],
+      onChunk: () => Promise.resolve(),
+    });
+    await expect(collect(countWriter.restoreAndRead())).rejects.toBeInstanceOf(ChunkIntegrityError);
+
+    const prefixWriter = new CanonicalChunkWriter<(typeof fixture)[number]>({
+      store: countStore,
+      logicalPrefix: 'run/substituted/normalize/chunks',
+      visibility: 'public',
+      licenseSnapshotRef: 'sc:license:test',
+      budget: createSharedRecordBudget(1),
+      signal: new AbortController().signal,
+      maximumRecordsPerChunk: 1,
+      restoredChunks: countSequence.chunks,
+      onChunk: () => Promise.resolve(),
+    });
+    await expect(collect(prefixWriter.restoreAndRead())).rejects.toBeInstanceOf(
+      ChunkIntegrityError,
+    );
+  });
+
+  it('closes restored body iterators on abort and early return and invalidates the writer', async () => {
+    const fixture = [
+      { ordinal: 0, fanout: 0 },
+      { ordinal: 1, fanout: 1 },
+    ] as const;
+    const createResumed = async () => {
+      const store = new MemoryStore();
+      const sequence = (await write(store, 2, fixture)).sequence;
+      const controller = new AbortController();
+      const writer = new CanonicalChunkWriter<(typeof fixture)[number]>({
+        store,
+        logicalPrefix: 'run/source/normalize/chunks',
+        visibility: 'public',
+        licenseSnapshotRef: 'sc:license:test',
+        budget: createSharedRecordBudget(2),
+        signal: controller.signal,
+        maximumRecordsPerChunk: 2,
+        restoredChunks: sequence.chunks,
+        onChunk: () => Promise.resolve(),
+      });
+      return { controller, store, writer };
+    };
+
+    const aborted = await createResumed();
+    const abortedValues = aborted.writer.restoreAndRead();
+    const abortedIterator = abortedValues[Symbol.asyncIterator]();
+    expect(await abortedIterator.next()).toMatchObject({ done: false, value: fixture[0] });
+    aborted.controller.abort();
+    await expect(abortedIterator.next()).rejects.toThrow();
+    expect(aborted.store.activeReads).toBe(0);
+    expect(aborted.store.finalizedReads).toBe(1);
+    await expect(aborted.writer.append(fixture[1])).rejects.toThrow('failed restore');
+    expect(() => abortedValues[Symbol.asyncIterator]()).toThrow('only be consumed once');
+    expect(() => aborted.writer.restoreAndRead()).toThrow('only be consumed once');
+
+    const returned = await createResumed();
+    const returnedIterator = returned.writer.restoreAndRead()[Symbol.asyncIterator]();
+    expect(await returnedIterator.next()).toMatchObject({ done: false, value: fixture[0] });
+    await returnedIterator.return?.();
+    expect(returned.store.activeReads).toBe(0);
+    expect(returned.store.finalizedReads).toBe(1);
+    await expect(returned.writer.finish()).rejects.toThrow('incomplete or failed restore');
+  });
+
+  it('supports an empty ledger and keeps restore backward compatible and one-shot', async () => {
+    const logicalPrefix = 'run/empty-ledger/normalize/events';
+    const store = new MemoryStore();
+    const budget = createSharedRecordBudget(1);
+    let checkpoint = emptyChunkLedger(logicalPrefix);
+    const writer = new CanonicalChunkWriter<Readonly<{ ordinal: number }>>({
+      store,
+      logicalPrefix,
+      visibility: 'public',
+      licenseSnapshotRef: 'sc:license:test',
+      budget,
+      signal: new AbortController().signal,
+      maximumRecordsPerChunk: 1,
+      restoredLedger: checkpoint,
+      onLedger: (ledger) => {
+        checkpoint = ledger;
+        return Promise.resolve();
+      },
+    });
+    expect(await collect(writer.restoreAndRead())).toEqual([]);
+    expect(() => writer.restoreAndRead()).toThrow('only be consumed once');
+    await writer.append({ ordinal: 0 });
+    const complete = await writer.finish();
+    expect(complete.recordCount).toBe(1);
+    expect(await collect(complete.read())).toEqual([{ ordinal: 0 }]);
+    expect(checkpoint.totalRecords).toBe(1);
+    await expect(writer.append({ ordinal: 1 })).rejects.toThrow('already finished');
+    await expect(writer.flush()).rejects.toThrow('already finished');
+    await expect(writer.finish()).rejects.toThrow('already finished');
+    expect(budget.metrics().inUse).toBe(0);
+
+    const legacy = new CanonicalChunkWriter<Readonly<{ ordinal: number }>>({
+      store: new MemoryStore(),
+      logicalPrefix: 'run/legacy-empty/normalize/events',
+      visibility: 'public',
+      licenseSnapshotRef: 'sc:license:test',
+      budget: createSharedRecordBudget(1),
+      signal: new AbortController().signal,
+      maximumRecordsPerChunk: 1,
+      restoredChunks: [],
+      onChunk: () => Promise.resolve(),
+    });
+    await legacy.restore();
+    await expect(legacy.restore()).rejects.toThrow('only be consumed once');
   });
 
   it('retries safely before write, after write before checkpoint, and after checkpoint', async () => {
