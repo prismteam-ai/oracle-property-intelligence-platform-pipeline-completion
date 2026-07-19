@@ -3,7 +3,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join, relative, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { DuckDBInstance } from '@duckdb/node-api';
@@ -25,12 +25,13 @@ import {
 } from '@oracle/canonical-model/normalizers/geospatial';
 import { testContext } from '@oracle/canonical-model/normalizers/test-context.test-support';
 import { createSharedRecordBudget } from '@oracle/source-adapters/spi/record-budget';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { canonicalJson } from './canonical-json.js';
 import { readJsonArtifact } from './artifacts.js';
 import {
   boundedCandidateAddressNumber,
+  boundedDuckDbTemporaryDirectory,
   createBoundedPipelineProcessors,
   normalizeBoundedIndexValue,
 } from './bounded-processors.js';
@@ -65,6 +66,25 @@ const DISCOVER_ONLY_SNAPSHOT_ID = snapshotIdSchema.parse(
 const FAILED_APN = '999-99-999';
 
 describe('bounded_streaming_v2 pipeline composition', () => {
+  it('keeps exact-generation DuckDB spill storage shallow and isolated', () => {
+    const scratchRoot = resolve('a-deliberately-long-assessment-workspace', 'bounded-processing');
+    const generationA = `sc:bounded-generation:${'a'.repeat(64)}`;
+    const generationB = `sc:bounded-generation:${'b'.repeat(64)}`;
+    const first = boundedDuckDbTemporaryDirectory(scratchRoot, RUN_ID, generationA);
+
+    expect(relative(scratchRoot, first)).toBe(basename(first));
+    expect(basename(first)).toMatch(/^\.t-[a-f0-9]{64}$/u);
+    expect(boundedDuckDbTemporaryDirectory(scratchRoot, RUN_ID, generationA)).toBe(first);
+    expect(boundedDuckDbTemporaryDirectory(scratchRoot, RUN_ID, generationB)).not.toBe(first);
+    expect(
+      boundedDuckDbTemporaryDirectory(
+        scratchRoot,
+        runIdSchema.parse(`sc:run:${'4'.repeat(64)}`),
+        generationA,
+      ),
+    ).not.toBe(first);
+  });
+
   it('freezes Unicode, whitespace, locale, and address-number index normalization', () => {
     expect(normalizeBoundedIndexValue('  ＭＡＩＮ\t  STRASSE  ')).toBe('main strasse');
     expect(boundedCandidateAddressNumber(' １２３Ａ  Main Street ')).toBe('123a');
@@ -73,6 +93,9 @@ describe('bounded_streaming_v2 pipeline composition', () => {
 
   it('runs canonical, reconciliation, feature, and portable release stages through opaque artifact URIs without row arrays', async () => {
     const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-pipeline-'));
+    const longScratchDirectory = join(root, 's'.repeat(Math.max(1, 129 - root.length - 1)));
+    const scratchDirectory = join(root, 'scratch');
+    expect(longScratchDirectory.length).toBeGreaterThanOrEqual(129);
     const mutations = normalizePropertyRecord(
       {
         apn: '123-45-678',
@@ -202,10 +225,18 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       'before_finalize',
     ] as const;
     let crashIndex = 0;
-    const createProcessor = () =>
+    const expectNoSpillDirectories = async (directory = scratchDirectory) => {
+      const entries = await readdir(directory, {
+        withFileTypes: true,
+      });
+      expect(
+        entries.filter((entry) => entry.isDirectory() && /^\.t-[a-f0-9]{64}$/u.test(entry.name)),
+      ).toEqual([]);
+    };
+    const createProcessor = (processorScratchDirectory = scratchDirectory) =>
       createBoundedPipelineProcessors({
         outputDirectory: join(root, 'output'),
-        scratchDirectory: join(root, 'scratch'),
+        scratchDirectory: processorScratchDirectory,
         partitionCount: 16,
         budget: {
           policyVersion: 'bounded-process-budget-v1',
@@ -416,20 +447,40 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       { stdio: ['ignore', 'pipe', 'pipe'] },
     );
     await once(separateLeaseHolder.stdout, 'data');
+    const observedTemporaryDirectories: string[] = [];
+    const createDuckDatabase = DuckDBInstance.create.bind(DuckDBInstance);
+    const createSpy = vi.spyOn(DuckDBInstance, 'create').mockImplementation((path, options) => {
+      const temporaryDirectory = (options as Readonly<Record<string, string>> | undefined)
+        ?.temp_directory;
+      if (temporaryDirectory !== undefined) observedTemporaryDirectories.push(temporaryDirectory);
+      return createDuckDatabase(path, options);
+    });
     try {
-      await expect(createProcessor().processBoundedCounty?.(request)).rejects.toThrow(
-        `injected ${crashPoints[0]} crash`,
-      );
+      await expect(
+        createProcessor(longScratchDirectory).processBoundedCounty?.(request),
+      ).rejects.toThrow(`injected ${crashPoints[0]} crash`);
     } finally {
+      createSpy.mockRestore();
       separateLeaseHolder.kill();
       await once(separateLeaseHolder, 'exit');
     }
+    expect(observedTemporaryDirectories).toHaveLength(1);
+    const observedTemporaryDirectory = observedTemporaryDirectories[0] as string;
+    expect(relative(longScratchDirectory, observedTemporaryDirectory)).toBe(
+      basename(observedTemporaryDirectory),
+    );
+    expect(
+      join(observedTemporaryDirectory, 'duckdb_temp_storage_DEFAULT-0.tmp').length,
+    ).toBeLessThan(260);
+    await expectNoSpillDirectories(longScratchDirectory);
     for (const point of crashPoints.slice(1)) {
       await expect(createProcessor().processBoundedCounty?.(request)).rejects.toThrow(
         `injected ${point} crash`,
       );
+      await expectNoSpillDirectories();
     }
     const first = await createProcessor().processBoundedCounty?.(request);
+    await expectNoSpillDirectories();
     expect(first).toMatchObject({ countyCompletionClaim: false });
     expect(first?.reconcileArtifact.byteSize).toBeLessThan(64 * 1024);
     expect(first?.featureArtifact.byteSize).toBeLessThan(64 * 1024);
@@ -726,6 +777,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     }
 
     const resumed = await createProcessor().processBoundedCounty?.(request);
+    await expectNoSpillDirectories();
     expect(resumed?.reconcileArtifact.sha256).toBe(first.reconcileArtifact.sha256);
     expect(resumed?.martArtifact.sha256).toBe(first.martArtifact.sha256);
 
@@ -744,6 +796,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
         },
       ],
     });
+    await expectNoSpillDirectories();
     if (changedGeneration === undefined) throw new Error('changed generation did not complete');
     const changedDescriptor = (await readJsonArtifact(
       artifactStore,
@@ -752,7 +805,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     expect(changedDescriptor.generationId).not.toBe(descriptor.generationId);
     expect(changedDescriptor.releaseDirectory).not.toBe(descriptor.releaseDirectory);
     const generationDirectories = (
-      await readdir(join(root, 'scratch', createHash('sha256').update(RUN_ID).digest('hex')), {
+      await readdir(join(scratchDirectory, createHash('sha256').update(RUN_ID).digest('hex')), {
         withFileTypes: true,
       })
     )

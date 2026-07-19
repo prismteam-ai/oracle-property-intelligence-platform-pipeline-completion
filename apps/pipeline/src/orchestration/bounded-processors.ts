@@ -335,9 +335,18 @@ async function processBoundedCounty(
       const confined = confinedChild(runRoot, generationPath(processing.generationId));
       await mkdir(confined, { recursive: true });
       const databasePath = join(confined, 'bounded-county.duckdb');
-      const instance = await openDuckDatabase(databasePath, confined, options.budget);
-      const connection = await instance.connect();
+      const temporaryDirectory = boundedDuckDbTemporaryDirectory(
+        options.scratchRoot,
+        request.configuration.runId,
+        processing.generationId,
+      );
+      let instance: DuckDBInstance | undefined;
+      let connection: DuckDBConnection | undefined;
       try {
+        await removeDuckDbTemporaryDirectory(temporaryDirectory);
+        await mkdir(temporaryDirectory, { recursive: true });
+        instance = await openDuckDatabase(databasePath, temporaryDirectory, options.budget);
+        connection = await instance.connect();
         await initializeDatabase(connection);
         await bindGeneration(connection, processing, runLease.token);
         await ingestMutations(connection, releaseContentRequest, processing);
@@ -504,8 +513,15 @@ async function processBoundedCounty(
           countyCompletionClaim: mart.evidence.countyCompletionClaim,
         });
       } finally {
-        connection.closeSync();
-        instance.closeSync();
+        try {
+          connection?.closeSync();
+        } finally {
+          try {
+            instance?.closeSync();
+          } finally {
+            await removeDuckDbTemporaryDirectory(temporaryDirectory);
+          }
+        }
       }
     } finally {
       await runLease.release();
@@ -6943,6 +6959,31 @@ function generationPath(generationId: string): string {
     throw new BoundedPipelineIntegrityError('Generation identifier is not path-safe');
   }
   return value.slice(0, 32);
+}
+
+export function boundedDuckDbTemporaryDirectory(
+  scratchRoot: string,
+  runId: string,
+  generationId: string,
+): string {
+  generationPath(generationId);
+  return confinedChild(
+    scratchRoot,
+    `.t-${sha256({
+      contractVersion: 'oracle-bounded-duckdb-temporary-directory-v1',
+      generationId,
+      runId,
+    })}`,
+  );
+}
+
+async function removeDuckDbTemporaryDirectory(path: string): Promise<void> {
+  await rm(path, {
+    force: true,
+    maxRetries: process.platform === 'win32' ? 5 : 0,
+    recursive: true,
+    retryDelay: 50,
+  });
 }
 
 function confinedChild(root: string, child: string): string {
