@@ -825,6 +825,62 @@ describe('streaming runner restart and budget contracts', () => {
     ).rejects.toBe(failure);
   });
 
+  it('recomputes unbound downstream artifacts when an incomplete run resumes', async () => {
+    const store = await stores('downstream-source-state-invalidation');
+    let reconcileCalls = 0;
+    let buildMartsCalls = 0;
+    const processors: PipelineProcessors = {
+      memoryProfile: 'bounded_streaming_v2',
+      reconcile: async (mutations) => {
+        reconcileCalls += 1;
+        let mutationCount = 0;
+        for await (const mutation of mutations.read()) {
+          void mutation;
+          mutationCount += 1;
+        }
+        return { canonical: { mutationCount }, links: [] };
+      },
+      deriveFeatures: (reconciled) => Promise.resolve({ reconciled }),
+      buildMarts: (features) => {
+        buildMartsCalls += 1;
+        if (buildMartsCalls === 1) {
+          return Promise.reject(new Error('first mart build intentionally failed'));
+        }
+        return Promise.resolve({ features, buildMartsCalls });
+      },
+    };
+
+    const firstController = new AbortController();
+    const firstAdapter = new GeneratedAdapter(
+      'downstream-source-state-invalidation',
+      firstController,
+      counters(),
+      { normalizeFanout: 0 },
+    );
+    const config = configuration('5'.repeat(64), [source(firstAdapter)]);
+    await expect(
+      runPipeline(config, {
+        ...dependencies(store, firstController),
+        processors,
+      }),
+    ).rejects.toThrow('first mart build intentionally failed');
+    expect(reconcileCalls).toBe(1);
+
+    const resumedController = new AbortController();
+    const resumedAdapter = new GeneratedAdapter(
+      'downstream-source-state-invalidation',
+      resumedController,
+      counters(),
+      { normalizeFanout: 0 },
+    );
+    await runPipeline(configuration('5'.repeat(64), [source(resumedAdapter)]), {
+      ...dependencies(store, resumedController),
+      processors,
+    });
+    expect(reconcileCalls).toBe(2);
+    expect(buildMartsCalls).toBe(2);
+  });
+
   it('releases a pre-transfer oversized event lease so another source can progress', async () => {
     const store = await stores('oversized-event-lease');
     const controller = new AbortController();

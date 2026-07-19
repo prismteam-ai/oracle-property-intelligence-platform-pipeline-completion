@@ -66,7 +66,6 @@ import {
   type PipelineConfiguration,
   type PipelineResult,
   type PipelineRunManifest,
-  type ReconciliationOutput,
   type SourceConfiguration,
   type SourceCoverage,
   type SourceExecutionManifest,
@@ -2233,6 +2232,21 @@ export async function runPipeline(
   let reconcileArtifact = run.state.reconcileArtifact;
   let featureArtifact = run.state.featureArtifact;
   let martArtifact = run.state.martArtifact;
+  if (reconcileArtifact !== null || featureArtifact !== null || martArtifact !== null) {
+    // Outer downstream descriptors predate a persisted source-input binding. Until a final
+    // manifest closes the run, retaining any of them can combine newly resumed source ledgers
+    // with stale reconcile/feature state. Content-addressed bounded stages still resume through
+    // their generation-scoped internal checkpoints after these unbound outer pointers are reset.
+    reconcileArtifact = null;
+    featureArtifact = null;
+    martArtifact = null;
+    await coordinator.updateRun({
+      reconcileArtifact,
+      featureArtifact,
+      martArtifact,
+      completedPhase: null,
+    });
+  }
   let boundedCountyCompletionClaim: boolean | null = null;
   const processorSourceManifests = Object.freeze(sourceResults.map(({ manifest }) => manifest));
   if (
@@ -2298,78 +2312,68 @@ export async function runPipeline(
       const allMutations = await combineChunkSequences(
         sourceResults.map(({ mutations }) => mutations),
       );
-      let reconciled: ReconciliationOutput;
-      if (reconcileArtifact === null) {
-        const phase = await timedPhase(
-          'reconcile',
-          null,
-          dependencies,
-          configuration.maximumPhaseAttempts,
-          () => dependencies.processors.reconcile(allMutations, dependencies.signal),
-        );
-        reconcileArtifact = await writeJsonArtifact({
-          store: dependencies.artifactStore,
-          runId: configuration.runId,
-          owner: 'pipeline',
-          phase: 'reconcile',
-          value: phase.value,
-        });
-        await coordinator.updateRun({ reconcileArtifact, completedPhase: 'reconcile' });
-        reconciled = phase.value;
-      } else reconciled = await loadRequired(dependencies, reconcileArtifact, 'reconciliation');
+      const reconcilePhase = await timedPhase(
+        'reconcile',
+        null,
+        dependencies,
+        configuration.maximumPhaseAttempts,
+        () => dependencies.processors.reconcile(allMutations, dependencies.signal),
+      );
+      reconcileArtifact = await writeJsonArtifact({
+        store: dependencies.artifactStore,
+        runId: configuration.runId,
+        owner: 'pipeline',
+        phase: 'reconcile',
+        value: reconcilePhase.value,
+      });
+      await coordinator.updateRun({ reconcileArtifact, completedPhase: 'reconcile' });
 
-      let features: unknown;
-      if (featureArtifact === null) {
-        const phase = await timedPhase(
-          'derive_features',
-          null,
-          dependencies,
-          configuration.maximumPhaseAttempts,
-          () => dependencies.processors.deriveFeatures(reconciled, dependencies.signal),
-        );
-        featureArtifact = await writeJsonArtifact({
-          store: dependencies.artifactStore,
-          runId: configuration.runId,
-          owner: 'pipeline',
-          phase: 'derive_features',
-          value: phase.value,
-        });
-        await coordinator.updateRun({ featureArtifact, completedPhase: 'derive_features' });
-        features = phase.value;
-      } else features = await loadRequired(dependencies, featureArtifact, 'features');
+      const featurePhase = await timedPhase(
+        'derive_features',
+        null,
+        dependencies,
+        configuration.maximumPhaseAttempts,
+        () => dependencies.processors.deriveFeatures(reconcilePhase.value, dependencies.signal),
+      );
+      featureArtifact = await writeJsonArtifact({
+        store: dependencies.artifactStore,
+        runId: configuration.runId,
+        owner: 'pipeline',
+        phase: 'derive_features',
+        value: featurePhase.value,
+      });
+      await coordinator.updateRun({ featureArtifact, completedPhase: 'derive_features' });
 
-      if (martArtifact === null) {
-        const phase = await timedPhase(
-          'build_marts',
-          null,
-          dependencies,
-          configuration.maximumPhaseAttempts,
-          () =>
-            dependencies.processors.buildMarts(
-              {
-                reconciled,
-                features,
-                run: Object.freeze({
-                  runId: configuration.runId,
-                  pipelineVersion: configuration.pipelineVersion,
-                  profile: configuration.profile.name,
-                  requestedAt: configuration.requestedAt,
-                  completedAt: dependencies.clock.now(),
-                }),
-                sources: processorSourceManifests,
-              },
-              dependencies.signal,
-            ),
-        );
-        martArtifact = await writeJsonArtifact({
-          store: dependencies.artifactStore,
-          runId: configuration.runId,
-          owner: 'pipeline',
-          phase: 'build_marts',
-          value: phase.value,
-        });
-        await coordinator.updateRun({ martArtifact, completedPhase: 'build_marts' });
-      }
+      const martPhase = await timedPhase(
+        'build_marts',
+        null,
+        dependencies,
+        configuration.maximumPhaseAttempts,
+        () =>
+          dependencies.processors.buildMarts(
+            {
+              reconciled: reconcilePhase.value,
+              features: featurePhase.value,
+              run: Object.freeze({
+                runId: configuration.runId,
+                pipelineVersion: configuration.pipelineVersion,
+                profile: configuration.profile.name,
+                requestedAt: configuration.requestedAt,
+                completedAt: dependencies.clock.now(),
+              }),
+              sources: processorSourceManifests,
+            },
+            dependencies.signal,
+          ),
+      );
+      martArtifact = await writeJsonArtifact({
+        store: dependencies.artifactStore,
+        runId: configuration.runId,
+        owner: 'pipeline',
+        phase: 'build_marts',
+        value: martPhase.value,
+      });
+      await coordinator.updateRun({ martArtifact, completedPhase: 'build_marts' });
     }
   }
 
