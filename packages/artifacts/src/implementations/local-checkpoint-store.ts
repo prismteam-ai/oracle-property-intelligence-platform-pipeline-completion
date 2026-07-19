@@ -11,7 +11,7 @@ import {
   type CheckpointStore,
   type CheckpointValue,
 } from '../checkpoint-store.js';
-import { canonicalJson, promoteAtomically } from './internal.js';
+import { canonicalJson, cleanupWithoutMaskingFailure, promoteAtomically } from './internal.js';
 
 export class LocalCheckpointStore implements CheckpointStore {
   readonly #root: string;
@@ -65,22 +65,17 @@ export class LocalCheckpointStore implements CheckpointStore {
         promotionFailed = true;
         throw error;
       } finally {
-        try {
-          await rm(temporary, { force: true });
-        } catch (cleanupError) {
-          if (!promotionFailed) throw cleanupError;
-        }
+        await cleanupWithoutMaskingFailure(() => rm(temporary, { force: true }), promotionFailed);
       }
       return { status: 'committed', checkpoint: request.checkpoint };
     } catch (error) {
       commitFailed = true;
       throw error;
     } finally {
-      try {
-        await rm(lockPath, { recursive: true, force: true });
-      } catch (cleanupError) {
-        if (!commitFailed) throw cleanupError;
-      }
+      await cleanupWithoutMaskingFailure(
+        () => rm(lockPath, { recursive: true, force: true }),
+        commitFailed,
+      );
     }
   }
 

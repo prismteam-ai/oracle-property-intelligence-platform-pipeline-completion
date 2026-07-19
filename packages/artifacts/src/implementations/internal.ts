@@ -63,6 +63,17 @@ function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+export async function cleanupWithoutMaskingFailure(
+  cleanup: () => Promise<void>,
+  priorOperationFailed: boolean,
+): Promise<void> {
+  try {
+    await cleanup();
+  } catch (error) {
+    if (!priorOperationFailed) throw error;
+  }
+}
+
 export function canonicalJson(value: unknown): string {
   if (value === null || typeof value === 'boolean' || typeof value === 'string') {
     return JSON.stringify(value);

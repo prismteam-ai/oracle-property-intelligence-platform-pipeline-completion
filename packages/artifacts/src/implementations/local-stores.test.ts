@@ -8,7 +8,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 
 import { AtomicPromotionExhaustedError } from '../artifact-store.js';
 import { createCheckpointEnvelope } from '../checkpoint-store.js';
-import { ImmutableArtifactConflictError, promoteAtomically } from './internal.js';
+import {
+  cleanupWithoutMaskingFailure,
+  ImmutableArtifactConflictError,
+  promoteAtomically,
+} from './internal.js';
 import { LocalArtifactStore } from './local-artifact-store.js';
 import { LocalCheckpointStore } from './local-checkpoint-store.js';
 
@@ -266,6 +270,14 @@ describe('LocalCheckpointStore', () => {
 });
 
 describe('atomic local promotion retry', () => {
+  it('reports cleanup failure only when there is no earlier operation failure', async () => {
+    const cleanupFailure = new Error('cleanup failed');
+    const cleanup = () => Promise.reject(cleanupFailure);
+
+    await expect(cleanupWithoutMaskingFailure(cleanup, false)).rejects.toBe(cleanupFailure);
+    await expect(cleanupWithoutMaskingFailure(cleanup, true)).resolves.toBeUndefined();
+  });
+
   it.each(['EACCES', 'EBUSY', 'EPERM'])('retries transient Windows %s failures', async (code) => {
     let calls = 0;
     const delays: number[] = [];

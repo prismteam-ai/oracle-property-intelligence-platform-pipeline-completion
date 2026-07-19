@@ -19,6 +19,7 @@ import {
   ImmutableArtifactConflictError,
   assertLogicalKey,
   canonicalJson,
+  cleanupWithoutMaskingFailure,
   cloneMetadata,
   consumeBody,
   promoteAtomically,
@@ -94,11 +95,10 @@ export class LocalArtifactStore implements RecoverableArtifactStore {
       throw error;
     } finally {
       if (!output.closed) output.destroy();
-      try {
-        await rm(temporary, { recursive: true, force: true });
-      } catch (cleanupError) {
-        if (!operationFailed) throw cleanupError;
-      }
+      await cleanupWithoutMaskingFailure(
+        () => rm(temporary, { recursive: true, force: true }),
+        operationFailed,
+      );
     }
   }
 
