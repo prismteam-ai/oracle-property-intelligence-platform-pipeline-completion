@@ -276,6 +276,46 @@ describe('streaming Caltrain GTFS CSV normalization', () => {
           }),
         ]),
       );
+      const service = mutations.find(
+        (mutation) =>
+          mutation.kind === 'entity_upsert' && mutation.entity.entityKind === 'transit-service',
+      );
+      const stop = mutations.find(
+        (mutation) =>
+          mutation.kind === 'entity_upsert' && mutation.entity.entityKind === 'transit-stop',
+      );
+      if (service?.kind !== 'entity_upsert' || stop?.kind !== 'entity_upsert') {
+        throw new Error('Expected canonical transit entities');
+      }
+      const pathsFor = (entityId: string): readonly string[] =>
+        mutations.flatMap((mutation) =>
+          mutation.kind === 'field_observation' && mutation.observation.entityId === entityId
+            ? [mutation.observation.fieldPath]
+            : [],
+        );
+      expect(pathsFor(service.entity.id)).toEqual([
+        '/agencyId',
+        '/routeId',
+        '/mode',
+        '/serviceStartDate',
+        '/serviceEndDate',
+      ]);
+      expect(pathsFor(stop.entity.id)).toEqual([
+        '/agencyId',
+        '/stopCode',
+        '/name',
+        '/location',
+        '/parentStopId',
+        '/boardable',
+        '/serviceIds',
+      ]);
+      expect(
+        mutations
+          .filter((mutation) => mutation.kind === 'field_observation')
+          .every(({ observation }) =>
+            observation.lineage.transformations.every(({ version }) => version === '1.1.0'),
+          ),
+      ).toBe(true);
     } finally {
       await rm(fixture.root, { force: true, recursive: true });
     }
@@ -608,7 +648,7 @@ describe('streaming Caltrain GTFS CSV normalization', () => {
     );
     try {
       const mutations = await collectMutations(fixture);
-      expect(mutations).toHaveLength(serviceCount + stopCount);
+      expect(mutations).toHaveLength(serviceCount * 6 + stopCount * 8);
       expect(new Set(mutations.map(({ mutationId }) => mutationId)).size).toBe(mutations.length);
       expect(mutations.map(({ sequence }) => sequence)).toEqual(
         Array.from({ length: mutations.length }, (_, index) => index),
@@ -658,7 +698,7 @@ describe('streaming Caltrain GTFS CSV normalization', () => {
         const stopPages = Math.ceil(stopCount / REVIEWED_STOP_PAGE_ROWS);
         const stopTimePages = stopPages;
         const expectedExecutions = tripPages + stopPages + stopTimePages;
-        expect(mutations).toHaveLength(serviceCount + stopCount);
+        expect(mutations).toHaveLength(serviceCount * 6 + stopCount * 8);
         expect(fixture.stats.executions).toBe(expectedExecutions);
         expect(fixture.stats.executions).toBeLessThan(stopCount);
         expect(fixture.stats.scannedBytes).toBe(

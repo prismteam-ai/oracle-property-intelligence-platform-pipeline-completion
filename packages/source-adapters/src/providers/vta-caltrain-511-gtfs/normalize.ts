@@ -17,6 +17,8 @@ import type {
   ValidatedGtfsFeed,
 } from './types.js';
 
+const GTFS_TRANSFORM_VERSION = '1.1.0';
+
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
 }
@@ -209,8 +211,8 @@ function entityLineage(
     },
     transformations: [
       {
-        name: 'normalize-gtfs-transit-v1',
-        version: '1.0.0',
+        name: 'normalize-gtfs-transit',
+        version: GTFS_TRANSFORM_VERSION,
         appliedAt: config.retrievedAt,
         inputSha256,
         outputSha256,
@@ -218,6 +220,53 @@ function entityLineage(
     ],
   };
   return { ...base, lineageSha256: sha256(stableJson(base)) };
+}
+
+function fieldObservationMutations(
+  feed: ValidatedGtfsFeed,
+  config: TransitFeedSnapshotConfig,
+  snapshotId: string,
+  runId: string,
+  entityId: string,
+  entityKind: 'transit-service' | 'transit-stop',
+  recordKey: string,
+  input: unknown,
+  values: Readonly<Record<string, unknown>>,
+  firstSequence: number,
+): readonly CanonicalMutation[] {
+  const sourceAsOf = config.sourceAsOf.state === 'unknown' ? null : config.sourceAsOf.at;
+  return Object.freeze(
+    Object.entries(values).map(([field, value], index) => {
+      const fieldPath = `/${field}`;
+      return canonicalMutationSchema.parse({
+        kind: 'field_observation',
+        mutationId: `sc:mutation:${sha256(
+          `${feed.artifactId}|${entityKind}|${entityId}|${fieldPath}|${GTFS_TRANSFORM_VERSION}`,
+        )}`,
+        runId,
+        sourceId: config.sourceId,
+        snapshotId,
+        sequence: firstSequence + index,
+        emittedAt: config.retrievedAt,
+        visibility: config.visibility,
+        observation: {
+          observationId: `sc:observation:${sha256(
+            `${snapshotId}|${feed.artifactId}|${recordKey}|${entityId}|${fieldPath}|${GTFS_TRANSFORM_VERSION}`,
+          )}`,
+          entityId,
+          entityKind,
+          fieldPath,
+          value,
+          observedAt: sourceAsOf ?? config.retrievedAt,
+          sourceAsOf,
+          authorityRank: config.role === 'operator_primary' ? 1 : 20,
+          confidence: 1,
+          visibility: config.visibility,
+          lineage: entityLineage(feed, config, recordKey, input, value),
+        },
+      });
+    }),
+  );
 }
 
 function routeMode(routeType: string | undefined): TransitService['mode'] {
@@ -239,7 +288,9 @@ export function createCanonicalTransitMutations(
   );
   const mutations: CanonicalMutation[] = [];
   let sequence = 0;
-  const runId = `sc:run:${sha256(`${config.sourceId}|${feed.bytes.sha256}|${config.selectedServiceDate}`)}`;
+  const runId = `sc:run:${sha256(
+    `${config.sourceId}|${feed.bytes.sha256}|${config.selectedServiceDate}|${GTFS_TRANSFORM_VERSION}`,
+  )}`;
   const snapshotId = `sc:snapshot:${config.sourceId.replace('sc:source:', '')}:${feed.bytes.sha256}`;
 
   for (const trip of snapshot.trips) {
@@ -272,6 +323,11 @@ export function createCanonicalTransitMutations(
           ? config.selectedServiceDate
           : parseGtfsDate(calendar['end_date'] ?? ''),
     };
+    const sourceInput = {
+      trip,
+      calendar: calendar ?? null,
+      selectedAddition: selectedAddition ?? null,
+    };
     const entity = {
       id: entityId,
       entityKind: 'transit-service' as const,
@@ -282,20 +338,16 @@ export function createCanonicalTransitMutations(
       visibility: config.visibility,
       sourceIds: [config.sourceId],
       lineage: [
-        entityLineage(
-          feed,
-          config,
-          `trips.txt:${trip['trip_id'] ?? ''}`,
-          { trip, calendar: calendar ?? null, selectedAddition: selectedAddition ?? null },
-          core,
-        ),
+        entityLineage(feed, config, `trips.txt:${trip['trip_id'] ?? ''}`, sourceInput, core),
       ],
       ...core,
     };
     mutations.push(
       canonicalMutationSchema.parse({
         kind: 'entity_upsert',
-        mutationId: `sc:mutation:${sha256(`${feed.artifactId}|service|${entityId}`)}`,
+        mutationId: `sc:mutation:${sha256(
+          `${feed.artifactId}|service|${entityId}|${GTFS_TRANSFORM_VERSION}`,
+        )}`,
         runId,
         sourceId: config.sourceId,
         snapshotId,
@@ -305,6 +357,20 @@ export function createCanonicalTransitMutations(
         entity,
       }),
     );
+    const observations = fieldObservationMutations(
+      feed,
+      config,
+      snapshotId,
+      runId,
+      entityId,
+      'transit-service',
+      `trips.txt:${trip['trip_id'] ?? ''}`,
+      sourceInput,
+      core,
+      sequence,
+    );
+    mutations.push(...observations);
+    sequence += observations.length;
   }
 
   const emittedServicePairByTripId = new Map<string, string>();
@@ -358,7 +424,9 @@ export function createCanonicalTransitMutations(
     mutations.push(
       canonicalMutationSchema.parse({
         kind: 'entity_upsert',
-        mutationId: `sc:mutation:${sha256(`${feed.artifactId}|stop|${entityId}`)}`,
+        mutationId: `sc:mutation:${sha256(
+          `${feed.artifactId}|stop|${entityId}|${GTFS_TRANSFORM_VERSION}`,
+        )}`,
         runId,
         sourceId: config.sourceId,
         snapshotId,
@@ -368,6 +436,20 @@ export function createCanonicalTransitMutations(
         entity,
       }),
     );
+    const observations = fieldObservationMutations(
+      feed,
+      config,
+      snapshotId,
+      runId,
+      entityId,
+      'transit-stop',
+      `stops.txt:${stop.stopId}`,
+      stop,
+      core,
+      sequence,
+    );
+    mutations.push(...observations);
+    sequence += observations.length;
   }
 
   return Object.freeze(mutations);
@@ -530,7 +612,9 @@ export async function* createStreamingCanonicalTransitMutations(
     context.signal,
   );
   const baseFeed = streamingFeedBase(feed);
-  const runId = `sc:run:${sha256(`${config.sourceId}|${feed.bytes.sha256}|${config.selectedServiceDate}`)}`;
+  const runId = `sc:run:${sha256(
+    `${config.sourceId}|${feed.bytes.sha256}|${config.selectedServiceDate}|${GTFS_TRANSFORM_VERSION}`,
+  )}`;
   const snapshotId = `sc:snapshot:${config.sourceId.replace('sc:source:', '')}:${feed.bytes.sha256}`;
   let sequence = 0;
   try {
@@ -645,6 +729,11 @@ export async function* createStreamingCanonicalTransitMutations(
               ? config.selectedServiceDate
               : parseGtfsDate(calendar['end_date'] ?? ''),
         };
+        const sourceInput = {
+          trip,
+          calendar: calendar ?? null,
+          selectedAddition: selectedAddition ?? null,
+        };
         const entity = {
           id: entityId,
           entityKind: 'transit-service' as const,
@@ -659,7 +748,7 @@ export async function* createStreamingCanonicalTransitMutations(
               baseFeed,
               config,
               `trips.txt:${trip['trip_id'] ?? ''}`,
-              { trip, calendar: calendar ?? null, selectedAddition: selectedAddition ?? null },
+              sourceInput,
               core,
             ),
           ],
@@ -667,7 +756,9 @@ export async function* createStreamingCanonicalTransitMutations(
         };
         yield canonicalMutationSchema.parse({
           kind: 'entity_upsert',
-          mutationId: `sc:mutation:${sha256(`${feed.artifactId}|service|${entityId}`)}`,
+          mutationId: `sc:mutation:${sha256(
+            `${feed.artifactId}|service|${entityId}|${GTFS_TRANSFORM_VERSION}`,
+          )}`,
           runId,
           sourceId: config.sourceId,
           snapshotId,
@@ -676,6 +767,20 @@ export async function* createStreamingCanonicalTransitMutations(
           visibility: config.visibility,
           entity,
         });
+        const observations = fieldObservationMutations(
+          baseFeed,
+          config,
+          snapshotId,
+          runId,
+          entityId,
+          'transit-service',
+          `trips.txt:${trip['trip_id'] ?? ''}`,
+          sourceInput,
+          core,
+          sequence,
+        );
+        for (const observation of observations) yield observation;
+        sequence += observations.length;
       }
       if (!result.truncated) break;
     }
@@ -906,7 +1011,9 @@ export async function* createStreamingCanonicalTransitMutations(
           };
           yield canonicalMutationSchema.parse({
             kind: 'entity_upsert',
-            mutationId: `sc:mutation:${sha256(`${feed.artifactId}|stop|${entityId}`)}`,
+            mutationId: `sc:mutation:${sha256(
+              `${feed.artifactId}|stop|${entityId}|${GTFS_TRANSFORM_VERSION}`,
+            )}`,
             runId,
             sourceId: config.sourceId,
             snapshotId,
@@ -915,6 +1022,20 @@ export async function* createStreamingCanonicalTransitMutations(
             visibility: config.visibility,
             entity,
           });
+          const observations = fieldObservationMutations(
+            baseFeed,
+            config,
+            snapshotId,
+            runId,
+            entityId,
+            'transit-stop',
+            `stops.txt:${stopId}`,
+            normalizedStop,
+            core,
+            sequence,
+          );
+          for (const observation of observations) yield observation;
+          sequence += observations.length;
         }
         lastStopId = rowString(row, 'page_key');
       }
