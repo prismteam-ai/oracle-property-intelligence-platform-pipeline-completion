@@ -1,4 +1,8 @@
 import { runCheck } from './check.js';
+import {
+  runPublicClosureCommand,
+  type PublicClosureCommandOptions,
+} from './commands/build-public-serving-closure.js';
 import { runCommand } from './commands/run.js';
 import type { RunProfileName } from './orchestration/types.js';
 import { pathToFileURL } from 'node:url';
@@ -10,13 +14,74 @@ function option(arguments_: readonly string[], name: string): string | undefined
 
 function usage(): void {
   process.stderr.write(
-    'Usage: oracle-pipeline --check | <discovery|pilot|full|incremental> [--fixture] [--source-config <json>] [--requested-at <iso>] [--workspace <repo>] --output <directory>\n',
+    'Usage: oracle-pipeline --check | <discovery|pilot|full|incremental> [--fixture] [--source-config <json>] [--requested-at <iso>] [--workspace <repo>] --output <directory> | public-closure --run-root <root> --run-manifest <stdout-json> --authorization-policy <json> --private-key-file <pem> --output <directory>\n',
   );
+}
+
+export function parsePublicClosureArguments(
+  arguments_: readonly string[],
+): PublicClosureCommandOptions | undefined {
+  if (arguments_[0] !== 'public-closure' || arguments_.length !== 11) return undefined;
+  const values = new Map<string, string>();
+  const allowed = new Set([
+    '--run-root',
+    '--run-manifest',
+    '--authorization-policy',
+    '--private-key-file',
+    '--output',
+  ]);
+  for (let index = 1; index < arguments_.length; index += 2) {
+    const name = arguments_[index];
+    const value = arguments_[index + 1];
+    if (
+      name === undefined ||
+      value === undefined ||
+      !allowed.has(name) ||
+      values.has(name) ||
+      value.length === 0 ||
+      value.startsWith('--')
+    ) {
+      return undefined;
+    }
+    values.set(name, value);
+  }
+  const runRoot = values.get('--run-root');
+  const runManifestPath = values.get('--run-manifest');
+  const authorizationPolicyPath = values.get('--authorization-policy');
+  const privateKeyPath = values.get('--private-key-file');
+  const outputDirectory = values.get('--output');
+  if (
+    runRoot === undefined ||
+    runManifestPath === undefined ||
+    authorizationPolicyPath === undefined ||
+    privateKeyPath === undefined ||
+    outputDirectory === undefined
+  ) {
+    return undefined;
+  }
+  return Object.freeze({
+    runRoot,
+    runManifestPath,
+    authorizationPolicyPath,
+    privateKeyPath,
+    outputDirectory,
+  });
 }
 
 export async function main(arguments_: readonly string[]): Promise<number> {
   if (arguments_.length === 1 && arguments_[0] === '--check') {
     process.stdout.write(`${JSON.stringify(runCheck())}\n`);
+    return 0;
+  }
+
+  if (arguments_[0] === 'public-closure') {
+    const options = parsePublicClosureArguments(arguments_);
+    if (options === undefined) {
+      usage();
+      return 2;
+    }
+    const summary = await runPublicClosureCommand(options);
+    process.stdout.write(`${JSON.stringify(summary)}\n`);
     return 0;
   }
 
