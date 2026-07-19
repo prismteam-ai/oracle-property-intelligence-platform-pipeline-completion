@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { finished } from 'node:stream/promises';
@@ -21,6 +21,7 @@ import {
   canonicalJson,
   cloneMetadata,
   consumeBody,
+  promoteAtomically,
 } from './internal.js';
 
 type LocalRecord = StoredArtifact & Readonly<{ formatVersion: 1 }>;
@@ -51,6 +52,7 @@ export class LocalArtifactStore implements RecoverableArtifactStore {
     const temporary = await mkdtemp(join(dirname(target), '.oracle-artifact-'));
     const bodyPath = join(temporary, 'body');
     const output = createWriteStream(bodyPath, { flags: 'wx' });
+    let operationFailed = false;
     try {
       const measured = await consumeBody(request.body, async (chunk) => {
         if (!output.write(chunk))
@@ -78,16 +80,25 @@ export class LocalArtifactStore implements RecoverableArtifactStore {
         flag: 'wx',
       });
       try {
-        await rename(temporary, target);
+        await promoteAtomically(temporary, target, {
+          retryAllowed: async () => !(await this.#exists(target)),
+        });
       } catch (error) {
         if (await this.#exists(target))
           throw new ImmutableArtifactConflictError(request.logicalKey);
         throw error;
       }
       return stored;
+    } catch (error) {
+      operationFailed = true;
+      throw error;
     } finally {
       if (!output.closed) output.destroy();
-      await rm(temporary, { recursive: true, force: true });
+      try {
+        await rm(temporary, { recursive: true, force: true });
+      } catch (cleanupError) {
+        if (!operationFailed) throw cleanupError;
+      }
     }
   }
 

@@ -47,6 +47,21 @@ export interface RecoverableArtifactStore extends ArtifactStore {
   headByLogicalKey(logicalKey: string): Promise<StoredArtifact | undefined>;
 }
 
+export class AtomicPromotionExhaustedError extends Error {
+  public readonly code = 'ATOMIC_PROMOTION_EXHAUSTED';
+
+  public constructor(
+    public readonly attempts: number,
+    public readonly systemCode: string,
+    cause: unknown,
+  ) {
+    super(`Atomic storage promotion remained blocked by ${systemCode} after ${attempts} attempts`, {
+      cause,
+    });
+    this.name = 'AtomicPromotionExhaustedError';
+  }
+}
+
 export function assertSha256(value: string): asserts value is string {
   sha256Schema.parse(value);
 }

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 import {
@@ -11,7 +11,7 @@ import {
   type CheckpointStore,
   type CheckpointValue,
 } from '../checkpoint-store.js';
-import { canonicalJson } from './internal.js';
+import { canonicalJson, promoteAtomically } from './internal.js';
 
 export class LocalCheckpointStore implements CheckpointStore {
   readonly #root: string;
@@ -43,6 +43,7 @@ export class LocalCheckpointStore implements CheckpointStore {
       if (isCode(error, 'EEXIST')) return { status: 'conflict', current: await this.load(scope) };
       throw error;
     }
+    let commitFailed = false;
     try {
       const current = await this.load(scope);
       if ((current?.revision ?? null) !== request.expectedRevision) {
@@ -57,14 +58,29 @@ export class LocalCheckpointStore implements CheckpointStore {
         encoding: 'utf8',
         flag: 'wx',
       });
+      let promotionFailed = false;
       try {
-        await rename(temporary, target);
+        await promoteAtomically(temporary, target);
+      } catch (error) {
+        promotionFailed = true;
+        throw error;
       } finally {
-        await rm(temporary, { force: true });
+        try {
+          await rm(temporary, { force: true });
+        } catch (cleanupError) {
+          if (!promotionFailed) throw cleanupError;
+        }
       }
       return { status: 'committed', checkpoint: request.checkpoint };
+    } catch (error) {
+      commitFailed = true;
+      throw error;
     } finally {
-      await rm(lockPath, { recursive: true, force: true });
+      try {
+        await rm(lockPath, { recursive: true, force: true });
+      } catch (cleanupError) {
+        if (!commitFailed) throw cleanupError;
+      }
     }
   }
 

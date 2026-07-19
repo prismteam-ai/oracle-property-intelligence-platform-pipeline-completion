@@ -4,9 +4,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { AtomicPromotionExhaustedError } from '@oracle/artifacts/artifact-store';
 import { LocalArtifactStore } from '@oracle/artifacts/implementations/local-artifact-store';
 import { LocalCheckpointStore } from '@oracle/artifacts/implementations/local-checkpoint-store';
-import { createCheckpointEnvelope, type CheckpointValue } from '@oracle/artifacts/checkpoint-store';
+import {
+  createCheckpointEnvelope,
+  type CheckpointCommit,
+  type CheckpointCommitResult,
+  type CheckpointStore,
+  type CheckpointValue,
+} from '@oracle/artifacts/checkpoint-store';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
 import { runIdSchema, snapshotIdSchema, sourceIdSchema } from '@oracle/contracts/ids';
 import {
@@ -569,6 +576,28 @@ async function stores(label: string) {
   };
 }
 
+class FailOnceCheckpointStore implements CheckpointStore {
+  #commitCount = 0;
+
+  public constructor(
+    private readonly delegate: CheckpointStore,
+    private readonly failure: AtomicPromotionExhaustedError,
+    private readonly failAtCommit: number,
+  ) {}
+
+  public load(scope: string) {
+    return this.delegate.load(scope);
+  }
+
+  public commit<TPayload extends CheckpointValue>(
+    request: CheckpointCommit<TPayload>,
+  ): Promise<CheckpointCommitResult<TPayload>> {
+    this.#commitCount += 1;
+    if (this.#commitCount === this.failAtCommit) return Promise.reject(this.failure);
+    return this.delegate.commit(request);
+  }
+}
+
 function configuration(
   runHash: string,
   sources: readonly SourceConfiguration[],
@@ -635,6 +664,27 @@ function dependencies(
 }
 
 describe('streaming runner restart and budget contracts', () => {
+  it('fails the run instead of classifying exhausted atomic promotion as a source outcome', async () => {
+    const store = await stores('atomic-promotion-exhausted');
+    const controller = new AbortController();
+    const adapter = new GeneratedAdapter('atomic-promotion-exhausted', controller, counters(), {
+      normalizeFanout: 1,
+    });
+    const failure = new AtomicPromotionExhaustedError(
+      8,
+      'EPERM',
+      Object.assign(new Error('locked'), { code: 'EPERM' }),
+    );
+    const base = dependencies(store, controller);
+
+    await expect(
+      runPipeline(configuration('9'.repeat(64), [source(adapter)]), {
+        ...base,
+        checkpointStore: new FailOnceCheckpointStore(store.checkpoints, failure, 2),
+      }),
+    ).rejects.toBe(failure);
+  });
+
   it('releases a pre-transfer oversized event lease so another source can progress', async () => {
     const store = await stores('oversized-event-lease');
     const controller = new AbortController();

@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 
+import { AtomicPromotionExhaustedError } from '@oracle/artifacts/artifact-store';
 import type { CheckpointEnvelope } from '@oracle/artifacts/checkpoint-store';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
 import type { SourceId } from '@oracle/contracts/ids';
@@ -1702,6 +1703,7 @@ async function runSource(
     }
   } catch (error) {
     if (dependencies.signal.aborted) throw error;
+    if (error instanceof AtomicPromotionExhaustedError) throw error;
     state = Object.freeze({
       ...state,
       terminalState: terminalFromError(error, state),

@@ -1,13 +1,14 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
+import { AtomicPromotionExhaustedError } from '../artifact-store.js';
 import { createCheckpointEnvelope } from '../checkpoint-store.js';
-import { ImmutableArtifactConflictError } from './internal.js';
+import { ImmutableArtifactConflictError, promoteAtomically } from './internal.js';
 import { LocalArtifactStore } from './local-artifact-store.js';
 import { LocalCheckpointStore } from './local-checkpoint-store.js';
 
@@ -126,6 +127,42 @@ describe('LocalArtifactStore', () => {
     const siblingUri = pathToFileURL(join(sibling, 'body')).href;
     await expect(store.head(siblingUri)).rejects.toThrow('escapes storage root');
   });
+
+  it('keeps one exact immutable winner under concurrent same-key promotion', async () => {
+    const root = await temporaryRoot();
+    const bytes = Buffer.from('content-addressed');
+    const request = {
+      logicalKey: `objects/${sha256(bytes)}`,
+      mediaType: 'application/octet-stream',
+      body: bytes,
+      expectedSha256: sha256(bytes),
+      metadata: { identity: 'exact' },
+      ifAbsent: true as const,
+    };
+    const stores = Array.from(
+      { length: 16 },
+      () =>
+        new LocalArtifactStore({
+          rootDirectory: root,
+          now: () => '2026-07-17T12:00:00.000Z',
+        }),
+    );
+
+    const results = await Promise.allSettled(stores.map((store) => store.putImmutable(request)));
+    expect(results.filter(({ status }) => status === 'fulfilled')).toHaveLength(1);
+    expect(
+      results
+        .filter((result) => result.status === 'rejected')
+        .every(({ reason }) => reason instanceof ImmutableArtifactConflictError),
+    ).toBe(true);
+    expect(await stores[0]?.headByLogicalKey(request.logicalKey)).toMatchObject({
+      logicalKey: request.logicalKey,
+      byteSize: bytes.byteLength,
+      sha256: request.expectedSha256,
+      metadata: request.metadata,
+    });
+    expect((await readdir(join(root, 'objects'))).some((name) => name.startsWith('.'))).toBe(false);
+  });
 });
 
 describe('LocalCheckpointStore', () => {
@@ -181,5 +218,152 @@ describe('LocalCheckpointStore', () => {
     document.payload.cursor = 99;
     await writeFile(path, JSON.stringify(document));
     await expect(store.load('tamper')).rejects.toThrow('payload hash');
+  });
+
+  it('serializes competing same-scope replacements without losing the committed winner', async () => {
+    const root = await temporaryRoot();
+    const stores = Array.from(
+      { length: 8 },
+      () => new LocalCheckpointStore({ rootDirectory: root }),
+    );
+    let current = createCheckpointEnvelope({
+      scope: 'shared/run',
+      previousRevision: null,
+      writtenAt: '2026-07-17T12:00:00.000Z',
+      payload: { cursor: 0 },
+    });
+    expect((await stores[0]?.commit({ expectedRevision: null, checkpoint: current }))?.status).toBe(
+      'committed',
+    );
+
+    for (let round = 1; round <= 12; round += 1) {
+      const candidates = stores.map((_, index) =>
+        createCheckpointEnvelope({
+          scope: 'shared/run',
+          previousRevision: current.revision,
+          writtenAt: `2026-07-17T12:${String(round).padStart(2, '0')}:${String(index).padStart(2, '0')}.000Z`,
+          payload: { cursor: round, writer: index },
+        }),
+      );
+      const results = await Promise.all(
+        stores.map((store, index) => {
+          const candidate = candidates[index];
+          if (candidate === undefined) throw new Error('Missing checkpoint candidate');
+          return store.commit({
+            expectedRevision: current.revision,
+            checkpoint: candidate,
+          });
+        }),
+      );
+      const committed = results.filter((result) => result.status === 'committed');
+      expect(committed).toHaveLength(1);
+      const winner = committed[0];
+      if (winner === undefined) throw new Error('Missing committed checkpoint winner');
+      current = winner.checkpoint;
+      expect(await stores[round % stores.length]?.load('shared/run')).toEqual(current);
+    }
+  });
+});
+
+describe('atomic local promotion retry', () => {
+  it.each(['EACCES', 'EBUSY', 'EPERM'])('retries transient Windows %s failures', async (code) => {
+    let calls = 0;
+    const delays: number[] = [];
+    await promoteAtomically('temporary', 'target', {
+      platform: 'win32',
+      attempts: 4,
+      rename: () => {
+        calls += 1;
+        if (calls < 3) return Promise.reject(Object.assign(new Error(code), { code }));
+        return Promise.resolve();
+      },
+      delay: (milliseconds) => {
+        delays.push(milliseconds);
+        return Promise.resolve();
+      },
+    });
+    expect(calls).toBe(3);
+    expect(delays).toEqual([25, 50]);
+  });
+
+  it('fails closed with a typed error and original cause after the retry budget', async () => {
+    const failure = Object.assign(new Error('still locked'), { code: 'EPERM' });
+    let calls = 0;
+    const promotion = promoteAtomically('temporary', 'target', {
+      platform: 'win32',
+      attempts: 3,
+      rename: () => {
+        calls += 1;
+        return Promise.reject(failure);
+      },
+      delay: () => Promise.resolve(),
+    });
+    await expect(promotion).rejects.toMatchObject({
+      name: 'AtomicPromotionExhaustedError',
+      code: 'ATOMIC_PROMOTION_EXHAUSTED',
+      attempts: 3,
+      systemCode: 'EPERM',
+      cause: failure,
+    });
+    await expect(promotion).rejects.toBeInstanceOf(AtomicPromotionExhaustedError);
+    expect(calls).toBe(3);
+  });
+
+  it('stops retrying when an immutable promotion winner is already visible', async () => {
+    const failure = Object.assign(new Error('destination exists'), { code: 'EPERM' });
+    let calls = 0;
+    const delays: number[] = [];
+    await expect(
+      promoteAtomically('temporary', 'target', {
+        platform: 'win32',
+        rename: () => {
+          calls += 1;
+          return Promise.reject(failure);
+        },
+        delay: (milliseconds) => {
+          delays.push(milliseconds);
+          return Promise.resolve();
+        },
+        retryAllowed: () => false,
+      }),
+    ).rejects.toBe(failure);
+    expect(calls).toBe(1);
+    expect(delays).toEqual([]);
+  });
+
+  it('rejects an invalid retry budget before attempting promotion', async () => {
+    let calls = 0;
+    await expect(
+      promoteAtomically('temporary', 'target', {
+        platform: 'win32',
+        attempts: 0,
+        rename: () => {
+          calls += 1;
+          return Promise.resolve();
+        },
+      }),
+    ).rejects.toBeInstanceOf(RangeError);
+    expect(calls).toBe(0);
+  });
+
+  it('does not retry non-transient or non-Windows promotion errors', async () => {
+    for (const [platform, code] of [
+      ['win32', 'ENOENT'],
+      ['linux', 'EPERM'],
+    ] as const) {
+      let calls = 0;
+      const failure = Object.assign(new Error(code), { code });
+      await expect(
+        promoteAtomically('temporary', 'target', {
+          platform,
+          rename: () => {
+            calls += 1;
+            return Promise.reject(failure);
+          },
+          delay: () => Promise.resolve(),
+        }),
+      ).rejects.toBe(failure);
+      expect(calls).toBe(1);
+    }
   });
 });

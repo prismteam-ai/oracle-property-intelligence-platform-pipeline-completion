@@ -1,6 +1,67 @@
 import { createHash } from 'node:crypto';
+import { rename } from 'node:fs/promises';
 
-import type { ArtifactBody, ArtifactMetadata } from '../artifact-store.js';
+import {
+  AtomicPromotionExhaustedError,
+  type ArtifactBody,
+  type ArtifactMetadata,
+} from '../artifact-store.js';
+
+const WINDOWS_PROMOTION_ATTEMPTS = 8;
+const WINDOWS_PROMOTION_RETRY_CODES = new Set(['EACCES', 'EBUSY', 'EPERM']);
+
+type AtomicPromotionOptions = Readonly<{
+  platform?: NodeJS.Platform;
+  attempts?: number;
+  rename?: (source: string, target: string) => Promise<void>;
+  delay?: (milliseconds: number) => Promise<void>;
+  retryAllowed?: (error: unknown, attempt: number) => boolean | Promise<boolean>;
+}>;
+
+export async function promoteAtomically(
+  source: string,
+  target: string,
+  options: AtomicPromotionOptions = {},
+): Promise<void> {
+  const attempts = options.attempts ?? WINDOWS_PROMOTION_ATTEMPTS;
+  if (!Number.isSafeInteger(attempts) || attempts < 1) {
+    throw new RangeError('Atomic promotion attempts must be a positive safe integer');
+  }
+  const renamePath = options.rename ?? rename;
+  const delay = options.delay ?? wait;
+  const platform = options.platform ?? process.platform;
+
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await renamePath(source, target);
+      return;
+    } catch (error) {
+      const code = errorCode(error);
+      const transientWindowsFailure =
+        platform === 'win32' && WINDOWS_PROMOTION_RETRY_CODES.has(code ?? '');
+      if (!transientWindowsFailure) {
+        throw error;
+      }
+      if (options.retryAllowed !== undefined && !(await options.retryAllowed(error, attempt))) {
+        throw error;
+      }
+      if (attempt >= attempts) {
+        throw new AtomicPromotionExhaustedError(attempts, code ?? 'UNKNOWN', error);
+      }
+      await delay(25 * attempt);
+    }
+  }
+}
+
+function errorCode(error: unknown): string | undefined {
+  return error instanceof Error && 'code' in error && typeof error.code === 'string'
+    ? error.code
+    : undefined;
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
 export function canonicalJson(value: unknown): string {
   if (value === null || typeof value === 'boolean' || typeof value === 'string') {
