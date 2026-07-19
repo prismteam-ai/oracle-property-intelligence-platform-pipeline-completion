@@ -2256,11 +2256,15 @@ export async function runPipeline(
     assertCountyProcessorProfile(configuration.profile.name, dependencies.processors.memoryProfile);
     if (
       (configuration.profile.name === 'full' || configuration.profile.name === 'incremental') &&
-      dependencies.processors.memoryProfile === 'bounded_streaming_v2'
+      dependencies.processors.memoryProfile === 'bounded_streaming_v2' &&
+      dependencies.processors.processBoundedCounty === undefined
     ) {
-      if (dependencies.processors.processBoundedCounty === undefined) {
-        throw new UnboundedCountyPhaseError('reconcile');
-      }
+      throw new UnboundedCountyPhaseError('reconcile');
+    }
+    if (
+      dependencies.processors.memoryProfile === 'bounded_streaming_v2' &&
+      dependencies.processors.processBoundedCounty !== undefined
+    ) {
       const acquiredSourceResults = sourceResults.filter(({ acquired }) => acquired.length > 0);
       if (acquiredSourceResults.length === 0) {
         throw new UnboundedCountyPhaseError('reconcile');

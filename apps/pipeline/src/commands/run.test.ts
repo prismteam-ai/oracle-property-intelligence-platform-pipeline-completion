@@ -48,6 +48,7 @@ import {
   RedirectRejectedError,
   RetryableAcquisitionCheckpointStore,
   runCommand,
+  usesBoundedPipelineProcessors,
 } from './run.js';
 
 const temporaryDirectories: string[] = [];
@@ -121,6 +122,16 @@ function requestUrl(input: string | URL | Request): string {
 }
 
 const RESUME_INSTANT = '2026-07-18T00:00:00.000Z';
+
+describe('production processor selection', () => {
+  it('routes production pilots through bounded processing while preserving tiny fixtures', () => {
+    expect(usesBoundedPipelineProcessors('pilot', false)).toBe(true);
+    expect(usesBoundedPipelineProcessors('pilot', true)).toBe(false);
+    expect(usesBoundedPipelineProcessors('full', false)).toBe(true);
+    expect(usesBoundedPipelineProcessors('incremental', false)).toBe(true);
+    expect(usesBoundedPipelineProcessors('discovery', false)).toBe(false);
+  });
+});
 
 interface ResumeCounters {
   discover: number;

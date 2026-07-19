@@ -158,8 +158,8 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       pipelineVersion: '2.0.0',
       requestedAt: NOW,
       profile: {
-        name: 'full',
-        recordCap: null,
+        name: 'pilot',
+        recordCap: 5_000,
         maxConcurrentSources: 1,
         maxBufferedRecords: 16,
       },

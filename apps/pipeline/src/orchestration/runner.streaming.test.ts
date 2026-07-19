@@ -665,6 +665,26 @@ function dependencies(
 }
 
 describe('streaming runner restart and budget contracts', () => {
+  it('fails closed when an incremental profile omits its declared bounded processor', async () => {
+    const store = await stores('missing-bounded');
+    const controller = new AbortController();
+    const adapter = new GeneratedAdapter('missing-bounded-a', controller, counters(), {
+      normalizeFanout: 0,
+    });
+    const secondAdapter = new GeneratedAdapter('missing-bounded-b', controller, counters(), {
+      normalizeFanout: 0,
+    });
+    const pilot = configuration('9'.repeat(64), [source(adapter), source(secondAdapter)]);
+    const incremental: PipelineConfiguration = {
+      ...pilot,
+      profile: { ...pilot.profile, name: 'incremental', recordCap: null },
+    };
+
+    await expect(runPipeline(incremental, dependencies(store, controller))).rejects.toThrow(
+      'configured processor is not a complete bounded_streaming_v2 implementation',
+    );
+  });
+
   it('resumes a current discover-only checkpoint with a truthful skipped-normalization zero state', async () => {
     const store = await stores('discover-only-zero-state-resume');
     const firstController = new AbortController();

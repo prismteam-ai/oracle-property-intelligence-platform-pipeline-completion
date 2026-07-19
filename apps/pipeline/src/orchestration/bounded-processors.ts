@@ -275,10 +275,13 @@ async function processBoundedCounty(
   options: RuntimeOptions,
 ): Promise<BoundedCountyProcessingResult> {
   if (
+    request.configuration.profile.name !== 'pilot' &&
     request.configuration.profile.name !== 'full' &&
     request.configuration.profile.name !== 'incremental'
   ) {
-    throw new TypeError('bounded_streaming_v2 is reserved for full and incremental profiles');
+    throw new TypeError(
+      'bounded_streaming_v2 is reserved for production pilot, full, and incremental profiles',
+    );
   }
   if (request.configuration.profile.name === 'incremental') {
     throw new BoundedPipelineIntegrityError(
@@ -1536,7 +1539,7 @@ function createProcessingInput(
     processorKind: BOUNDED_PROCESSOR_KIND,
     runId: request.configuration.runId,
     pipelineVersion: request.configuration.pipelineVersion,
-    profile: request.configuration.profile.name as 'full' | 'incremental',
+    profile: request.configuration.profile.name as 'pilot' | 'full' | 'incremental',
     configurationSha256: sha256({
       configuration: request.configuration,
       completeSourceStateInventory: [...request.sources].sort((left, right) =>

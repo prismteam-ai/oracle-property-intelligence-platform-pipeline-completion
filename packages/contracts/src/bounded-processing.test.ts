@@ -1389,6 +1389,9 @@ describe('bounded_streaming_v2 processing contract', () => {
     expect(() =>
       assertProcessorProfileCompatibility('incremental', 'bounded_streaming_v2'),
     ).not.toThrow();
+    expect(() =>
+      assertProcessorProfileCompatibility('pilot', 'bounded_streaming_v2'),
+    ).not.toThrow();
     expect(() => assertProcessorProfileCompatibility('full', 'small_run_only_v1')).toThrow(
       /cannot execute profile/u,
     );

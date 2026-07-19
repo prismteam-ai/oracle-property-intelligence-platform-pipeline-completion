@@ -826,6 +826,10 @@ export type RunCommandOptions = Readonly<{
   beforePhase?: (phase: OrchestrationPhase, sourceId: SourceId | null) => void | Promise<void>;
 }>;
 
+export function usesBoundedPipelineProcessors(profile: RunProfileName, fixture: boolean): boolean {
+  return profile === 'full' || profile === 'incremental' || (profile === 'pilot' && !fixture);
+}
+
 export async function runCommand(options: RunCommandOptions): Promise<PipelineResult> {
   if (options.fixture && options.profile !== 'pilot' && options.profile !== 'discovery') {
     throw new TypeError('The committed networkless fixture is only valid for discovery or pilot');
@@ -932,13 +936,12 @@ export async function runCommand(options: RunCommandOptions): Promise<PipelineRe
           : new FixtureParcelTransport(fixture),
       clock,
       delay: new AbortableDelay(),
-      processors:
-        options.profile === 'full' || options.profile === 'incremental'
-          ? createBoundedPipelineProcessors({
-              outputDirectory,
-              scratchDirectory: resolve(outputDirectory, 'bounded-processing'),
-            })
-          : createDefaultPipelineProcessors(),
+      processors: usesBoundedPipelineProcessors(options.profile, options.fixture)
+        ? createBoundedPipelineProcessors({
+            outputDirectory,
+            scratchDirectory: resolve(outputDirectory, 'bounded-processing'),
+          })
+        : createDefaultPipelineProcessors(),
       signal: controller.signal,
       ...(options.beforePhase === undefined ? {} : { beforePhase: options.beforePhase }),
     }),

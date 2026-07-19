@@ -195,7 +195,11 @@ export const P8_FROZEN_CLOSURE_FILES = Object.freeze([
 
 export const boundedProcessorCompatibilityPolicySchema = z.strictObject({
   policyVersion: z.literal('bounded-processor-compatibility-v1'),
-  boundedStreamingV2Profiles: z.tuple([z.literal('full'), z.literal('incremental')]),
+  boundedStreamingV2Profiles: z.tuple([
+    z.literal('pilot'),
+    z.literal('full'),
+    z.literal('incremental'),
+  ]),
   smallRunOnlyV1Profiles: z.tuple([z.literal('pilot')]),
   finalizedV1: z.literal('readable_unchanged'),
   incompleteV1ErrorCode: z.literal('LEGACY_INCOMPLETE_CHECKPOINT'),
@@ -235,7 +239,7 @@ export type BoundedProcessorCompatibilityPolicy = z.infer<
 
 export const BOUNDED_PROCESSOR_COMPATIBILITY_POLICY = Object.freeze({
   policyVersion: 'bounded-processor-compatibility-v1',
-  boundedStreamingV2Profiles: Object.freeze(['full', 'incremental']),
+  boundedStreamingV2Profiles: Object.freeze(['pilot', 'full', 'incremental']),
   smallRunOnlyV1Profiles: Object.freeze(['pilot']),
   finalizedV1: 'readable_unchanged',
   incompleteV1ErrorCode: 'LEGACY_INCOMPLETE_CHECKPOINT',
@@ -1094,7 +1098,7 @@ const processingInputShape = {
   logicalOutputIdentitySha256: sha256Schema,
   runId: runIdSchema,
   pipelineVersion: semverSchema,
-  profile: z.enum(['full', 'incremental']),
+  profile: z.enum(['pilot', 'full', 'incremental']),
   configurationSha256: sha256Schema,
   requestedAt: isoDateTimeSchema,
   sourceManifestSha256: sha256Schema,
@@ -2062,10 +2066,7 @@ export function assertProcessorProfileCompatibility(
   profile: 'pilot' | 'full' | 'incremental',
   memoryProfile: 'small_run_only_v1' | 'bounded_streaming_v2',
 ): void {
-  const accepted =
-    memoryProfile === 'bounded_streaming_v2'
-      ? profile === 'full' || profile === 'incremental'
-      : profile === 'pilot';
+  const accepted = memoryProfile === 'bounded_streaming_v2' || profile === 'pilot';
   if (!accepted) throw new BoundedProcessorProfileError(profile, memoryProfile);
 }
 
