@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "runtime": {
+    "maxConcurrentSources": 2,
+    "maxBufferedRecords": 50,
+    "maximumPhaseAttempts": 2,
+    "requestTimeoutMs": 30000
+  },
+  "pilot": {
+    "recordCap": 5000,
+    "includeLargeSources": []
+  },
+  "parcels": {
+    "pageSize": 5000
+  },
+  "paloAltoYearBuilt": {
+    "pageSize": 5000
+  }
+}
