@@ -26,7 +26,7 @@ export const MTC_PALO_ALTO_LICENSE_SNAPSHOT_ID: LicenseSnapshotId = licenseSnaps
 
 export const MTC_PALO_ALTO_VISIBILITY = 'prohibited_public' as const;
 export const MTC_PALO_ALTO_CONTRACT_VERSION = '2.0.0';
-export const MTC_PALO_ALTO_TRANSFORM_VERSION = '1.0.0';
+export const MTC_PALO_ALTO_TRANSFORM_VERSION = '1.1.0';
 
 export const MTC_PALO_ALTO_FIELDS = Object.freeze([
   'objectid',

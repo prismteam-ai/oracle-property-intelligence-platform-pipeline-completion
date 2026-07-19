@@ -713,8 +713,36 @@ describe('MTC Palo Alto year-built adapter', () => {
         '/floodZone',
         '/nearCreek',
         '/sourceCoordinates',
+        '/county',
+        '/state',
+        '/apn',
+        '/jurisdiction',
+        '/primaryAddressId',
+        '/unitIds',
+        '/landAreaSquareMeters',
       ]),
     );
+    expect(
+      observations
+        .filter(({ observation }) =>
+          [
+            '/county',
+            '/state',
+            '/apn',
+            '/jurisdiction',
+            '/primaryAddressId',
+            '/unitIds',
+            '/parcelGeometry',
+            '/landAreaSquareMeters',
+          ].includes(observation.fieldPath),
+        )
+        .map(({ observation }) => observation.fieldPath),
+    ).toHaveLength(8);
+    expect(
+      observations.every(({ observation }) =>
+        observation.lineage.transformations.every(({ version }) => version === '1.1.0'),
+      ),
+    ).toBe(true);
     expect(
       observations.every(
         (mutation) =>

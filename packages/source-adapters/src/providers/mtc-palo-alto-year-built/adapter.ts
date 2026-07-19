@@ -1182,12 +1182,30 @@ export class MtcPaloAltoYearBuiltAdapter implements StreamingSourceAdapter<
       { path: '/parcelGeometry', value: record.geometry as JsonValue },
       { path: '/sourceAddressDescription', value: record.addressDescription },
       { path: '/sourceObjectId', value: record.objectId },
+      { path: '/county', value: entity.county },
+      { path: '/state', value: entity.state },
+      { path: '/apn', value: entity.apn },
+      { path: '/jurisdiction', value: entity.jurisdiction },
+      { path: '/primaryAddressId', value: entity.primaryAddressId },
+      { path: '/unitIds', value: entity.unitIds },
+      { path: '/landAreaSquareMeters', value: entity.landAreaSquareMeters },
     ]);
-    const baseParts = [record.snapshotId, record.artifactId, record.recordKey];
+    const baseParts = [
+      record.snapshotId,
+      record.artifactId,
+      record.recordKey,
+      MTC_PALO_ALTO_TRANSFORM_VERSION,
+    ];
+    const runId = deterministicId(
+      'sc:run:',
+      record.snapshotId,
+      'mtc-palo-alto-normalize',
+      MTC_PALO_ALTO_TRANSFORM_VERSION,
+    );
     const entityMutation = canonicalMutationSchema.parse({
       kind: 'entity_upsert',
       mutationId: deterministicId('sc:mutation:', ...baseParts, 'entity'),
-      runId: deterministicId('sc:run:', record.snapshotId, 'mtc-palo-alto-normalize'),
+      runId,
       sourceId: MTC_PALO_ALTO_SOURCE_ID,
       snapshotId: record.snapshotId,
       sequence: record.ordinal * (values.length + 1),
@@ -1203,7 +1221,7 @@ export class MtcPaloAltoYearBuiltAdapter implements StreamingSourceAdapter<
       yield canonicalMutationSchema.parse({
         kind: 'field_observation',
         mutationId: deterministicId('sc:mutation:', ...baseParts, field.path),
-        runId: deterministicId('sc:run:', record.snapshotId, 'mtc-palo-alto-normalize'),
+        runId,
         sourceId: MTC_PALO_ALTO_SOURCE_ID,
         snapshotId: record.snapshotId,
         sequence: record.ordinal * (values.length + 1) + index + 1,
