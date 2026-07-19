@@ -638,7 +638,7 @@ function withoutFailedLaneMutations(
  * of bytes, at least the policy value).
  */
 function operatorDuckdbMemoryBytes(policyBytes: number): number {
-  const raw = process.env['ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES'];
+  const raw = process.env.ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES;
   if (raw === undefined || raw.trim() === '') return policyBytes;
   const parsed = Number(raw);
   if (!Number.isSafeInteger(parsed) || parsed < policyBytes) {
