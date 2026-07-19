@@ -664,6 +664,45 @@ function dependencies(
 }
 
 describe('streaming runner restart and budget contracts', () => {
+  it('resumes a current discover-only checkpoint with a truthful skipped-normalization zero state', async () => {
+    const store = await stores('discover-only-zero-state-resume');
+    const firstController = new AbortController();
+    const firstAdapter = new GeneratedAdapter(
+      'discover-only-zero-state-resume',
+      firstController,
+      counters(),
+    );
+    const firstSource = Object.freeze({
+      ...source(firstAdapter),
+      executionMode: 'discover_only' as const,
+    });
+    const first = await runPipeline(
+      configuration('8'.repeat(64), [firstSource]),
+      dependencies(store, firstController),
+    );
+    expect(first.manifest.sources[0]).toMatchObject({
+      terminalState: 'partial',
+      executionMode: 'discover_only',
+      summary: null,
+    });
+
+    const resumedController = new AbortController();
+    const resumedAdapter = new GeneratedAdapter(
+      'discover-only-zero-state-resume',
+      resumedController,
+      counters(),
+    );
+    const resumedSource = Object.freeze({
+      ...source(resumedAdapter),
+      executionMode: 'discover_only' as const,
+    });
+    const resumed = await runPipeline(
+      configuration('8'.repeat(64), [resumedSource]),
+      dependencies(store, resumedController),
+    );
+    expect(resumed.manifest).toEqual(first.manifest);
+  });
+
   it('fails the run instead of classifying exhausted atomic promotion as a source outcome', async () => {
     const store = await stores('atomic-promotion-exhausted');
     const controller = new AbortController();

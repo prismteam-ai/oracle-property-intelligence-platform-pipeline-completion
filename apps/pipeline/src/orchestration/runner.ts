@@ -224,6 +224,15 @@ async function migrateLegacyNormalizationLedgers(
   let migrated = false;
   const sources: PersistedSourceState[] = [];
   for (const source of state.sources) {
+    const configuredSource = configuration.sources.find(
+      ({ adapter }) => adapter.describe().sourceId === source.sourceId,
+    );
+    if (configuredSource === undefined) {
+      throw new Error(`Checkpoint source is absent from configuration: ${source.sourceId}`);
+    }
+    const normalizationSkipped =
+      configuration.profile.name === 'discovery' ||
+      configuredSource.executionMode === 'discover_only';
     const raw = source as unknown as Record<string, unknown>;
     const eventPrefix = normalizationLogicalPrefix(state.runId, source.sourceId);
     if (format === 'current') {
@@ -233,17 +242,19 @@ async function migrateLegacyNormalizationLedgers(
         candidate.normalizationLedger,
         eventPrefix,
         dependencies,
+        normalizationSkipped,
       );
-      await openLedgerChunkSequencePrefix(
+      const mutations = await openLedgerChunkSequencePrefix(
         dependencies.artifactStore,
         candidate.mutationLedger,
         mutationLogicalPrefix(state.runId, source.sourceId),
       );
-      await openLedgerChunkSequencePrefix(
+      const validationIssues = await openLedgerChunkSequencePrefix(
         dependencies.artifactStore,
         candidate.validationIssueLedger,
         validationIssueLogicalPrefix(state.runId, source.sourceId),
       );
+      assertSkippedProjectionLedgers(source, mutations, validationIssues, normalizationSkipped);
       sources.push(candidate);
       continue;
     }
@@ -258,8 +269,9 @@ async function migrateLegacyNormalizationLedgers(
       source,
       verified,
       legacyReferences.at(-1)?.resumeCursor ?? null,
+      normalizationSkipped,
     );
-    await assertNormalizationProjectionIdentity(source, verified);
+    await assertNormalizationProjectionIdentity(source, verified, normalizationSkipped);
     const normalizationLedger = await migrateLegacyChunkLedger(
       dependencies.artifactStore,
       eventPrefix,
@@ -270,6 +282,7 @@ async function migrateLegacyNormalizationLedgers(
       normalizationLedger,
       eventPrefix,
       dependencies,
+      normalizationSkipped,
     );
     const migratedSource = { ...raw };
     delete migratedSource.normalizationChunks;
@@ -285,16 +298,17 @@ async function migrateLegacyNormalizationLedgers(
       ...migratedSource,
       normalizationLedger,
     }) as PersistedSourceState;
-    await openLedgerChunkSequencePrefix(
+    const mutations = await openLedgerChunkSequencePrefix(
       dependencies.artifactStore,
       candidate.mutationLedger,
       mutationLogicalPrefix(state.runId, source.sourceId),
     );
-    await openLedgerChunkSequencePrefix(
+    const validationIssues = await openLedgerChunkSequencePrefix(
       dependencies.artifactStore,
       candidate.validationIssueLedger,
       validationIssueLogicalPrefix(state.runId, source.sourceId),
     );
+    assertSkippedProjectionLedgers(source, mutations, validationIssues, normalizationSkipped);
     sources.push(candidate);
     migrated = true;
   }
@@ -447,21 +461,42 @@ async function validateMigratedNormalizationState(
   ledger: ChunkLedger,
   logicalPrefix: string,
   dependencies: OrchestrationDependencies,
+  normalizationSkipped: boolean,
 ): Promise<void> {
   const sequence = await openLedgerChunkSequencePrefix<NormalizationEvent>(
     dependencies.artifactStore,
     ledger,
     logicalPrefix,
   );
-  assertNormalizationOuterIdentity(source, sequence, ledger.resumeCursor);
-  await assertNormalizationProjectionIdentity(source, sequence);
+  assertNormalizationOuterIdentity(source, sequence, ledger.resumeCursor, normalizationSkipped);
+  await assertNormalizationProjectionIdentity(source, sequence, normalizationSkipped);
 }
 
 function assertNormalizationOuterIdentity(
   source: PersistedSourceState,
   sequence: ChunkSequence<NormalizationEvent>,
   resumeCursor: string | null,
+  normalizationSkipped = false,
 ): void {
+  if (normalizationSkipped) {
+    if (
+      sequence.recordCount !== 0 ||
+      resumeCursor !== null ||
+      source.normalizationCursor !== null ||
+      source.normalizationEventRecords !== 0 ||
+      source.decodedRecords !== 0 ||
+      source.acceptedRecords !== 0 ||
+      source.rejectedRecords !== 0 ||
+      source.mutationRecords !== 0 ||
+      source.validationIssueRecords !== 0 ||
+      source.normalizationLogicalSha256 !== null ||
+      source.mutationLogicalSha256 !== null ||
+      source.validationIssueLogicalSha256 !== null
+    ) {
+      throw new Error(`Skipped normalization identity is inconsistent for ${source.sourceId}`);
+    }
+    return;
+  }
   if (source.normalizationLogicalSha256 === null) {
     if (source.normalizationEventRecords !== 0 || phaseCompleted(source, 'normalize')) {
       throw new Error(`Incomplete normalization identity is inconsistent for ${source.sourceId}`);
@@ -489,7 +524,9 @@ function assertNormalizationOuterIdentity(
 async function assertNormalizationProjectionIdentity(
   source: PersistedSourceState,
   events: ChunkSequence<NormalizationEvent>,
+  normalizationSkipped = false,
 ): Promise<void> {
+  if (normalizationSkipped) return;
   if (
     source.mutationLogicalSha256 === null &&
     source.validationIssueLogicalSha256 === null &&
@@ -517,6 +554,17 @@ async function assertNormalizationProjectionIdentity(
     issueHash.digest('hex') !== source.validationIssueLogicalSha256
   ) {
     throw new Error(`Normalization projection identity changed for ${source.sourceId}`);
+  }
+}
+
+function assertSkippedProjectionLedgers(
+  source: PersistedSourceState,
+  mutations: ChunkSequence<unknown>,
+  validationIssues: ChunkSequence<unknown>,
+  normalizationSkipped: boolean,
+): void {
+  if (normalizationSkipped && (mutations.recordCount !== 0 || validationIssues.recordCount !== 0)) {
+    throw new Error(`Skipped normalization projection is inconsistent for ${source.sourceId}`);
   }
 }
 
