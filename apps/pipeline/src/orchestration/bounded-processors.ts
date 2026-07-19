@@ -628,6 +628,27 @@ function withoutFailedLaneMutations(
   });
 }
 
+/**
+ * Execution-only operator override for the DuckDB working-set ceiling. The
+ * bounded budget policy object, its hashes, and the generation identity are
+ * intentionally unchanged: the DuckDB memory limit does not alter logical
+ * outputs or artifact layout. County-scale derive_features/build_marts can
+ * exceed the default 128 MiB working set; an operator may raise ONLY the
+ * enforcement ceiling via ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES (a safe integer
+ * of bytes, at least the policy value).
+ */
+function operatorDuckdbMemoryBytes(policyBytes: number): number {
+  const raw = process.env['ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES'];
+  if (raw === undefined || raw.trim() === '') return policyBytes;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < policyBytes) {
+    throw new RangeError(
+      `ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES must be a safe integer of at least ${policyBytes}`,
+    );
+  }
+  return parsed;
+}
+
 async function openDuckDatabase(
   databasePath: string,
   temporaryDirectory: string,
@@ -638,7 +659,7 @@ async function openDuckDatabase(
     try {
       return await DuckDBInstance.create(databasePath, {
         threads: String(budget.maxWorkers),
-        memory_limit: `${budget.duckdbMemoryBytes}B`,
+        memory_limit: `${operatorDuckdbMemoryBytes(budget.duckdbMemoryBytes)}B`,
         temp_directory: temporaryDirectory,
       });
     } catch (error) {

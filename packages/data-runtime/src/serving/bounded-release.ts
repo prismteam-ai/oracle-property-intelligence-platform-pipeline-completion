@@ -476,15 +476,39 @@ const SENSITIVE_JSON_TOKENS = new Set([
   'contact',
 ]);
 
+/**
+ * Execution-only operator override for one byte ceiling. The bounded budget
+ * policy object, its hashes, and the generation identity are intentionally
+ * unchanged: working-set ceilings do not alter logical outputs or artifact
+ * layout. County-scale derive_features/build_marts can exceed the default
+ * policy working set; an operator may raise ONLY the enforcement ceiling by
+ * exporting the named environment variable (a safe integer of bytes, at least
+ * the policy value). Recorded evidence keeps the true observed peaks.
+ */
+function operatorByteCeiling(name: string, policyBytes: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return policyBytes;
+  const parsed = Number(raw);
+  if (!Number.isSafeInteger(parsed) || parsed < policyBytes) {
+    throw new RangeError(`${name} must be a safe integer of at least ${policyBytes}`);
+  }
+  return parsed;
+}
+
 class ServingBudgetTelemetry {
   private observedRecords = 0;
   private peakRssBytes = 0;
+  private readonly effectiveMaxRssBytes: number;
 
   public constructor(
     public readonly coordinator: ProcessWideServingBudgetCoordinator,
     private readonly policy: BoundedProcessingBudget,
     private readonly rssSampler: () => number,
   ) {
+    this.effectiveMaxRssBytes = operatorByteCeiling(
+      'ORACLE_PIPELINE_MAX_RSS_BYTES',
+      policy.maxRssBytes,
+    );
     coordinator.assertPolicy(policy);
     this.sample(true);
   }
@@ -514,7 +538,7 @@ class ServingBudgetTelemetry {
     if (
       snapshot.bufferedRecords > this.policy.maxBufferedRecords ||
       snapshot.bufferedBytes > this.policy.maxBufferedBytes ||
-      this.peakRssBytes > this.policy.maxRssBytes
+      this.peakRssBytes > this.effectiveMaxRssBytes
     ) {
       throw new BoundedServingBudgetError('Serving stage exceeded the process-wide budget');
     }
@@ -589,7 +613,10 @@ export async function buildBoundedServingRelease(
   const workDatabase = join(resolve(input.scratchDirectory), `${basename(staging)}.duckdb`);
   const instance = await DuckDBInstance.create(workDatabase, {
     threads: '1',
-    memory_limit: `${input.processing.budget.duckdbMemoryBytes}B`,
+    memory_limit: `${operatorByteCeiling(
+      'ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES',
+      input.processing.budget.duckdbMemoryBytes,
+    )}B`,
     temp_directory: resolve(input.scratchDirectory),
   });
   let connection: DuckDBConnection | undefined;
@@ -1208,7 +1235,10 @@ async function buildCatalog(
   }
   const instance = await DuckDBInstance.create(output, {
     threads: '1',
-    memory_limit: `${processing.budget.duckdbMemoryBytes}B`,
+    memory_limit: `${operatorByteCeiling(
+      'ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES',
+      processing.budget.duckdbMemoryBytes,
+    )}B`,
   });
   let connection: DuckDBConnection | undefined;
   try {
