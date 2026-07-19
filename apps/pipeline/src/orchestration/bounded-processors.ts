@@ -823,9 +823,7 @@ async function initializeDatabase(connection: DuckDBConnection): Promise<void> {
     generation_id VARCHAR NOT NULL, source_id VARCHAR NOT NULL, source_ordinal BIGINT NOT NULL,
     partition_id INTEGER NOT NULL, sort_key VARCHAR NOT NULL,
     mutation_id VARCHAR NOT NULL, content_sha256 VARCHAR NOT NULL, mutation_json VARCHAR NOT NULL)`);
-  await connection.run(
-    'CREATE INDEX IF NOT EXISTS raw_partition_sort ON raw_mutation(generation_id, partition_id, sort_key, mutation_id)',
-  );
+  await connection.run('DROP INDEX IF EXISTS raw_partition_sort');
   await connection.run(`CREATE TABLE IF NOT EXISTS canonical_claim (
     generation_id VARCHAR NOT NULL, mutation_id VARCHAR NOT NULL, content_sha256 VARCHAR NOT NULL,
     PRIMARY KEY(generation_id, mutation_id))`);
@@ -954,8 +952,6 @@ async function ingestMutations(
   request: BoundedCountyProcessingRequest,
   processing: BoundedProcessingInput,
 ): Promise<IngestResult> {
-  const logical = createHash('sha256');
-  let recordCount = 0;
   const existingCount = await scalarCount(
     connection,
     `SELECT count(*)::BIGINT AS value FROM raw_mutation WHERE generation_id=${sql(processing.generationId)}`,
@@ -964,18 +960,20 @@ async function ingestMutations(
     (total, source) => total + source.sequence.recordCount,
     0,
   );
-  if (existingCount > 0) {
-    if (existingCount !== declaredCount)
+  if (existingCount !== 0) {
+    if (existingCount > declaredCount) {
       throw new BoundedPipelineIntegrityError(
-        'Durable mutation spool count differs from immutable chunk inventory',
+        'Durable mutation spool count exceeds immutable chunk inventory',
       );
-    const verified = await verifyMutationSpool(connection, processing);
-    if (verified.logicalSha256 !== processing.mutationLog.logicalSha256)
-      throw new BoundedPipelineIntegrityError(
-        'Durable mutation spool logical hash differs from immutable chunks',
-      );
-    return verified;
+    }
+    if (existingCount === declaredCount) {
+      return verifyMutationSpoolIntegrity(connection, processing, declaredCount);
+    }
+    await connection.run(
+      `DELETE FROM raw_mutation WHERE generation_id=${sql(processing.generationId)}`,
+    );
   }
+
   const ordered = [...request.mutationSources].sort((a, b) => compareUtf8(a.sourceId, b.sourceId));
   const appender = await connection.createAppender('raw_mutation');
   try {
@@ -991,7 +989,6 @@ async function ingestMutations(
         }
         const body = canonicalJson(mutation);
         const contentSha256 = createHash('sha256').update(body).digest('hex');
-        logical.update(`${body}\n`);
         appender.appendVarchar(processing.generationId);
         appender.appendVarchar(source.sourceId);
         appender.appendBigInt(BigInt(sourceOrdinal));
@@ -1003,30 +1000,46 @@ async function ingestMutations(
         appender.appendVarchar(contentSha256);
         appender.appendVarchar(body);
         appender.endRow();
-        recordCount += 1;
         sourceOrdinal += 1;
       }
     }
     appender.flushSync();
-  } finally {
-    appender.closeSync();
+  } catch (error) {
+    try {
+      appender.closeSync();
+    } catch {
+      // Preserve the actionable read/parse/cancel error. The next run replays any underfilled
+      // durable generation; a close failure after a successful stream still propagates below.
+    }
+    throw error;
   }
-  if (recordCount !== declaredCount)
+  appender.closeSync();
+  return verifyMutationSpoolIntegrity(connection, processing, declaredCount);
+}
+
+async function verifyMutationSpoolIntegrity(
+  connection: DuckDBConnection,
+  processing: BoundedProcessingInput,
+  declaredCount: number,
+): Promise<IngestResult> {
+  const verified = await verifyMutationSpool(connection, processing);
+  if (verified.recordCount !== declaredCount) {
     throw new BoundedPipelineIntegrityError(
-      'Mutation stream count differs from immutable chunk inventory',
+      'Durable mutation spool count differs from immutable chunk inventory',
     );
-  const logicalSha256 = logical.digest('hex');
-  if (logicalSha256 !== processing.mutationLog.logicalSha256)
-    throw new BoundedPipelineIntegrityError(
-      'Mutation spool hash differs between verification and durable write',
-    );
+  }
   const collisions = await scalarCount(
     connection,
     `SELECT count(*)::BIGINT AS value FROM (SELECT mutation_id FROM raw_mutation WHERE generation_id=${sql(processing.generationId)} GROUP BY mutation_id HAVING count(DISTINCT content_sha256) > 1)`,
   );
   if (collisions !== 0)
     throw new BoundedPipelineIntegrityError('Mutation identity was reused for different content');
-  return Object.freeze({ logicalSha256, recordCount });
+  if (verified.logicalSha256 !== processing.mutationLog.logicalSha256) {
+    throw new BoundedPipelineIntegrityError(
+      'Durable mutation spool logical hash differs from immutable chunks',
+    );
+  }
+  return verified;
 }
 
 async function computeExactMutationLogicalSha256(
@@ -1177,22 +1190,53 @@ async function verifyMutationSpool(
 ): Promise<IngestResult> {
   const hash = createHash('sha256');
   let recordCount = 0;
+  let currentSourceId: string | null = null;
+  let expectedSourceOrdinal = 0;
+  let ordinalDiscontinuitySourceId: string | null = null;
+  let derivedRoutingMismatch = false;
   for await (const row of streamRows(
     connection,
-    `SELECT source_id, source_ordinal, mutation_id, content_sha256, mutation_json FROM raw_mutation WHERE generation_id=${sql(processing.generationId)} ORDER BY source_id, source_ordinal`,
+    `SELECT source_id, source_ordinal, partition_id, sort_key, mutation_id, content_sha256, mutation_json FROM raw_mutation WHERE generation_id=${sql(processing.generationId)} ORDER BY source_id, source_ordinal`,
   )) {
+    const sourceId = stringValue(row.source_id);
+    const sourceOrdinal = numberValue(row.source_ordinal);
     const body = stringValue(row.mutation_json);
     const mutation = canonicalMutationSchema.parse(JSON.parse(body));
     if (
-      mutation.sourceId !== stringValue(row.source_id) ||
+      mutation.sourceId !== sourceId ||
       mutation.mutationId !== stringValue(row.mutation_id) ||
       createHash('sha256').update(body).digest('hex') !== stringValue(row.content_sha256)
     )
       throw new BoundedPipelineIntegrityError(
         'Durable mutation spool row identity/content mismatch',
       );
+    if (sourceId !== currentSourceId) {
+      currentSourceId = sourceId;
+      expectedSourceOrdinal = 0;
+    }
+    if (sourceOrdinal !== expectedSourceOrdinal) {
+      ordinalDiscontinuitySourceId ??= sourceId;
+    }
+    expectedSourceOrdinal += 1;
+    if (
+      numberValue(row.partition_id) !==
+        partitionForMutation(mutation, processing.partitionPlan.partitionCount) ||
+      stringValue(row.sort_key) !== mutationSortKeyHex(mutation)
+    ) {
+      derivedRoutingMismatch = true;
+    }
     hash.update(`${body}\n`);
     recordCount += 1;
+  }
+  if (ordinalDiscontinuitySourceId !== null) {
+    throw new BoundedPipelineIntegrityError(
+      `Durable mutation spool source ordinals are not contiguous: ${ordinalDiscontinuitySourceId}`,
+    );
+  }
+  if (derivedRoutingMismatch) {
+    throw new BoundedPipelineIntegrityError(
+      'Durable mutation spool derived routing metadata mismatch',
+    );
   }
   return Object.freeze({ logicalSha256: hash.digest('hex'), recordCount });
 }

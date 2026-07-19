@@ -15,6 +15,7 @@ import {
   snapshotIdSchema,
   sourceIdSchema,
 } from '@oracle/contracts/ids';
+import { mutationSortKeyHex, partitionForMutation } from '@oracle/contracts/bounded-processing';
 import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
 import { acquiredArtifactSchema, type AcquiredArtifact } from '@oracle/contracts/source';
 import { normalizePropertyRecord } from '@oracle/canonical-model/normalizers/property';
@@ -95,6 +96,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-pipeline-'));
     const longScratchDirectory = join(root, 's'.repeat(Math.max(1, 129 - root.length - 1)));
     const scratchDirectory = join(root, 'scratch');
+    const partitionCount = 16;
     expect(longScratchDirectory.length).toBeGreaterThanOrEqual(129);
     const mutations = normalizePropertyRecord(
       {
@@ -225,6 +227,14 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       'before_finalize',
     ] as const;
     let crashIndex = 0;
+    const defaultCrash: NonNullable<
+      Parameters<typeof createBoundedPipelineProcessors>[0]['crash']
+    > = (point) => {
+      if (point === crashPoints[crashIndex]) {
+        crashIndex += 1;
+        throw new Error(`injected ${point} crash`);
+      }
+    };
     const expectNoSpillDirectories = async (directory = scratchDirectory) => {
       const entries = await readdir(directory, {
         withFileTypes: true,
@@ -233,11 +243,16 @@ describe('bounded_streaming_v2 pipeline composition', () => {
         entries.filter((entry) => entry.isDirectory() && /^\.t-[a-f0-9]{64}$/u.test(entry.name)),
       ).toEqual([]);
     };
-    const createProcessor = (processorScratchDirectory = scratchDirectory) =>
+    const createProcessor = (
+      processorScratchDirectory = scratchDirectory,
+      crash: NonNullable<
+        Parameters<typeof createBoundedPipelineProcessors>[0]['crash']
+      > = defaultCrash,
+    ) =>
       createBoundedPipelineProcessors({
         outputDirectory: join(root, 'output'),
         scratchDirectory: processorScratchDirectory,
-        partitionCount: 16,
+        partitionCount,
         budget: {
           policyVersion: 'bounded-process-budget-v1',
           maxBufferedRecords: 16,
@@ -251,12 +266,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
           maxBytesPerOutputChunk: 1024 * 1024,
           rssSampleIntervalRecords: 1,
         },
-        crash: (point) => {
-          if (point === crashPoints[crashIndex]) {
-            crashIndex += 1;
-            throw new Error(`injected ${point} crash`);
-          }
-        },
+        crash,
       });
     const request: BoundedCountyProcessingRequest = {
       configuration,
@@ -434,6 +444,44 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       leaseHolder.kill();
       await once(leaseHolder, 'exit');
     }
+    expect(sequence.recordCount).toBeGreaterThan(1);
+    let mutationReadAttempt = 0;
+    const interruptedSequence = Object.freeze({
+      ...sequence,
+      read: async function* () {
+        mutationReadAttempt += 1;
+        let ordinal = 0;
+        for await (const value of sequence.read()) {
+          if (mutationReadAttempt === 2 && ordinal === 1) {
+            throw new Error('injected interrupted mutation spool');
+          }
+          yield value;
+          ordinal += 1;
+        }
+      },
+    }) satisfies ChunkSequence<CanonicalMutation>;
+    const interruptedRequest: BoundedCountyProcessingRequest = {
+      ...request,
+      mutationSources: request.mutationSources.map((sourceInput) =>
+        sourceInput.sourceId === SOURCE_ID
+          ? { ...sourceInput, sequence: interruptedSequence }
+          : sourceInput,
+      ),
+    };
+    await expect(
+      createProcessor(longScratchDirectory).processBoundedCounty?.(interruptedRequest),
+    ).rejects.toThrow('injected interrupted mutation spool');
+    const recoveredDatabasePath = await boundedDatabaseFile(longScratchDirectory, RUN_ID);
+    const underfilledRows = await queryDuckDatabase(
+      recoveredDatabasePath,
+      'SELECT source_ordinal FROM raw_mutation ORDER BY source_id, source_ordinal',
+    );
+    expect(underfilledRows.length).toBeGreaterThan(0);
+    expect(underfilledRows.length).toBeLessThan(sequence.recordCount);
+    await runDuckDatabase(
+      recoveredDatabasePath,
+      'CREATE INDEX raw_partition_sort ON raw_mutation(generation_id, partition_id, sort_key, mutation_id)',
+    );
     const separateRoot = await mkdtemp(join(tmpdir(), 'oracle-bounded-separate-resource-'));
     const separateLeasePath = join(separateRoot, '.oracle-bounded-resource-lease.json');
     const separateLeaseHolder = spawn(
@@ -465,7 +513,10 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       await once(separateLeaseHolder, 'exit');
     }
     expect(observedTemporaryDirectories).toHaveLength(1);
-    const observedTemporaryDirectory = observedTemporaryDirectories[0] as string;
+    const observedTemporaryDirectory = observedTemporaryDirectories[0];
+    if (observedTemporaryDirectory === undefined) {
+      throw new Error('Expected one observed DuckDB temporary directory');
+    }
     expect(relative(longScratchDirectory, observedTemporaryDirectory)).toBe(
       basename(observedTemporaryDirectory),
     );
@@ -473,6 +524,81 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       join(observedTemporaryDirectory, 'duckdb_temp_storage_DEFAULT-0.tmp').length,
     ).toBeLessThan(260);
     await expectNoSpillDirectories(longScratchDirectory);
+    const mutationRowsQuery =
+      'SELECT generation_id, source_id, source_ordinal, partition_id, sort_key, mutation_id, content_sha256, mutation_json FROM raw_mutation ORDER BY source_id, source_ordinal';
+    const recoveredRows = await queryDuckDatabase(recoveredDatabasePath, mutationRowsQuery);
+    expect(recoveredRows).toHaveLength(sequence.recordCount);
+    expect(
+      await queryDuckDatabase(
+        recoveredDatabasePath,
+        "SELECT index_name FROM duckdb_indexes() WHERE index_name='raw_partition_sort'",
+      ),
+    ).toEqual([]);
+
+    const cleanScratchDirectory = join(root, 'clean-spool');
+    await expect(
+      createProcessor(cleanScratchDirectory, (point) => {
+        if (point === 'after_mutation_spool') throw new Error('injected clean spool crash');
+      }).processBoundedCounty?.(request),
+    ).rejects.toThrow('injected clean spool crash');
+    const cleanDatabasePath = await boundedDatabaseFile(cleanScratchDirectory, RUN_ID);
+    expect(await queryDuckDatabase(cleanDatabasePath, mutationRowsQuery)).toEqual(recoveredRows);
+
+    const metadataTarget = recoveredRows[0];
+    if (metadataTarget === undefined) throw new Error('Expected durable mutation metadata');
+    const metadataTargetWhere = `generation_id=${duckSql(String(metadataTarget.generation_id))} AND source_id=${duckSql(String(metadataTarget.source_id))} AND mutation_id=${duckSql(String(metadataTarget.mutation_id))}`;
+    const expectedPartitionId = Number(metadataTarget.partition_id);
+    if (!Number.isSafeInteger(expectedPartitionId)) {
+      throw new Error('Expected a safe durable mutation partition identifier');
+    }
+    const expectedSortKey = String(metadataTarget.sort_key);
+    await runDuckDatabase(
+      cleanDatabasePath,
+      `UPDATE raw_mutation SET partition_id=${(expectedPartitionId + 1) % partitionCount}, sort_key=${duckSql(`${expectedSortKey}00`)} WHERE ${metadataTargetWhere}`,
+    );
+    await expect(
+      createProcessor(cleanScratchDirectory).processBoundedCounty?.(request),
+    ).rejects.toThrow('Durable mutation spool derived routing metadata mismatch');
+    await runDuckDatabase(
+      cleanDatabasePath,
+      `UPDATE raw_mutation SET partition_id=${expectedPartitionId}, sort_key=${duckSql(expectedSortKey)} WHERE ${metadataTargetWhere}`,
+    );
+
+    const expectedSourceOrdinal = String(metadataTarget.source_ordinal);
+    await runDuckDatabase(
+      cleanDatabasePath,
+      `UPDATE raw_mutation SET source_ordinal=source_ordinal+${sequence.recordCount} WHERE ${metadataTargetWhere}`,
+    );
+    await expect(
+      createProcessor(cleanScratchDirectory).processBoundedCounty?.(request),
+    ).rejects.toThrow('Durable mutation spool source ordinals are not contiguous');
+    await runDuckDatabase(
+      cleanDatabasePath,
+      `UPDATE raw_mutation SET source_ordinal=${expectedSourceOrdinal} WHERE ${metadataTargetWhere}`,
+    );
+
+    const collisionIdentity = recoveredRows[0];
+    const collisionTarget = recoveredRows.find(
+      (row) => row.mutation_id !== collisionIdentity?.mutation_id,
+    );
+    if (collisionIdentity === undefined || collisionTarget === undefined) {
+      throw new Error('Expected two distinct mutation identities in the durable spool');
+    }
+    const collisionMutation = parseJsonObject(String(collisionTarget.mutation_json));
+    const conflictingMutation = {
+      ...collisionMutation,
+      mutationId: String(collisionIdentity.mutation_id),
+    };
+    const collisionBody = canonicalJson(conflictingMutation);
+    const collisionContentSha256 = createHash('sha256').update(collisionBody).digest('hex');
+    await runDuckDatabase(
+      recoveredDatabasePath,
+      `UPDATE raw_mutation SET partition_id=${partitionForMutation(conflictingMutation, partitionCount)}, sort_key=${duckSql(mutationSortKeyHex(conflictingMutation))}, mutation_id=${duckSql(String(collisionIdentity.mutation_id))}, content_sha256=${duckSql(collisionContentSha256)}, mutation_json=${duckSql(collisionBody)} WHERE generation_id=${duckSql(String(collisionTarget.generation_id))} AND source_id=${duckSql(String(collisionTarget.source_id))} AND source_ordinal=${String(collisionTarget.source_ordinal)}`,
+    );
+    await expect(
+      createProcessor(longScratchDirectory).processBoundedCounty?.(request),
+    ).rejects.toThrow('Mutation identity was reused for different content');
+
     for (const point of crashPoints.slice(1)) {
       await expect(createProcessor().processBoundedCounty?.(request)).rejects.toThrow(
         `injected ${point} crash`,
@@ -1281,6 +1407,51 @@ async function readStoredJson(
     byteLength += chunk.byteLength;
   }
   return JSON.parse(Buffer.concat(chunks, byteLength).toString('utf8')) as unknown;
+}
+
+async function boundedDatabaseFile(scratchRoot: string, runId: string): Promise<string> {
+  const runRoot = join(scratchRoot, createHash('sha256').update(runId).digest('hex'));
+  const generationDirectories = (await readdir(runRoot, { withFileTypes: true })).filter((entry) =>
+    entry.isDirectory(),
+  );
+  if (generationDirectories.length !== 1 || generationDirectories[0] === undefined) {
+    throw new Error('Expected exactly one bounded generation database');
+  }
+  return join(runRoot, generationDirectories[0].name, 'bounded-county.duckdb');
+}
+
+async function queryDuckDatabase(
+  path: string,
+  query: string,
+): Promise<readonly Readonly<Record<string, unknown>>[]> {
+  const instance = await DuckDBInstance.create(path);
+  const connection = await instance.connect();
+  try {
+    const result = await connection.stream(query);
+    const rows: Readonly<Record<string, unknown>>[] = [];
+    for await (const batch of result.yieldRowObjectJs()) {
+      for (const row of batch) rows.push(row);
+    }
+    return Object.freeze(rows);
+  } finally {
+    connection.closeSync();
+    instance.closeSync();
+  }
+}
+
+async function runDuckDatabase(path: string, statement: string): Promise<void> {
+  const instance = await DuckDBInstance.create(path);
+  const connection = await instance.connect();
+  try {
+    await connection.run(statement);
+  } finally {
+    connection.closeSync();
+    instance.closeSync();
+  }
+}
+
+function duckSql(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
 }
 
 async function readParquetRows(
