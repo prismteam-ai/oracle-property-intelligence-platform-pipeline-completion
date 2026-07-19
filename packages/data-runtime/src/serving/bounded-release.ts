@@ -973,6 +973,17 @@ async function buildOrAdoptRelation(
     while (batchReleases.length > 0) batchReleases.pop()?.();
     sinceFlush = 0;
   };
+  const acquireWithBatchRelief = (records: number, bytes: number): (() => void) => {
+    const snapshot = input.telemetry.coordinator.snapshot();
+    if (
+      batchReleases.length > 0 &&
+      (snapshot.bufferedRecords + records > input.processing.budget.maxBufferedRecords ||
+        snapshot.bufferedBytes + bytes > input.processing.budget.maxBufferedBytes)
+    ) {
+      releaseBatch();
+    }
+    return input.telemetry.acquire(records, bytes);
+  };
   try {
     for await (const artifact of exactRelationArtifacts(input.source, input.completedBuildMarts)) {
       inventory.observe(artifact);
@@ -984,6 +995,7 @@ async function buildOrAdoptRelation(
         input.processing.budget,
         input.telemetry,
         input.readArtifact,
+        acquireWithBatchRelief,
       )) {
         const sortKey = rowSortKey(definition, row);
         if (previousSortKey !== undefined && compareUtf8(previousSortKey, sortKey) > 0) {
@@ -991,7 +1003,8 @@ async function buildOrAdoptRelation(
         }
         previousSortKey = sortKey;
         logicalHash.update(`${canonicalJson(row)}\n`);
-        batchReleases.push(input.telemetry.acquire(1, residentBytes * 2));
+        const retainedBytes = residentBytes * 2;
+        batchReleases.push(acquireWithBatchRelief(1, retainedBytes));
         appendRow(appender, definition.columns, row);
         appendPrivacyHashes(
           row,
@@ -1487,6 +1500,8 @@ async function* readVerifiedRows(
   policy: BoundedProcessingBudget,
   telemetry: ServingBudgetTelemetry,
   readArtifact: BoundedServingReleaseBuildInput['readArtifact'],
+  acquireLease: (records: number, bytes: number) => () => void = (records, bytes) =>
+    telemetry.acquire(records, bytes),
 ): AsyncIterable<Readonly<{ row: ServingRow; residentBytes: number }>> {
   const hash = createHash('sha256');
   let bytes = 0;
@@ -1499,7 +1514,7 @@ async function* readVerifiedRows(
     1,
     Math.min(64 * 1024, maximumLineBytes, Math.floor(policy.maxBufferedBytes / 8)),
   );
-  const releaseStreamBuffer = telemetry.acquire(0, highWaterMark);
+  const releaseStreamBuffer = acquireLease(0, highWaterMark);
   try {
     const chunks: AsyncIterable<Uint8Array> =
       readArtifact === undefined
@@ -1518,13 +1533,13 @@ async function* readVerifiedRows(
       if (readArtifact !== undefined && bytes + buffer.byteLength > artifact.byteSize) {
         throw new BoundedReleaseCorruptionError(artifact.logicalKey);
       }
-      const releaseChunk = telemetry.acquire(0, buffer.byteLength);
+      const releaseChunk = acquireLease(0, buffer.byteLength);
       hash.update(buffer);
       bytes += buffer.byteLength;
       const combinedBytes = pending.byteLength + buffer.byteLength;
       let releaseCombined: () => void;
       try {
-        releaseCombined = telemetry.acquire(0, combinedBytes);
+        releaseCombined = acquireLease(0, combinedBytes);
       } catch (error) {
         releaseChunk();
         throw error;
@@ -1548,7 +1563,7 @@ async function* readVerifiedRows(
           start = index + 1;
           if (line.byteLength > maximumLineBytes) throw new BoundedLineBudgetError();
           const residentBytes = Math.max(1, line.byteLength);
-          const releaseRow = telemetry.acquire(1, residentBytes * 4);
+          const releaseRow = acquireLease(1, residentBytes * 4);
           try {
             const row = validateRow(definition, JSON.parse(line.toString('utf8')) as unknown);
             const sortKey = rowSortKey(definition, row);
@@ -1562,7 +1577,7 @@ async function* readVerifiedRows(
         }
         const remainderBytes = combined.byteLength - start;
         if (remainderBytes > maximumLineBytes) throw new BoundedLineBudgetError();
-        const nextReleasePending = telemetry.acquire(0, remainderBytes);
+        const nextReleasePending = acquireLease(0, remainderBytes);
         try {
           pending = Buffer.from(combined.subarray(start));
           releasePending = nextReleasePending;

@@ -239,6 +239,56 @@ function checkpointForBuildMarts(
 }
 
 describe('bounded serving release v2', () => {
+  it('flushes retained rows before the verifier lease exhausts a tight shared budget', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-serving-tight-budget-'));
+    const baseline = processingInput();
+    const processing = processingInput({
+      budget: {
+        ...baseline.budget,
+        maxBufferedRecords: 2,
+        maxRecordsPerOutputChunk: 2,
+        rssSampleIntervalRecords: 1,
+      },
+    });
+    let relations = await relationInputs(root, processing);
+    const fieldCoverage = relations.find(
+      ({ visibility, relation }) => visibility === 'public' && relation === 'field_coverage',
+    );
+    const fieldCoverageArtifact = fieldCoverage?.artifacts?.[0];
+    if (fieldCoverageArtifact === undefined) throw new Error('fixture field coverage');
+    const firstRow = JSON.parse(
+      (await readFile(new URL(fieldCoverageArtifact.uri), 'utf8')).trim(),
+    ) as Record<string, null | boolean | number | string>;
+    const secondRow = {
+      ...firstRow,
+      field_name: `${String(firstRow.field_name)}-second`,
+    };
+    relations = await replaceRelationRows(relations, 'public', 'field_coverage', [
+      firstRow,
+      secondRow,
+    ]);
+
+    const release = await buildBoundedServingRelease({
+      processing,
+      relations,
+      ...releaseControls(processing),
+      outputDirectory: join(root, 'release'),
+      scratchDirectory: join(root, 'scratch'),
+      writeBatchRecords: 2,
+      maximumLineBytes: 64 * 1024,
+    });
+
+    expect(release.evidence.budget.peakBufferedRecords).toBeLessThanOrEqual(2);
+    expect(release.evidence.budget.peakBufferedBytes).toBeLessThanOrEqual(
+      processing.budget.maxBufferedBytes,
+    );
+    expect(
+      release.manifest.artifacts.find(
+        ({ relativePath }) => relativePath === 'public/field-coverage.parquet',
+      )?.rowCount,
+    ).toBe(2);
+  });
+
   it('writes and reopens all seven visibility-preserving relations deterministically', async () => {
     const rootA = await mkdtemp(join(tmpdir(), 'oracle-bounded-serving-a-'));
     const rootB = await mkdtemp(join(tmpdir(), 'oracle-bounded-serving-b-'));
