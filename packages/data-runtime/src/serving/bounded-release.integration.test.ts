@@ -1758,6 +1758,104 @@ describe('bounded serving release v2', () => {
     ).rejects.toBeInstanceOf(BoundedFinalizationRaceError);
   }, 120_000);
 
+  it('streams portable immutable artifacts and fails closed for hostile injected bytes', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-serving-portable-stream-'));
+    const processing = processingInput();
+    const physicalRelations = await relationInputs(root, processing);
+    const bytesByLogicalKey = new Map<string, Uint8Array>();
+    const relations = await Promise.all(
+      physicalRelations.map(async (relation): Promise<BoundedServingRelationInput> => {
+        const artifacts = await Promise.all(
+          (relation.artifacts ?? []).map(async (artifact): Promise<ImmutableBoundedArtifact> => {
+            bytesByLogicalKey.set(artifact.logicalKey, await readFile(new URL(artifact.uri)));
+            return Object.freeze({
+              ...artifact,
+              uri: `file://oracle-artifact/${encodeURIComponent(artifact.logicalKey)}`,
+            });
+          }),
+        );
+        return Object.freeze({ ...relation, artifacts: Object.freeze(artifacts) });
+      }),
+    );
+    const exactReader: NonNullable<BoundedServingReleaseBuildInput['readArtifact']> = (
+      artifact,
+      range,
+    ) =>
+      (async function* (): AsyncIterable<Uint8Array> {
+        await Promise.resolve();
+        const bytes = bytesByLogicalKey.get(artifact.logicalKey);
+        if (bytes === undefined) throw new Error('fixture portable artifact');
+        const selected = bytes.subarray(range.start, range.endInclusive + 1);
+        for (let offset = 0; offset < selected.byteLength; offset += 7) {
+          yield selected.subarray(offset, Math.min(offset + 7, selected.byteLength));
+        }
+      })();
+    const build = (name: string, readArtifact?: BoundedServingReleaseBuildInput['readArtifact']) =>
+      buildBoundedServingRelease({
+        processing,
+        relations,
+        ...releaseControls(processing),
+        finalization: {
+          attemptId: `portable-${name}`,
+          coordinator: releaseControls(processing).finalization.coordinator,
+        },
+        outputDirectory: join(root, `${name}-release`),
+        scratchDirectory: join(root, `${name}-scratch`),
+        writeBatchRecords: 1,
+        maximumLineBytes: 64 * 1024,
+        ...(readArtifact === undefined ? {} : { readArtifact }),
+      });
+
+    await expect(build('no-reader')).rejects.toThrow();
+    const released = await build('exact', exactReader);
+    await expect(verifyBoundedServingRelease(released.outputDirectory)).resolves.toBeDefined();
+    await expect(build('exact', exactReader)).resolves.toMatchObject({
+      adoptedIdenticalWinner: true,
+    });
+
+    const hostileReader =
+      (
+        mutation: 'tampered' | 'truncated' | 'oversized',
+      ): NonNullable<BoundedServingReleaseBuildInput['readArtifact']> =>
+      (artifact, range) =>
+        (async function* (): AsyncIterable<Uint8Array> {
+          await Promise.resolve();
+          const exact = bytesByLogicalKey.get(artifact.logicalKey);
+          if (exact === undefined) throw new Error('fixture portable artifact');
+          if (mutation === 'oversized') {
+            yield new Uint8Array(64 * 1024 + 1);
+            return;
+          }
+          if (mutation === 'tampered' && artifact.dataset !== 'public/pipeline_runs') {
+            yield exact.subarray(range.start, range.endInclusive + 1);
+            return;
+          }
+          const changed = Uint8Array.from(exact.subarray(range.start, range.endInclusive + 1));
+          if (mutation === 'truncated') {
+            yield changed.subarray(0, changed.byteLength - 1);
+            return;
+          }
+          const marker = Buffer.from('"expected_count":1');
+          const markerOffset = Buffer.from(exact).indexOf(marker);
+          if (markerOffset < 0) throw new Error('fixture tamper marker');
+          const changedOffset = markerOffset + marker.byteLength - 1 - range.start;
+          if (changedOffset >= 0 && changedOffset < changed.byteLength) {
+            changed[changedOffset] = '2'.charCodeAt(0);
+          }
+          yield changed;
+        })();
+
+    await expect(build('tampered', hostileReader('tampered'))).rejects.toBeInstanceOf(
+      BoundedReleaseCorruptionError,
+    );
+    await expect(build('truncated', hostileReader('truncated'))).rejects.toBeInstanceOf(
+      BoundedReleaseCorruptionError,
+    );
+    await expect(build('oversized', hostileReader('oversized'))).rejects.toBeInstanceOf(
+      BoundedServingBudgetError,
+    );
+  }, 120_000);
+
   it('rejects RSS overflow and combined stream buffers without retaining leases', async () => {
     const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-serving-budget-'));
     const processing = processingInput();

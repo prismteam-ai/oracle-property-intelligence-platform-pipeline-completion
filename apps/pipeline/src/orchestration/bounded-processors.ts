@@ -4005,6 +4005,7 @@ async function buildMarts(
         resolver: trustedAcquisition.resolver,
       }),
       trustedCanonicalLineage: canonicalLineageResolver(connection, processing.generationId),
+      readArtifact: (artifact, range) => request.artifactStore.read(artifact.uri, range),
       finalization: Object.freeze({
         attemptId: `${processing.generationId}:${releaseCheckpoint.expectedRevision}`,
         coordinator: new FileReleaseFinalizationCoordinator(join(root, 'release-finalization')),

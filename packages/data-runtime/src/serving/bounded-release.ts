@@ -238,6 +238,15 @@ export type BoundedServingReleaseBuildInput = Readonly<{
     coordinator: BoundedReleaseFinalizationCoordinator;
   }>;
   sharedBudget: ProcessWideServingBudgetCoordinator;
+  /**
+   * Opens the exact inclusive byte range without changing descriptor identity.
+   * The release builder bounds every requested range to its stream budget.
+   * Standalone callers may omit this to retain strict local file-URI reads.
+   */
+  readArtifact?: (
+    artifact: ImmutableBoundedArtifact,
+    range: Readonly<{ start: number; endInclusive: number }>,
+  ) => AsyncIterable<Uint8Array>;
   rssSampler?: () => number;
 }>;
 
@@ -612,6 +621,7 @@ export async function buildBoundedServingRelease(
             publicHashes,
             restrictedHashes,
             telemetry,
+            readArtifact: input.readArtifact,
           });
           buildCheckpoint = await checkpointArtifact(
             staging,
@@ -920,6 +930,7 @@ async function buildOrAdoptRelation(
     publicHashes: DuckDBAppender;
     restrictedHashes: DuckDBAppender;
     telemetry: ServingBudgetTelemetry;
+    readArtifact: BoundedServingReleaseBuildInput['readArtifact'];
   }>,
 ): Promise<BuildCheckpointArtifact> {
   const definition = BOUNDED_SERVING_RELATIONS[input.source.relation];
@@ -972,6 +983,7 @@ async function buildOrAdoptRelation(
         input.maximumLineBytes,
         input.processing.budget,
         input.telemetry,
+        input.readArtifact,
       )) {
         const sortKey = rowSortKey(definition, row);
         if (previousSortKey !== undefined && compareUtf8(previousSortKey, sortKey) > 0) {
@@ -1029,6 +1041,7 @@ async function verifyInputRelation(
     publicHashes: DuckDBAppender;
     restrictedHashes: DuckDBAppender;
     telemetry: ServingBudgetTelemetry;
+    readArtifact: BoundedServingReleaseBuildInput['readArtifact'];
   }>,
   definition: ServingRelationDefinition,
 ): Promise<void> {
@@ -1050,6 +1063,7 @@ async function verifyInputRelation(
       input.maximumLineBytes,
       input.processing.budget,
       input.telemetry,
+      input.readArtifact,
     )) {
       const sortKey = rowSortKey(definition, row);
       if (previousSortKey !== undefined && compareUtf8(previousSortKey, sortKey) > 0) {
@@ -1472,8 +1486,8 @@ async function* readVerifiedRows(
   maximumLineBytes: number,
   policy: BoundedProcessingBudget,
   telemetry: ServingBudgetTelemetry,
+  readArtifact: BoundedServingReleaseBuildInput['readArtifact'],
 ): AsyncIterable<Readonly<{ row: ServingRow; residentBytes: number }>> {
-  const path = artifactPath(artifact);
   const hash = createHash('sha256');
   let bytes = 0;
   let records = 0;
@@ -1487,8 +1501,23 @@ async function* readVerifiedRows(
   );
   const releaseStreamBuffer = telemetry.acquire(0, highWaterMark);
   try {
-    for await (const chunk of createReadStream(path, { highWaterMark })) {
+    const chunks: AsyncIterable<Uint8Array> =
+      readArtifact === undefined
+        ? createReadStream(artifactPath(artifact), { highWaterMark })
+        : readArtifactInBoundedRanges(artifact, readArtifact, highWaterMark);
+    for await (const chunk of chunks) {
+      if (!(chunk instanceof Uint8Array) || chunk.byteLength === 0) {
+        throw new BoundedReleaseCorruptionError(artifact.logicalKey);
+      }
+      if (readArtifact !== undefined && chunk.byteLength > highWaterMark) {
+        throw new BoundedServingBudgetError(
+          'Immutable artifact reader exceeded the bounded stream chunk size',
+        );
+      }
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (readArtifact !== undefined && bytes + buffer.byteLength > artifact.byteSize) {
+        throw new BoundedReleaseCorruptionError(artifact.logicalKey);
+      }
       const releaseChunk = telemetry.acquire(0, buffer.byteLength);
       hash.update(buffer);
       bytes += buffer.byteLength;
@@ -1558,6 +1587,36 @@ async function* readVerifiedRows(
     lastSortKey !== artifact.lastSortKey
   ) {
     throw new BoundedReleaseCorruptionError(artifact.logicalKey);
+  }
+}
+
+async function* readArtifactInBoundedRanges(
+  artifact: ImmutableBoundedArtifact,
+  readArtifact: NonNullable<BoundedServingReleaseBuildInput['readArtifact']>,
+  maximumRangeBytes: number,
+): AsyncIterable<Uint8Array> {
+  for (let start = 0; start < artifact.byteSize; start += maximumRangeBytes) {
+    const endInclusive = Math.min(artifact.byteSize - 1, start + maximumRangeBytes - 1);
+    const expectedBytes = endInclusive - start + 1;
+    let observedBytes = 0;
+    for await (const chunk of readArtifact(artifact, { start, endInclusive })) {
+      if (!(chunk instanceof Uint8Array) || chunk.byteLength === 0) {
+        throw new BoundedReleaseCorruptionError(artifact.logicalKey);
+      }
+      if (chunk.byteLength > maximumRangeBytes) {
+        throw new BoundedServingBudgetError(
+          'Immutable artifact reader exceeded the bounded stream chunk size',
+        );
+      }
+      observedBytes += chunk.byteLength;
+      if (observedBytes > expectedBytes) {
+        throw new BoundedReleaseCorruptionError(artifact.logicalKey);
+      }
+      yield chunk;
+    }
+    if (observedBytes !== expectedBytes) {
+      throw new BoundedReleaseCorruptionError(artifact.logicalKey);
+    }
   }
 }
 
@@ -1767,6 +1826,9 @@ function assertReleaseInputBounds(input: BoundedServingReleaseBuildInput): void 
     typeof (sharedBudget as ProcessWideServingBudgetCoordinator).snapshot !== 'function'
   ) {
     throw new BoundedBuildConfigurationError('explicit shared process budget coordinator');
+  }
+  if (input.readArtifact !== undefined && typeof input.readArtifact !== 'function') {
+    throw new BoundedBuildConfigurationError('immutable artifact reader');
   }
   if (
     trustedCanonicalLineage === null ||

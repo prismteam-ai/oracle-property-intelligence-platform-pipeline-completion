@@ -67,7 +67,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     expect(boundedCandidateAddressNumber('Main Street')).toBeNull();
   });
 
-  it('runs canonical, reconciliation, feature, and portable release stages without row arrays', async () => {
+  it('runs canonical, reconciliation, feature, and portable release stages through opaque artifact URIs without row arrays', async () => {
     const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-pipeline-'));
     const mutations = normalizePropertyRecord(
       {
@@ -105,10 +105,12 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     const failedSequence = chunkSequence(failedMutations);
     expect(failedSequence.recordCount).toBeGreaterThan(0);
     expect(failedSequence.recordCount).toBe(failedMutations.length);
-    const artifactStore = new LocalArtifactStore({
+    const localArtifactStore = new LocalArtifactStore({
       rootDirectory: join(root, 'artifacts'),
       now: () => NOW,
     });
+    const opaqueMartStore = createOpaqueMartArtifactStore(localArtifactStore);
+    const artifactStore = opaqueMartStore.store;
     const checkpointStore = new LocalCheckpointStore({ rootDirectory: join(root, 'checkpoints') });
     const source = sourceManifest(mutations.length);
     const failedSource = Object.freeze({
@@ -429,12 +431,24 @@ describe('bounded_streaming_v2 pipeline composition', () => {
         sourceIds: readonly string[];
         limitations: readonly string[];
       }>[];
+      budget: Readonly<{
+        peakBufferedRecords: number;
+        peakBufferedBytes: number;
+        maxBufferedRecords: number;
+        maxBufferedBytes: number;
+      }>;
     }>;
     expect(releaseEvidence).toMatchObject({
       runStatus: 'failed',
       releaseScope: 'partial_county',
       countyCompletionClaim: false,
     });
+    expect(releaseEvidence.budget.peakBufferedRecords).toBeLessThanOrEqual(
+      releaseEvidence.budget.maxBufferedRecords,
+    );
+    expect(releaseEvidence.budget.peakBufferedBytes).toBeLessThanOrEqual(
+      releaseEvidence.budget.maxBufferedBytes,
+    );
     expect(
       releaseEvidence.sourceStates.find(({ sourceId }) => sourceId === BLOCKED_SOURCE_ID),
     ).toMatchObject({ terminalState: 'blocked' });
@@ -605,6 +619,42 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       'finalize_release',
     ]);
     expect(checkpoint?.finalization?.state).toMatch(/^(?:promoted|adopted_identical_winner)$/u);
+    const buildMartsStage = checkpoint?.completedStages.find(
+      ({ stage }) => stage === 'build_marts',
+    );
+    if (buildMartsStage === undefined) throw new Error('build_marts stage is missing');
+    const buildMartsManifestArtifact = await artifactStore.headByLogicalKey(
+      `bsm/${buildMartsStage.outputManifestSha256}.json`,
+    );
+    if (buildMartsManifestArtifact === undefined) {
+      throw new Error('build_marts stage manifest object is missing');
+    }
+    const buildMartsManifest = (await readStoredJson(
+      artifactStore,
+      buildMartsManifestArtifact.uri,
+    )) as Readonly<{
+      artifacts: readonly Readonly<{
+        dataset: string;
+        logicalKey: string;
+        uri: string;
+        byteSize: number;
+        sha256: string;
+      }>[];
+    }>;
+    const martDescriptors = buildMartsManifest.artifacts
+      .map((artifact) => ({
+        logicalKey: artifact.logicalKey,
+        uri: artifact.uri,
+        byteSize: artifact.byteSize,
+        sha256: artifact.sha256,
+      }))
+      .sort((left, right) => left.logicalKey.localeCompare(right.logicalKey, 'en-US'));
+    expect(martDescriptors).toEqual(opaqueMartStore.descriptors());
+    expect(new Set(buildMartsManifest.artifacts.map(({ dataset }) => dataset)).size).toBe(12);
+    expect(martDescriptors.every(({ uri }) => uri.startsWith('file://oracle-artifact/'))).toBe(
+      true,
+    );
+    expect(martDescriptors.every(({ uri }) => opaqueMartStore.readUris().includes(uri))).toBe(true);
     for (const stage of checkpoint?.completedStages ?? []) {
       expect(
         await artifactStore.headByLogicalKey(`bsm/${stage.outputManifestSha256}.json`),
@@ -975,6 +1025,105 @@ async function* oneBuffer(value: Uint8Array): AsyncIterable<Uint8Array> {
   yield await Promise.resolve(value);
 }
 
+function createOpaqueMartArtifactStore(delegate: LocalArtifactStore): Readonly<{
+  store: BoundedCountyProcessingRequest['artifactStore'];
+  descriptors: () => readonly Readonly<{
+    logicalKey: string;
+    uri: string;
+    byteSize: number;
+    sha256: string;
+  }>[];
+  readUris: () => readonly string[];
+}> {
+  type PipelineArtifactStore = BoundedCountyProcessingRequest['artifactStore'];
+  const descriptors = new Map<
+    string,
+    Readonly<{ logicalKey: string; uri: string; byteSize: number; sha256: string }>
+  >();
+  const readUris: string[] = [];
+  const isMartKey = (logicalKey: string): boolean => logicalKey.startsWith('bm/');
+  const opaqueUri = (logicalKey: string): string =>
+    `file://oracle-artifact/${Buffer.from(logicalKey, 'utf8').toString('base64url')}`;
+  const logicalKeyFromOpaqueUri = (uri: string): string | null => {
+    const parsed = new URL(uri);
+    if (parsed.protocol !== 'file:' || parsed.hostname !== 'oracle-artifact') return null;
+    return Buffer.from(parsed.pathname.slice(1), 'base64url').toString('utf8');
+  };
+  const restore = <
+    T extends Readonly<{
+      logicalKey: string;
+      uri: string;
+      byteSize: number;
+      sha256: string;
+    }>,
+  >(
+    stored: T,
+  ): T => {
+    if (!isMartKey(stored.logicalKey)) return stored;
+    const restored = Object.freeze({ ...stored, uri: opaqueUri(stored.logicalKey) }) as T;
+    descriptors.set(
+      stored.logicalKey,
+      Object.freeze({
+        logicalKey: restored.logicalKey,
+        uri: restored.uri,
+        byteSize: restored.byteSize,
+        sha256: restored.sha256,
+      }),
+    );
+    return restored;
+  };
+  const physicalUri = async (uri: string): Promise<string> => {
+    const logicalKey = logicalKeyFromOpaqueUri(uri);
+    if (logicalKey === null) return uri;
+    const stored = await delegate.headByLogicalKey(logicalKey);
+    if (stored === undefined) throw new Error(`Opaque fixture artifact is missing: ${logicalKey}`);
+    return stored.uri;
+  };
+  const store: PipelineArtifactStore = Object.freeze({
+    putImmutable: async (request: Parameters<PipelineArtifactStore['putImmutable']>[0]) =>
+      restore(await delegate.putImmutable(request)),
+    putImmutableStreaming: async (
+      request: Parameters<PipelineArtifactStore['putImmutableStreaming']>[0],
+    ) => restore(await delegate.putImmutableStreaming(request)),
+    head: async (uri: string) => {
+      const stored = await delegate.head(await physicalUri(uri));
+      return stored === undefined ? undefined : restore(stored);
+    },
+    headByLogicalKey: async (logicalKey: string) => {
+      const stored = await delegate.headByLogicalKey(logicalKey);
+      return stored === undefined ? undefined : restore(stored);
+    },
+    read: (uri: string, range?: Parameters<PipelineArtifactStore['read']>[1]) =>
+      (async function* (): AsyncIterable<Uint8Array> {
+        if (logicalKeyFromOpaqueUri(uri) !== null) readUris.push(uri);
+        yield* delegate.read(await physicalUri(uri), range);
+      })(),
+  });
+  return Object.freeze({
+    store,
+    descriptors: () =>
+      Object.freeze(
+        [...descriptors.values()].sort((left, right) =>
+          left.logicalKey.localeCompare(right.logicalKey, 'en-US'),
+        ),
+      ),
+    readUris: () => Object.freeze([...readUris]),
+  });
+}
+
+async function readStoredJson(
+  store: BoundedCountyProcessingRequest['artifactStore'],
+  uri: string,
+): Promise<unknown> {
+  const chunks: Uint8Array[] = [];
+  let byteLength = 0;
+  for await (const chunk of store.read(uri)) {
+    chunks.push(chunk);
+    byteLength += chunk.byteLength;
+  }
+  return JSON.parse(Buffer.concat(chunks, byteLength).toString('utf8')) as unknown;
+}
+
 async function readParquetRows(
   path: string,
 ): Promise<readonly Readonly<Record<string, unknown>>[]> {
@@ -1026,7 +1175,7 @@ function chunkSequence<T>(values: readonly T[]): ChunkSequence<T> {
 }
 
 async function rootedChunkSequence<T>(
-  artifactStore: LocalArtifactStore,
+  artifactStore: BoundedCountyProcessingRequest['artifactStore'],
   values: readonly T[],
 ): Promise<ChunkSequence<T>> {
   const logicalPrefix = 'fixture/rooted-mutations';
@@ -1054,7 +1203,7 @@ function sourceManifest(accepted: number): SourceExecutionManifest {
 }
 
 async function acquiredArtifact(
-  artifactStore: LocalArtifactStore,
+  artifactStore: BoundedCountyProcessingRequest['artifactStore'],
   sourceId: SourceExecutionManifest['sourceId'],
   snapshotId: SourceExecutionManifest['snapshotId'],
 ): Promise<AcquiredArtifact> {
