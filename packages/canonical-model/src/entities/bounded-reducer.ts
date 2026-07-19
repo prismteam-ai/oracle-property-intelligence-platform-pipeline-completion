@@ -213,7 +213,7 @@ export async function reduceBoundedCanonicalPartition(
   try {
     for await (const value of input.mutations) {
       const releaseMutation = acquire(1, input.maximumMutationBytes);
-      let retainedMutationLease = false;
+      let validationLeaseReleased = false;
       try {
         const mutation = canonicalMutationSchema.parse(value);
         const mutationBytes = Buffer.byteLength(canonicalJson(mutation), 'utf8');
@@ -249,8 +249,12 @@ export async function reduceBoundedCanonicalPartition(
         }
 
         if (mutation.kind === 'entity_upsert' || mutation.kind === 'field_observation') {
-          entityGroupReleases.push(releaseMutation);
-          retainedMutationLease = true;
+          // Validation reserves the configured worst case before parsing. Retaining every
+          // validated mutation at that ceiling makes a small, valid entity group appear to use
+          // maximumMutationBytes * records, so replace it with the exact canonical byte lease.
+          releaseMutation();
+          validationLeaseReleased = true;
+          entityGroupReleases.push(acquire(1, mutationBytes));
           entityGroup.push(mutation);
           entityGroupBytes += mutationBytes;
           sampleBudget();
@@ -265,7 +269,7 @@ export async function reduceBoundedCanonicalPartition(
           artifactRecords += 1;
         }
       } finally {
-        if (!retainedMutationLease) releaseMutation();
+        if (!validationLeaseReleased) releaseMutation();
       }
       if (inputRecords % input.budget.rssSampleIntervalRecords === 0) sampleBudget();
     }

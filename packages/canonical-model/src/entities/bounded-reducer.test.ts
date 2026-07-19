@@ -202,6 +202,51 @@ describe('bounded canonical reduction', () => {
     expect(sharedBudget.snapshot()).toMatchObject({ bufferedRecords: 0, bufferedBytes: 0 });
   });
 
+  it('retains validated mutations at exact canonical bytes instead of the validation ceiling', async () => {
+    const mutations = fixture();
+    const aggregate = reduceCanonicalMutations(mutations).entities[0];
+    if (aggregate === undefined) throw new Error('Expected one canonical entity aggregate');
+    const mutationBytes = mutations.map((mutation) =>
+      Buffer.byteLength(canonicalJson(mutation), 'utf8'),
+    );
+    const totalMutationBytes = mutationBytes.reduce((total, bytes) => total + bytes, 0);
+    const maximumMutationBytes = Math.max(...mutationBytes) + 1_024;
+    const maximumAggregateBytes = Buffer.byteLength(canonicalJson(aggregate), 'utf8') + 1_024;
+    const maxBufferedBytes =
+      Math.max(maximumMutationBytes, totalMutationBytes + maximumAggregateBytes) + 1;
+    const exactBudget = {
+      ...budget,
+      maxBufferedRecords: mutations.length + 1,
+      maxRecordsPerOutputChunk: mutations.length + 1,
+      maxBufferedBytes,
+      maxBytesPerOutputChunk: maxBufferedBytes,
+    };
+    expect(mutations.length * maximumMutationBytes + maximumAggregateBytes).toBeGreaterThan(
+      exactBudget.maxBufferedBytes,
+    );
+
+    const transaction = new Transaction();
+    const sharedBudget = new ProcessWideBoundedBudget(exactBudget);
+    const summary = await reduceBoundedCanonicalPartition({
+      generationId: transaction.generationId,
+      partitionId: 0,
+      partitionCount: 1,
+      artifact: artifact(mutations),
+      budget: exactBudget,
+      maximumMutationBytes,
+      maximumAggregateBytes,
+      mutations: rows(mutations),
+      transaction,
+      sharedBudget,
+      sampleRssBytes: () => 1,
+    });
+
+    expect(summary.entityRecords).toBe(1);
+    expect(summary.peakBufferedBytes).toBeLessThanOrEqual(exactBudget.maxBufferedBytes);
+    expect(transaction.aborted).toBe(false);
+    expect(sharedBudget.snapshot()).toMatchObject({ bufferedRecords: 0, bufferedBytes: 0 });
+  });
+
   it('enforces one aggregate lease across two concurrent partition workers', async () => {
     const mutations = fixture();
     let entered: () => void = () => undefined;
