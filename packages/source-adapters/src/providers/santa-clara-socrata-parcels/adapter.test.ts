@@ -766,6 +766,21 @@ describe('Santa Clara Socrata parcel adapter', () => {
         mutation.observation.fieldPath === '/parcelGeometry',
     );
     expect(geometryObservation).not.toEqual(secondGeometryObservation);
+    const observationPaths = firstRun.flatMap((mutation) =>
+      mutation.kind === 'field_observation' ? [mutation.observation.fieldPath] : [],
+    );
+    expect(observationPaths).toEqual(
+      expect.arrayContaining([
+        '/county',
+        '/state',
+        '/apn',
+        '/jurisdiction',
+        '/primaryAddressId',
+        '/unitIds',
+        '/parcelGeometry',
+        '/landAreaSquareMeters',
+      ]),
+    );
     expect(
       firstRun.some(
         (mutation) =>
@@ -788,6 +803,7 @@ describe('Santa Clara Socrata parcel adapter', () => {
           artifactId: first.artifactId,
         });
         expect(mutation.observation.lineage.transformations).toHaveLength(1);
+        expect(mutation.observation.lineage.transformations[0]?.version).toBe('1.1.0');
       }
     }
   });

@@ -1053,7 +1053,7 @@ export class SantaClaraSocrataParcelsAdapter implements StreamingSourceAdapter<
     const lineageFor = (value: JsonValue): FieldLineage => {
       const transformation = {
         name: 'santa-clara-socrata-parcels-normalize',
-        version: '1.0.0',
+        version: '1.1.0',
         appliedAt: record.retrievedAt,
         inputSha256: record.rawFeatureSha256,
         outputSha256: sha256Text(stableJson(value)),
@@ -1102,9 +1102,14 @@ export class SantaClaraSocrataParcelsAdapter implements StreamingSourceAdapter<
     yield entityMutation;
 
     const observations: readonly Readonly<{ fieldPath: string; value: JsonValue }>[] = [
+      { fieldPath: '/county', value: propertyCore.county },
+      { fieldPath: '/state', value: propertyCore.state },
       { fieldPath: '/apn', value: record.apn },
       { fieldPath: '/jurisdiction', value: record.jurisdiction },
+      { fieldPath: '/primaryAddressId', value: propertyCore.primaryAddressId },
+      { fieldPath: '/unitIds', value: propertyCore.unitIds },
       { fieldPath: '/parcelGeometry', value: record.geometry },
+      { fieldPath: '/landAreaSquareMeters', value: propertyCore.landAreaSquareMeters },
       { fieldPath: '/sourceObjectId', value: record.rowKey },
       ...Object.entries(record.properties)
         .sort(([left], [right]) => left.localeCompare(right))
