@@ -16,7 +16,10 @@ import {
   sourceIdSchema,
 } from '@oracle/contracts/ids';
 import { mutationSortKeyHex, partitionForMutation } from '@oracle/contracts/bounded-processing';
-import type { CanonicalMutation } from '@oracle/contracts/canonical/mutation';
+import {
+  canonicalMutationSchema,
+  type CanonicalMutation,
+} from '@oracle/contracts/canonical/mutation';
 import { acquiredArtifactSchema, type AcquiredArtifact } from '@oracle/contracts/source';
 import { normalizePropertyRecord } from '@oracle/canonical-model/normalizers/property';
 import {
@@ -567,7 +570,7 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     const expectedSourceOrdinal = String(metadataTarget.source_ordinal);
     await runDuckDatabase(
       cleanDatabasePath,
-      `UPDATE raw_mutation SET source_ordinal=source_ordinal+${sequence.recordCount} WHERE ${metadataTargetWhere}`,
+      `UPDATE raw_mutation SET source_ordinal=source_ordinal+1 WHERE ${metadataTargetWhere}`,
     );
     await expect(
       createProcessor(cleanScratchDirectory).processBoundedCounty?.(request),
@@ -957,6 +960,140 @@ describe('bounded_streaming_v2 pipeline composition', () => {
     await expect(createProcessor().processBoundedCounty?.(request)).rejects.toThrow();
   }, 180_000);
 
+  const largeSpoolRegression = async (): Promise<void> => {
+    const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-large-spool-'));
+    const artifactStore = new LocalArtifactStore({
+      rootDirectory: join(root, 'artifacts'),
+      now: () => NOW,
+    });
+    const checkpointStore = new LocalCheckpointStore({
+      rootDirectory: join(root, 'checkpoints'),
+    });
+    const largePayload = 'x'.repeat(5 * 1024);
+    const largeMutations = Object.freeze(
+      Array.from({ length: 28_000 }, (_, index) => {
+        const identity = createHash('sha256').update(`large-spool-${index}`).digest('hex');
+        return canonicalMutationSchema.parse({
+          kind: 'artifact_reference',
+          mutationId: `sc:mutation:${identity}`,
+          runId: RUN_ID,
+          sourceId: SOURCE_ID,
+          snapshotId: SNAPSHOT_ID,
+          sequence: index,
+          emittedAt: NOW,
+          visibility: 'public',
+          artifact: {
+            artifactId: `sc:artifact:sha256:${identity}`,
+            role: 'raw',
+            entityId: null,
+            description: largePayload,
+          },
+        });
+      }),
+    );
+    const baseSequence = chunkSequence(largeMutations);
+    let sequenceReadCalls = 0;
+    const sequence = Object.freeze({
+      ...baseSequence,
+      read: async function* () {
+        sequenceReadCalls += 1;
+        yield* baseSequence.read();
+      },
+    }) satisfies ChunkSequence<CanonicalMutation>;
+    const trustedArtifact = await acquiredArtifact(artifactStore, SOURCE_ID, SNAPSHOT_ID);
+    const blockedDependencies = [
+      'san_jose_permits',
+      'palo_alto_year_built',
+      'ownership_transfers',
+      'overture_starbucks',
+      'osm_pedestrian_graph',
+      'vta_gtfs',
+      'caltrain_gtfs',
+      'noaa_shoreline',
+      'usgs_hydrography',
+      'usgs_elevation',
+    ].map((capability) =>
+      unavailableSourceManifest(
+        `large-spool-${capability.replaceAll('_', '-')}`,
+        capability,
+        'blocked',
+      ),
+    );
+    const configuration = {
+      runId: RUN_ID,
+      pipelineVersion: '2.0.0',
+      requestedAt: NOW,
+      profile: {
+        name: 'pilot',
+        recordCap: 5_000,
+        maxConcurrentSources: 1,
+        maxBufferedRecords: 2_048,
+      },
+      sources: [],
+      maximumPhaseAttempts: 1,
+    } as unknown as PipelineConfiguration;
+    const request: BoundedCountyProcessingRequest = {
+      configuration,
+      mutationSources: [{ sourceId: SOURCE_ID, snapshotId: SNAPSHOT_ID, sequence }],
+      acquiredSources: [{ sourceId: SOURCE_ID, artifacts: [trustedArtifact] }],
+      sources: [sourceManifest(largeMutations.length), ...blockedDependencies],
+      existing: { reconcileArtifact: null, featureArtifact: null, martArtifact: null },
+      artifactStore,
+      checkpointStore,
+      clock: { now: () => NOW },
+      signal: new AbortController().signal,
+    };
+    let completedSpoolPasses = 0;
+    const scratchDirectory = join(root, 'scratch');
+    const createProcessor = () =>
+      createBoundedPipelineProcessors({
+        outputDirectory: join(root, 'output'),
+        scratchDirectory,
+        partitionCount: 16,
+        budget: {
+          policyVersion: 'bounded-process-budget-v1',
+          maxBufferedRecords: 2_048,
+          maxBufferedBytes: 8 * 1024 * 1024,
+          maxRssBytes: 1024 * 1024 * 1024,
+          duckdbMemoryBytes: 128 * 1024 * 1024,
+          runtimeReserveBytes: 128 * 1024 * 1024,
+          maxOpenFiles: 16,
+          maxWorkers: 1,
+          maxRecordsPerOutputChunk: 8,
+          maxBytesPerOutputChunk: 1024 * 1024,
+          rssSampleIntervalRecords: 1,
+        },
+        crash: (point) => {
+          if (point === 'after_mutation_spool') {
+            completedSpoolPasses += 1;
+            throw new Error(`large spool pass ${completedSpoolPasses}`);
+          }
+        },
+      });
+
+    const processor = createProcessor();
+    await expect(processor.processBoundedCounty?.(request)).rejects.toThrow('large spool pass 1');
+    expect(sequenceReadCalls).toBe(2);
+    await expect(processor.processBoundedCounty?.(request)).rejects.toThrow('large spool pass 2');
+    expect(sequenceReadCalls).toBe(3);
+
+    const databasePath = await boundedDatabaseFile(scratchDirectory, RUN_ID);
+    const metadata = await queryDuckDatabase(
+      databasePath,
+      'SELECT generation_id, source_id, mutation_id, partition_id FROM raw_mutation LIMIT 1',
+    );
+    const target = metadata[0];
+    if (target === undefined) throw new Error('Expected large durable spool metadata');
+    await runDuckDatabase(
+      databasePath,
+      `UPDATE raw_mutation SET partition_id=${(Number(target.partition_id) + 1) % 16} WHERE generation_id=${duckSql(String(target.generation_id))} AND source_id=${duckSql(String(target.source_id))} AND mutation_id=${duckSql(String(target.mutation_id))}`,
+    );
+    await expect(processor.processBoundedCounty?.(request)).rejects.toThrow(
+      'Durable mutation spool derived routing metadata mismatch',
+    );
+    expect(sequenceReadCalls).toBe(4);
+  };
+
   it('emits four honest public proxies and keeps both ownership inquiries unknown on full-profile inputs', async () => {
     const root = await mkdtemp(join(tmpdir(), 'oracle-bounded-inquiries-'));
     const lanes = [
@@ -1258,6 +1395,12 @@ describe('bounded_streaming_v2 pipeline composition', () => {
       expect(row).toMatchObject({ supportClass: 'unknown', value: null });
     }
   }, 120_000);
+
+  it(
+    'adopts a large complete spool under constrained DuckDB memory and rejects routing corruption',
+    largeSpoolRegression,
+    300_000,
+  );
 });
 
 function sourceLane(
