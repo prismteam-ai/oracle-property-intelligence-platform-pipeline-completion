@@ -681,11 +681,26 @@ function operatorCeiling(variable: string, policyBytes: number): number {
 function applyOperatorCeilings(policy: BoundedProcessingBudget): BoundedProcessingBudget {
   const duckdbMemoryBytes = operatorDuckdbMemoryBytes(policy.duckdbMemoryBytes);
   const maxRssBytes = operatorMaxRssBytes(policy.maxRssBytes);
-  if (duckdbMemoryBytes === policy.duckdbMemoryBytes && maxRssBytes === policy.maxRssBytes) {
+  // Several per-record leases are derived from maxBufferedBytes, so this is the lever
+  // for county-scale rows without editing each derivation. Schema-validated below.
+  const maxBufferedBytes = operatorCeiling(
+    'ORACLE_PIPELINE_MAX_BUFFERED_BYTES',
+    policy.maxBufferedBytes,
+  );
+  if (
+    duckdbMemoryBytes === policy.duckdbMemoryBytes &&
+    maxRssBytes === policy.maxRssBytes &&
+    maxBufferedBytes === policy.maxBufferedBytes
+  ) {
     return policy;
   }
   return Object.freeze(
-    boundedProcessingBudgetSchema.parse({ ...policy, duckdbMemoryBytes, maxRssBytes }),
+    boundedProcessingBudgetSchema.parse({
+      ...policy,
+      duckdbMemoryBytes,
+      maxRssBytes,
+      maxBufferedBytes,
+    }),
   );
 }
 
@@ -2588,9 +2603,21 @@ async function reconcileAll(
       budget: processing.budget,
       repository,
       ...Object.freeze({
+        // Per-SUBJECT lease, and only one subject is in flight at a time (the linker
+        // acquires then releases per subject), so dividing the whole byte budget by the
+        // record COUNT is the wrong shape: it yielded 16 MiB / 2048 = 8 KiB, three orders
+        // of magnitude below the sibling leases in this same file (maximumMutationBytes
+        // 1 MiB, maximumAggregateBytes 8 MiB). Any property carrying a normal number of
+        // permit/evidence rows serializes past 8 KiB, so reconcile_links aborted with
+        // "Reconciliation subject exceeded its preallocated canonical serialization lease"
+        // on real county data while passing on fixtures.
+        //
+        // Enforcement ceiling only: subjects that already fit are unaffected and produce
+        // byte-identical output, so this changes no artifact hash or release identity.
+        // Stays <= maxBufferedBytes, as bounded-linker.ts:136 requires.
         maximumCanonicalBytesPerRecord: Math.max(
           1,
-          Math.floor(processing.budget.maxBufferedBytes / processing.budget.maxBufferedRecords),
+          Math.min(1024 * 1024, Math.floor(processing.budget.maxBufferedBytes / 16)),
         ),
       }),
       canonicalSha256: sha256,
@@ -3688,6 +3715,21 @@ function representativePoint(entity: CanonicalEntity): readonly [number, number]
       return entity.location.coordinates;
     case 'hydro-feature':
       return representativeGeometryPoint(entity.geometry);
+    // Properties carry their own parcel geometry and must yield a point, or every
+    // proximity feature is structurally empty at any data scale.
+    //
+    // The spatial join resolves a property's point via
+    // coalesce(primaryAddressId, entity_id), so it already falls back to the property
+    // itself when there is no linked address — and there never is: both property
+    // adapters hardcode primaryAddressId to null, and no code anywhere constructs an
+    // 'address' canonical entity. The join was therefore correct but could never match,
+    // because properties were never inserted into geospatial_candidate.
+    //
+    // representativeGeometryPoint already declares parcelGeometry in its own parameter
+    // type, so this case was intended and simply missing. Note the point is a genuine
+    // vertex of the real parcel geometry, not a synthesized coordinate.
+    case 'property':
+      return representativeGeometryPoint(entity.parcelGeometry);
     default:
       return null;
   }

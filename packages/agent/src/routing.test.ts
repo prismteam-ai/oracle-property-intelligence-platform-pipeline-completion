@@ -324,6 +324,52 @@ const routingCases = [
   ['ambiguous', 'Help me understand what is available.'],
 ] as const satisfies readonly (readonly [OracleAgentQueryClass, string])[];
 
+describe('README demo-transcript agent prompts route correctly', () => {
+  // Verbatim from README.md:69. The prior singular-only pattern could not match
+  // "owners", so only transit_walkability matched and the agent answered half a
+  // two-predicate question without signalling that the other half was dropped.
+  it('matches plural "regional owners" so both predicates are routed', () => {
+    const prompt = 'Which properties are near public transportation and also have regional owners?';
+    expect(classifyOracleAgentQuestion(prompt)).toBe('combined_ranking');
+    // Singular must keep working.
+    expect(classifyOracleAgentQuestion('Which properties have a regional owner?')).toBe(
+      'regional_owner',
+    );
+  });
+
+  it('routes the ranking prompt to combined_ranking', () => {
+    expect(
+      classifyOracleAgentQuestion(
+        'Which properties appear to be strong candidates for further review based on ownership age, roof age, and location signals?',
+      ),
+    ).toBe('combined_ranking');
+  });
+
+  // Spatial criteria are only ever emitted with supportClass 'proxy', so a route
+  // that leaves includeProxy undefined returns zero rows no matter how much data
+  // the release contains.
+  it('requests proxy support for every spatially-derived criterion', () => {
+    for (const prompt of [
+      'Show properties within walking distance of public transportation.',
+      'Show properties within walking distance of Starbucks.',
+      'Show properties with a view of water.',
+    ]) {
+      const route = selectDeterministicInquiryEvidenceRoute(prompt, 'release-1', 25);
+      expect(route, `expected a deterministic route for: ${prompt}`).not.toBeNull();
+      expect(route?.primaryCall.input).toMatchObject({ includeProxy: true });
+    }
+  });
+
+  it('does not request proxy support for non-spatial criteria', () => {
+    const route = selectDeterministicInquiryEvidenceRoute(
+      'Which properties have roofs older than 15 years?',
+      'release-1',
+      25,
+    );
+    expect(route?.primaryCall.input).not.toHaveProperty('includeProxy');
+  });
+});
+
 describe('Bedrock-bounded request-derived active tools', () => {
   it('classifies every request and removes tools from deterministic inquiry synthesis', async () => {
     expect(routingCases.map(([queryClass]) => queryClass)).toEqual(ORACLE_AGENT_QUERY_CLASSES);

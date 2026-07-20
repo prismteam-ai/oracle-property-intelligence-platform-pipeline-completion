@@ -104,10 +104,15 @@ export const ACTIVE_TOOL_NAMES_BY_QUERY_CLASS = Object.freeze({
 const criterionPatterns: Readonly<Record<CriterionQueryClass, readonly RegExp[]>> = Object.freeze({
   roof_age: [/\broof(?:s|ing)?\b/iu, /\byear[\s-]+built\b/iu, /\bbuilding age\b/iu],
   water_view: [
-    /\bwater[\s-]+view\b/iu,
+    /\bwater[\s-]+views?\b/iu,
     /\bwaterfront\b/iu,
     /\b(?:shoreline|ocean|bay|lake)[\s-]+(?:view|distance|proximity)\b/iu,
     /\bdistance[\s-]+to[\s-]+water\b/iu,
+    // The README presenter prompt is "Show properties with a view of water."
+    // (README.md:56) — the noun-first phrasing matched none of the patterns above,
+    // so the demo's own wording routed nowhere.
+    /\bviews?[\s-]+of[\s-]+(?:the[\s-]+)?water\b/iu,
+    /\bviews?[\s-]+of[\s-]+(?:the[\s-]+)?(?:shoreline|ocean|bay|lake)\b/iu,
   ],
   ownership_age: [
     /\bownership[\s-]+(?:age|tenure|history)\b/iu,
@@ -118,11 +123,16 @@ const criterionPatterns: Readonly<Record<CriterionQueryClass, readonly RegExp[]>
     /\bchanged[\s-]+hands\b/iu,
     /\blong[\s-]*term owner\b/iu,
   ],
+  // Plurals matter: the README demo prompt is "…also have regional ownerS"
+  // (README.md:69). \bowner\b cannot match "owners" because the trailing "s" is a
+  // word character, so this class failed to match, only transit_walkability did,
+  // and the agent silently answered half of a two-predicate question with no
+  // indication the ownership half had been dropped.
   regional_owner: [
-    /\bregional[\s-]+owner\b/iu,
-    /\blocal[\s-]+owner\b/iu,
-    /\bowner[\s-]+region\b/iu,
-    /\bowner[\s-]+(?:location|residence)\b/iu,
+    /\bregional[\s-]+owners?\b/iu,
+    /\blocal[\s-]+owners?\b/iu,
+    /\bowners?[\s-]+region\b/iu,
+    /\bowners?[\s-]+(?:location|residence)\b/iu,
   ],
   transit_walkability: [
     /\btransit\b/iu,
@@ -261,6 +271,7 @@ export function selectDeterministicInquiryEvidenceRoute(
       input: Object.freeze({
         releaseId,
         limit,
+        ...proxyInputFor(callClasses[0] ?? deterministicClass),
         ...(thresholdInputByClass[callClasses[0] ?? deterministicClass] ?? {}),
       }),
     }),
@@ -270,10 +281,34 @@ export function selectDeterministicInquiryEvidenceRoute(
           toolName: DETERMINISTIC_INQUIRY_TOOL_BY_QUERY_CLASS[callClass],
           input: Object.freeze({
             releaseId,
+            ...proxyInputFor(callClass),
             ...(thresholdInputByClass[callClass] ?? {}),
           }),
         }),
       ),
     ),
   });
+}
+
+/**
+ * Spatial criteria are emitted by the pipeline with supportClass 'proxy' — the
+ * proximity features are derived from parcel/candidate geometry rather than a
+ * routed pedestrian network, which is unconfigured. serving-adapter.ts threads
+ * includeProxy into every one of these tools, but the deterministic route never
+ * populated it, so the executor saw undefined for the one flag that admits the
+ * only support class these criteria ever produce.
+ *
+ * Requesting proxy explicitly is what makes the answer non-empty; the response
+ * still carries the proxy support class, so the distinction stays visible to the
+ * caller rather than being presented as a routed measurement.
+ */
+const PROXY_ELIGIBLE_CLASSES: ReadonlySet<string> = new Set([
+  'water_view',
+  'transit_walkability',
+  'starbucks_walkability',
+  'combined_ranking',
+]);
+
+function proxyInputFor(queryClass: string): Readonly<Record<string, boolean>> {
+  return PROXY_ELIGIBLE_CLASSES.has(queryClass) ? Object.freeze({ includeProxy: true }) : {};
 }
