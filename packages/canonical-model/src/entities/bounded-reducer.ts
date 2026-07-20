@@ -172,13 +172,21 @@ export async function reduceBoundedCanonicalPartition(
     peakBufferedRecords = Math.max(peakBufferedRecords, processWide.peakBufferedRecords);
     peakBufferedBytes = Math.max(peakBufferedBytes, processWide.peakBufferedBytes);
     peakRssBytes = Math.max(peakRssBytes, sampleRss());
-    if (
-      entityGroup.length > input.budget.maxBufferedRecords ||
-      entityGroupBytes > input.budget.maxBufferedBytes ||
-      peakRssBytes > input.budget.maxRssBytes
-    ) {
+    // Name the dimension that blew. All three limits previously shared one message, so an
+    // operator could not tell a genuinely oversized entity group (records/bytes) from a
+    // process-level RSS ceiling that simply was not raised alongside duckdbMemoryBytes.
+    // Counts and byte sizes only — never mutation content.
+    const exceeded =
+      entityGroup.length > input.budget.maxBufferedRecords
+        ? `records ${entityGroup.length} > maxBufferedRecords ${input.budget.maxBufferedRecords}`
+        : entityGroupBytes > input.budget.maxBufferedBytes
+          ? `bytes ${entityGroupBytes} > maxBufferedBytes ${input.budget.maxBufferedBytes}`
+          : peakRssBytes > input.budget.maxRssBytes
+            ? `rss ${peakRssBytes} > maxRssBytes ${input.budget.maxRssBytes}`
+            : null;
+    if (exceeded !== null) {
       throw new BoundedCanonicalBudgetError(
-        'Canonical entity group exceeded the shared process budget',
+        `Canonical entity group exceeded the shared process budget (${exceeded})`,
       );
     }
   };

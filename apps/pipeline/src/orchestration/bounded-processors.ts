@@ -45,6 +45,7 @@ import {
   mutationChunkInputSchema,
   partitionForMutation,
   physicalMutationManifestSha256,
+  boundedProcessingBudgetSchema,
   type BoundedMutationLogInput,
   type BoundedProcessingBudget,
   type BoundedProcessingInput,
@@ -234,7 +235,7 @@ export function createBoundedPipelineProcessors(
     roots: resourceRoots,
   });
   const partitionCount = options.partitionCount ?? PARTITION_COUNT;
-  const budget = options.budget ?? DEFAULT_BUDGET;
+  const budget = applyOperatorCeilings(options.budget ?? DEFAULT_BUDGET);
   const sharedBudget = processGlobalBudget(budget, resourceIdentity);
   if (!Number.isSafeInteger(partitionCount) || partitionCount < 12) {
     throw new RangeError('partitionCount must be a safe integer of at least 12');
@@ -638,15 +639,54 @@ function withoutFailedLaneMutations(
  * of bytes, at least the policy value).
  */
 function operatorDuckdbMemoryBytes(policyBytes: number): number {
-  const raw = process.env.ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES;
+  return operatorCeiling('ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES', policyBytes);
+}
+
+/**
+ * Execution-only operator override for the resident-set ceiling, the companion
+ * of ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES. Like it, this changes no logical
+ * output, no budget hash, and no generation identity.
+ *
+ * Raising the DuckDB working set ALONE is not a safe lever: DuckDB's allocation
+ * counts toward process RSS, but the reducer/linker guards enforce
+ * `budget.maxRssBytes`, which defaulted to 512 MiB. An 8 GiB DuckDB ceiling
+ * therefore drove RSS past the guard and aborted reduce_canonical with
+ * "Canonical entity group exceeded the shared process budget". The two ceilings
+ * must move together, which is precisely the invariant
+ * boundedProcessingBudgetSchema already encodes
+ * (maxBufferedBytes + duckdbMemoryBytes + runtimeReserveBytes <= maxRssBytes) —
+ * an invariant the open-time-only override silently bypassed.
+ */
+function operatorMaxRssBytes(policyBytes: number): number {
+  return operatorCeiling('ORACLE_PIPELINE_MAX_RSS_BYTES', policyBytes);
+}
+
+function operatorCeiling(variable: string, policyBytes: number): number {
+  const raw = process.env[variable];
   if (raw === undefined || raw.trim() === '') return policyBytes;
   const parsed = Number(raw);
   if (!Number.isSafeInteger(parsed) || parsed < policyBytes) {
-    throw new RangeError(
-      `ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES must be a safe integer of at least ${policyBytes}`,
-    );
+    throw new RangeError(`${variable} must be a safe integer of at least ${policyBytes}`);
   }
   return parsed;
+}
+
+/**
+ * Apply the operator ceilings to the budget POLICY rather than only at DuckDB
+ * open time, so that boundedProcessingBudgetSchema validates the raised values
+ * as a set. A configuration that raises the DuckDB working set without matching
+ * RSS headroom now fails immediately at startup with a precise message, instead
+ * of running for hours and aborting mid-compute.
+ */
+function applyOperatorCeilings(policy: BoundedProcessingBudget): BoundedProcessingBudget {
+  const duckdbMemoryBytes = operatorDuckdbMemoryBytes(policy.duckdbMemoryBytes);
+  const maxRssBytes = operatorMaxRssBytes(policy.maxRssBytes);
+  if (duckdbMemoryBytes === policy.duckdbMemoryBytes && maxRssBytes === policy.maxRssBytes) {
+    return policy;
+  }
+  return Object.freeze(
+    boundedProcessingBudgetSchema.parse({ ...policy, duckdbMemoryBytes, maxRssBytes }),
+  );
 }
 
 async function openDuckDatabase(
