@@ -55,7 +55,9 @@ const identityProjection = `
   pq.parcel_identifier,
   pq.address_street,
   pq.address_city,
-  pq.address_zip`;
+  pq.address_zip,
+  pq.latitude,
+  pq.longitude`;
 
 const filters = `
   AND (? IS NULL OR pq.address_city = ?)

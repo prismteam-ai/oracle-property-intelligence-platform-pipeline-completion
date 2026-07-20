@@ -299,6 +299,62 @@ describe('Oracle evaluator routes', () => {
     ).toHaveProperty('checked', true);
   });
 
+  it('renders per-row inquiry evidence and the coordinate/route basis from the nested inquiry shape', async () => {
+    const user = userEvent.setup();
+    const client = createOverrideClient((operation, _input, envelope) => {
+      if (operation !== 'inquiry.transitWalkability') return null;
+      return {
+        ...envelope,
+        data: {
+          capability: {
+            state: 'supported',
+            supportClasses: ['supported'],
+            numerator: 1,
+            denominator: 1,
+            limitations: [],
+          },
+          results: [
+            {
+              propertyId: 'TEST-PROP-001',
+              parcelIdentifier: '001',
+              addressStreet: '1 Test-only Way',
+              addressCity: 'Palo Alto',
+              addressZip: '94301',
+              latitude: 37.441,
+              longitude: -122.143,
+              supportClass: 'supported',
+              value: { networkDistanceMeters: 640, estimatedWalkMinutes: 8 },
+              evidence: [
+                {
+                  evidenceId: 'TEST-EVIDENCE-TRANSIT-001',
+                  supportClass: 'supported',
+                  sourceIds: ['TEST-SOURCE-GTFS'],
+                  limitations: [],
+                },
+              ],
+              limitations: [],
+            },
+          ],
+          resultCount: 1,
+        },
+      };
+    });
+
+    renderRoute('/inquiries/transit-walkability', client);
+    const table = await screen.findByRole('table', {
+      name: /Walking distance to public transportation results/u,
+    });
+    expect(
+      within(table).getByText('TEST-EVIDENCE-TRANSIT-001 · sources: TEST-SOURCE-GTFS'),
+    ).toBeTruthy();
+
+    await user.click(screen.getByRole('button', { name: 'Spatial evidence' }));
+    const spatial = screen.getByRole('list', { name: 'Map-equivalent result list' });
+    expect(within(spatial).getByText(/37\.441/u)).toBeTruthy();
+    expect(within(spatial).getByText(/-122\.143/u)).toBeTruthy();
+    expect(within(spatial).getByText('640 m · 8 min walk')).toBeTruthy();
+  });
+
   it('sends the frozen property search contract and renders an honest empty capability receipt', async () => {
     let propertyInput: Readonly<Record<string, unknown>> | null = null;
     const client = createOverrideClient((operation, input, envelope) => {

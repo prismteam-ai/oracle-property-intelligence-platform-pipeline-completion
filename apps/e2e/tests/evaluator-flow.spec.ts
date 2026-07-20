@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Response } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Page, type Response } from '@playwright/test';
 
 import { expectReleaseIdentity, truthLabelPattern } from '../support/assertions.js';
 import {
@@ -11,7 +11,7 @@ import {
 } from '../support/fixture.js';
 import { openEvaluatorRoute, prepareEvaluatorPage } from '../support/page.js';
 import { inquiryRoutes } from '../support/routes.js';
-import { isHostedTarget } from '../support/target.js';
+import { evaluatorTargetConfiguration, isHostedTarget } from '../support/target.js';
 
 let fixture: FixtureController | null;
 
@@ -74,6 +74,79 @@ function stringItems(value: unknown): readonly string[] {
     : [];
 }
 
+/**
+ * One prompt per public serving criterion. Each phrasing routes to exactly that
+ * single criterion in packages/agent/src/routing.ts, and the two threshold
+ * criteria carry the year the deterministic inquiry route requires.
+ */
+const criterionPrompts: Readonly<Record<string, string>> = Object.freeze({
+  roof_age: 'Which properties have roofs older than 15 years?',
+  water_view_candidate: 'Which properties are water-view candidates in this release?',
+  ownership_age: 'Which properties have not exchanged ownership in more than 10 years?',
+  regional_owner: 'Which properties have a regional owner in this release?',
+  transit_walkability: 'Which properties are within walking distance of transit?',
+  starbucks_walkability: 'Which properties are within walking distance of a Starbucks?',
+});
+
+/** Owner-free by design: no public release can report this criterion as supported. */
+const ownerFreeBlockedCriterion = 'ownership_age';
+const localBlockedLimitation =
+  'The accepted public snapshot contains no redistributable ownership-transfer evidence.';
+
+type ReleaseCapability = Readonly<{
+  criterion: string;
+  state: string;
+  limitations: readonly string[];
+}>;
+
+/**
+ * Reads the deployed serving config so criterion expectations follow the release
+ * under test instead of a hardcoded capability matrix.
+ */
+async function releaseCapabilities(
+  request: APIRequestContext,
+): Promise<readonly ReleaseCapability[]> {
+  const { publicArtifactBaseURL } = evaluatorTargetConfiguration();
+  const response = await request.get(`${publicArtifactBaseURL}/serving-config.json`);
+  expect(response.status(), 'The deployed serving config must be publicly readable.').toBe(200);
+  const capabilities = asRecord(asRecord((await response.json()) as unknown)?.capabilities);
+  expect(
+    capabilities,
+    'The deployed serving config must publish per-criterion capabilities.',
+  ).not.toBeNull();
+  return Object.freeze(
+    Object.entries(capabilities ?? {}).flatMap(([criterion, value]) => {
+      const capability = asRecord(value);
+      const state = capability?.state;
+      return typeof state === 'string' && state.length > 0
+        ? [
+            Object.freeze({
+              criterion,
+              state,
+              limitations: stringItems(capability?.limitations),
+            }),
+          ]
+        : [];
+    }),
+  );
+}
+
+async function askAgent(
+  page: Page,
+  prompt: string,
+): Promise<Readonly<{ response: Response; body: unknown }>> {
+  await openEvaluatorRoute(page, '/agent');
+  await page.getByRole('textbox', { name: /ask|prompt|question/i }).fill(prompt);
+  const responsePromise = operationResponse(
+    page,
+    'agent.ask',
+    isHostedTarget() ? HOSTED_AGENT_RESPONSE_TIMEOUT_MS : undefined,
+  );
+  await page.getByRole('button', { name: /ask|run/i }).click();
+  const response = await responsePromise;
+  return { response, body: (await response.json()) as unknown };
+}
+
 async function expectReturnedCapabilityEnvelope(page: Page, body: unknown): Promise<void> {
   const envelope = asRecord(body);
   const capability = capabilityFrom(body);
@@ -102,6 +175,7 @@ async function installLocalOperationFixture(
   page: Page,
   operation: string,
   data: JsonRecord,
+  limitations: readonly string[] = ['Deterministic browser fixture; never production county data.'],
 ): Promise<void> {
   if (isHostedTarget()) return;
   await page.route('**/*', async (route) => {
@@ -126,7 +200,7 @@ async function installLocalOperationFixture(
         manifestCid: FIXTURE_MANIFEST_CID,
         asOf: '2026-07-17T00:00:00.000Z',
         coverage: {},
-        limitations: ['Deterministic browser fixture; never production county data.'],
+        limitations: [...limitations],
         data,
         nextCursor: null,
         truncated: false,
@@ -289,35 +363,125 @@ test('invalid inquiry parameters are rejected without a query claim', async ({ p
   await expect(page.locator('a[href^="/properties/"]')).toHaveCount(0);
 });
 
-test('agent shows named-tool trace and exact citations when available', async ({ page }) => {
-  await openEvaluatorRoute(page, '/agent');
-  const prompt = page.getByRole('textbox', { name: /ask|prompt|question/i });
-  await prompt.fill(
-    'Which properties have roofs older than 15 years and have not exchanged ownership in more than 10 years?',
-  );
-  const responsePromise = operationResponse(
-    page,
-    'agent.ask',
-    isHostedTarget() ? HOSTED_AGENT_RESPONSE_TIMEOUT_MS : undefined,
-  );
-  await page.getByRole('button', { name: /ask|run/i }).click();
-  const response = await responsePromise;
-  const body: unknown = await response.json();
-  expect(response.status()).toBe(200);
-  const data = asRecord(asRecord(body)?.data);
-  const citations = stringItems(data?.citations);
-  const toolNames = Array.isArray(data?.toolCalls)
+function traceToolNames(data: JsonRecord | null): readonly string[] {
+  return Array.isArray(data?.toolCalls)
     ? data.toolCalls.flatMap((value) => {
         const call = asRecord(value);
         const name = call?.toolName ?? call?.name;
         return typeof name === 'string' ? [name] : [];
       })
     : [];
-  expect(citations.length).toBeGreaterThan(0);
+}
+
+test('agent shows named-tool trace and exact citations for a release-supported criterion', async ({
+  page,
+  request,
+}) => {
+  let criterion = 'roof_age';
+  if (isHostedTarget()) {
+    const supported = (await releaseCapabilities(request)).filter(
+      (capability) =>
+        capability.state === 'supported' && criterionPrompts[capability.criterion] !== undefined,
+    );
+    test.skip(
+      supported.length === 0,
+      'The deployed serving config reports no supported criterion, so no criterion can produce a cited answer on this release.',
+    );
+    criterion = supported[0]?.criterion ?? criterion;
+  }
+  const prompt = criterionPrompts[criterion];
+  if (prompt === undefined) throw new Error(`No agent prompt is mapped for ${criterion}.`);
+
+  const { response, body } = await askAgent(page, prompt);
+  expect(response.status()).toBe(200);
+  const data = asRecord(asRecord(body)?.data);
+  const citations = stringItems(data?.citations);
+  const toolNames = traceToolNames(data);
+  expect(
+    citations.length,
+    `${criterion} is supported, so it must return evidence citations.`,
+  ).toBeGreaterThan(0);
   expect(toolNames.length).toBeGreaterThan(0);
   await expect(page.getByRole('heading', { name: /tool.*trace|trace/i })).toBeVisible();
   await expect(page.getByText(toolNames[0] ?? '', { exact: false }).first()).toBeVisible();
   await expect(page.getByText(citations[0] ?? '', { exact: false }).first()).toBeVisible();
+  await expectReleaseIdentity(page);
+});
+
+test('agent tells the truth about a blocked criterion instead of failing the request', async ({
+  page,
+  request,
+}) => {
+  let blockedLimitation = localBlockedLimitation;
+  if (isHostedTarget()) {
+    const blocked = (await releaseCapabilities(request)).find(
+      (capability) => capability.criterion === ownerFreeBlockedCriterion,
+    );
+    expect(
+      blocked,
+      `${ownerFreeBlockedCriterion} must appear in the deployed serving config.`,
+    ).toBeDefined();
+    expect(
+      blocked?.state,
+      `${ownerFreeBlockedCriterion} is owner-free blocked by design in every public release.`,
+    ).toBe('blocked');
+    blockedLimitation = blocked?.limitations[0] ?? '';
+    expect(
+      blockedLimitation.length,
+      'A blocked criterion must publish a concrete limitation.',
+    ).toBeGreaterThan(0);
+  } else {
+    await installLocalOperationFixture(
+      page,
+      'agent.ask',
+      {
+        status: 'complete',
+        answer:
+          'No proven matching properties were found in the bounded primary candidate page. This result is not county-exhaustive.',
+        citations: [],
+        toolCalls: [
+          {
+            callIndex: 1,
+            toolName: 'find_roof_age_candidates',
+            releaseId: FIXTURE_RELEASE_ID,
+            evidenceIds: [],
+          },
+          {
+            callIndex: 2,
+            toolName: 'find_ownership_age_candidates',
+            releaseId: FIXTURE_RELEASE_ID,
+            evidenceIds: [],
+          },
+        ],
+      },
+      [blockedLimitation],
+    );
+  }
+
+  const { response, body } = await askAgent(
+    page,
+    'Which properties have roofs older than 15 years and have not exchanged ownership in more than 10 years?',
+  );
+  expect(response.status(), 'A blocked criterion must answer honestly, not fail.').toBe(200);
+  const envelope = asRecord(body);
+  const data = asRecord(envelope?.data);
+  expect(
+    stringItems(data?.citations),
+    'A blocked criterion cannot produce evidence citations.',
+  ).toHaveLength(0);
+  expect(Array.isArray(data?.citations)).toBe(true);
+  expect(String(data?.answer)).toMatch(/no proven matching properties/iu);
+  expect(traceToolNames(data).length).toBeGreaterThan(0);
+  expect(
+    stringItems(envelope?.limitations),
+    'The blocked criterion must be named in the returned limitations.',
+  ).toContain(blockedLimitation);
+
+  await expect(page.getByText(/no proven matching properties/i).first()).toBeVisible();
+  await expect(page.getByText('No evidence citation was returned.')).toBeVisible();
+  await expect(
+    page.getByRole('complementary', { name: 'Query metadata and limitations' }),
+  ).toContainText(blockedLimitation);
   await expectReleaseIdentity(page);
 });
 

@@ -15,6 +15,7 @@ import type {
   InquirySupportClass,
   OwnershipAgeInput,
   OwnershipAgeValue,
+  PropertyIdentity,
   RankingCriterion,
   RegionalOwnerInput,
   RegionalOwnerValue,
@@ -56,6 +57,8 @@ type SimpleRow = AnalyticalRow &
     address_street: unknown;
     address_city: unknown;
     address_zip: unknown;
+    latitude: unknown;
+    longitude: unknown;
     support_class: unknown;
     value_number: unknown;
     value_text: unknown;
@@ -69,6 +72,8 @@ type RankingRow = AnalyticalRow &
     address_street: unknown;
     address_city: unknown;
     address_zip: unknown;
+    latitude: unknown;
+    longitude: unknown;
     score: unknown;
     evidence_coverage: unknown;
     ranking_position: unknown;
@@ -563,19 +568,15 @@ export class NamedInquiryExecutor {
   }
 }
 
-function identity(row: AnalyticalRow): Readonly<{
-  propertyId: string;
-  parcelIdentifier: string;
-  addressStreet: string | null;
-  addressCity: string | null;
-  addressZip: string | null;
-}> {
+function identity(row: AnalyticalRow): PropertyIdentity {
   return Object.freeze({
     propertyId: requiredString(row.property_id, 'property_id'),
     parcelIdentifier: requiredString(row.parcel_identifier, 'parcel_identifier'),
     addressStreet: nullableString(row.address_street, 'address_street'),
     addressCity: nullableString(row.address_city, 'address_city'),
     addressZip: nullableString(row.address_zip, 'address_zip'),
+    latitude: nullableNumber(row.latitude, 'latitude'),
+    longitude: nullableNumber(row.longitude, 'longitude'),
   });
 }
 
@@ -587,6 +588,11 @@ function requiredString(value: unknown, label: string): string {
 function nullableString(value: unknown, label: string): string | null {
   if (value === null) return null;
   return requiredString(value, label);
+}
+
+function nullableNumber(value: unknown, label: string): number | null {
+  if (value === null) return null;
+  return requiredNumber(value, label);
 }
 
 function requiredNumber(value: unknown, label: string): number {

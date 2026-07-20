@@ -63,6 +63,8 @@ export type PropertyIdentity = Readonly<{
   addressStreet: string | null;
   addressCity: string | null;
   addressZip: string | null;
+  latitude: number | null;
+  longitude: number | null;
 }>;
 
 export type InquiryItem<TValue> = PropertyIdentity &

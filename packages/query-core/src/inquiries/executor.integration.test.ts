@@ -114,6 +114,7 @@ const properties = Object.freeze([
     id: GOLDEN_A,
     parcel: '001',
     city: 'Palo Alto',
+    coordinates: [37.441, -122.143],
     roof: ['supported', 20, '2006-01-01'],
     water: ['supported', 100, 'clear_candidate'],
     ownership: ['supported', 12, '2014-01-01'],
@@ -125,6 +126,7 @@ const properties = Object.freeze([
     id: GOLDEN_B,
     parcel: '002',
     city: 'San Jose',
+    coordinates: [37.339, -121.895],
     roof: ['proxy', 30, '1996-01-01'],
     water: ['proxy', 200, 'candidate'],
     ownership: ['unknown', null, null],
@@ -136,6 +138,7 @@ const properties = Object.freeze([
     id: GOLDEN_C,
     parcel: '003',
     city: 'Santa Clara',
+    coordinates: [37.354, -121.955],
     roof: ['supported', 40, '1986-01-01'],
     water: ['unknown', null, null],
     ownership: ['unknown', null, null],
@@ -147,6 +150,8 @@ const properties = Object.freeze([
     id: GOLDEN_D,
     parcel: '004',
     city: 'Palo Alto',
+    // Coordinates are unavailable for this golden: the identity projection must stay nullable.
+    coordinates: [null, null],
     roof: ['supported', 25, '2001-01-01'],
     water: ['unknown', null, null],
     ownership: ['unknown', null, null],
@@ -158,6 +163,7 @@ const properties = Object.freeze([
     id: GOLDEN_E,
     parcel: '005',
     city: 'Palo Alto',
+    coordinates: [37.447, -122.152],
     roof: ['supported', 22, '2004-01-01'],
     water: ['unknown', null, null],
     ownership: ['unknown', null, null],
@@ -236,7 +242,8 @@ async function nativeSession(): Promise<AnalyticalSession> {
         initialize: async (connection) => {
           await connection.run(`CREATE TABLE property_query(
             property_id VARCHAR, parcel_identifier VARCHAR, address_street VARCHAR,
-            address_city VARCHAR, address_zip VARCHAR, visibility VARCHAR,
+            address_city VARCHAR, address_zip VARCHAR, latitude DOUBLE, longitude DOUBLE,
+            visibility VARCHAR,
             roof_support_class VARCHAR, roof_age_years BIGINT, roof_reference_date VARCHAR,
             water_support_class VARCHAR, water_distance_meters DOUBLE, water_visibility_state VARCHAR,
             ownership_support_class VARCHAR, years_since_exchange BIGINT, last_exchange_date VARCHAR,
@@ -246,13 +253,14 @@ async function nativeSession(): Promise<AnalyticalSession> {
           )`);
           for (const item of properties) {
             await connection.run(
-              'INSERT INTO property_query VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              'INSERT INTO property_query VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
               [
                 item.id,
                 item.parcel,
                 `${item.parcel} Golden St`,
                 item.city,
                 '95000',
+                ...item.coordinates,
                 'public',
                 ...item.roof,
                 ...item.water,
@@ -331,6 +339,8 @@ describe('named inquiry direct DuckDB parity', () => {
       expect(response.results[0]).toMatchObject({
         propertyId: GOLDEN_A,
         supportClass: 'supported',
+        latitude: 37.441,
+        longitude: -122.143,
       });
       expect(response.results[0]?.evidence.length).toBeGreaterThan(0);
     }
@@ -352,6 +362,10 @@ describe('named inquiry direct DuckDB parity', () => {
       { session },
     );
     expect(response.results.map(({ propertyId }) => propertyId)).toEqual([GOLDEN_A, GOLDEN_B]);
+    expect(response.results.map(({ latitude, longitude }) => [latitude, longitude])).toEqual([
+      [37.441, -122.143],
+      [37.339, -121.895],
+    ]);
     expect(response.results[0]?.value.components).toHaveLength(3);
     expect(response.results.map(({ value }) => value.rank)).toEqual([1, 2]);
     expect(response.results[1]?.value.components).toEqual(
@@ -420,6 +434,7 @@ describe('named inquiry direct DuckDB parity', () => {
       { session },
     );
     expect(second.results.map(({ propertyId }) => propertyId)).toEqual([GOLDEN_D]);
+    expect(second.results[0]).toMatchObject({ latitude: null, longitude: null });
     expect(Buffer.byteLength(first.nextCursor, 'utf8')).toBeLessThanOrEqual(512);
     await expect(
       executor.roofAge(
@@ -618,6 +633,8 @@ describe('named inquiry fixed-plan authority boundary', () => {
               address_street: '1 Golden St',
               address_city: 'Palo Alto',
               address_zip: '95000',
+              latitude: 37.441,
+              longitude: -122.143,
               support_class: 'supported',
               value_number: 20,
               value_text: '2006-01-01',
@@ -675,6 +692,8 @@ describe('named inquiry fixed-plan authority boundary', () => {
       address_street: '1 Golden St',
       address_city: 'Palo Alto',
       address_zip: '95000',
+      latitude: 37.441,
+      longitude: -122.143,
       value_number: 20,
       value_text: '2006-01-01',
     };

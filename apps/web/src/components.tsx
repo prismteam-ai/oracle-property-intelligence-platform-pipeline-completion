@@ -227,8 +227,56 @@ export function StatePanel({
 export type TableColumn = Readonly<{
   label: string;
   keys: readonly string[];
-  kind?: 'text' | 'truth' | 'property-link';
+  kind?: 'text' | 'truth' | 'property-link' | 'evidence';
 }>;
+
+function stringList(value: unknown): readonly string[] {
+  if (typeof value === 'string') return value.length === 0 ? [] : [value];
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is string => typeof item === 'string' && item.length > 0);
+}
+
+/**
+ * Named inquiries return per-row evidence as `evidence: EvidenceSummary[]`, not as a flat
+ * `evidenceIds` field. Summarize that nested shape so inquiry surfaces cite real evidence
+ * identifiers; surfaces without it fall back to the flat column keys.
+ */
+function evidenceSummary(row: DataRow): string | null {
+  const items = Array.isArray(row.evidence) ? row.evidence.filter(isRecord) : [];
+  if (items.length === 0) return null;
+  const evidenceIds = [...new Set(items.flatMap((item) => stringList(item.evidenceId)))];
+  const sourceIds = [...new Set(items.flatMap((item) => stringList(item.sourceIds)))];
+  const parts = [
+    evidenceIds.length === 0 ? null : evidenceIds.join(', '),
+    sourceIds.length === 0 ? null : `sources: ${sourceIds.join(', ')}`,
+  ].filter((part): part is string => part !== null);
+  return parts.length === 0 ? null : parts.join(' · ');
+}
+
+/**
+ * Walkability and water-view inquiries carry their coordinate/route basis inside the nested
+ * `value` object; property search carries it at the row root.
+ */
+function routeBasis(row: DataRow): string {
+  const nested = valueFor(row, ['value']);
+  const sources: readonly DataRow[] = isRecord(nested) ? [nested, row] : [row];
+  const pick = (keys: readonly string[]): unknown => {
+    for (const source of sources) {
+      const value = valueFor(source, keys);
+      if (value !== undefined && value !== null) return value;
+    }
+    return undefined;
+  };
+  const distanceMeters = pick(['networkDistanceMeters', 'distanceMeters']);
+  const walkMinutes = pick(['estimatedWalkMinutes', 'walkMinutes']);
+  const basis = pick(['terrainVisibilityState', 'routeBasis']);
+  const parts = [
+    distanceMeters === undefined ? null : `${displayValue(distanceMeters)} m`,
+    walkMinutes === undefined ? null : `${displayValue(walkMinutes)} min walk`,
+    basis === undefined ? null : displayValue(basis),
+  ].filter((part): part is string => part !== null);
+  return parts.length === 0 ? displayValue(undefined) : parts.join(' · ');
+}
 
 export function EvidenceTable({
   caption,
@@ -263,6 +311,9 @@ export function EvidenceTable({
                       <TruthBadge state={truthStateFrom(value)} />
                     </td>
                   );
+                }
+                if (column.kind === 'evidence') {
+                  return <td key={column.label}>{evidenceSummary(row) ?? displayValue(value)}</td>;
                 }
                 if (column.kind === 'property-link' && typeof value === 'string') {
                   return (
@@ -301,6 +352,7 @@ const resultColumns: readonly TableColumn[] = [
   {
     label: 'Evidence / coverage',
     keys: ['evidenceIds', 'evidenceId', 'sourceIds', 'sourceId', 'evidence_coverage'],
+    kind: 'evidence',
   },
 ];
 
@@ -374,11 +426,7 @@ export function ResultViews({
                   </div>
                   <div>
                     <dt>Distance / route basis</dt>
-                    <dd>
-                      {displayValue(
-                        valueFor(row, ['networkDistanceMeters', 'distanceMeters', 'routeBasis']),
-                      )}
-                    </dd>
+                    <dd>{routeBasis(row)}</dd>
                   </div>
                 </dl>
               </li>
