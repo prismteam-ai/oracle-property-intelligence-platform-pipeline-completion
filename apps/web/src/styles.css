@@ -123,6 +123,14 @@ svg {
 
 :focus-visible {
   outline: 3px solid var(--focus);
+}
+
+/* Route changes move programmatic focus to the page heading / main landmark for
+   screen readers; a visible ring on these non-interactive targets reads as a
+   stray border, so suppress it there only. */
+h1[tabindex='-1']:focus-visible,
+main[tabindex='-1']:focus-visible {
+  outline: none;
   outline-offset: 3px;
 }
 

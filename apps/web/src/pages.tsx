@@ -463,10 +463,31 @@ export function PropertiesPage() {
   );
 }
 
+function expandSingleJsonFact(record: DataRow): DataRow {
+  const entries = Object.entries(record);
+  if (entries.length !== 1) return record;
+  const [, value] = entries[0] ?? [];
+  if (typeof value !== 'string' || !value.startsWith('{')) return record;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return record;
+    const expanded: Record<string, unknown> = {};
+    for (const [factKey, factValue] of Object.entries(parsed)) {
+      expanded[factKey] =
+        factValue === null || typeof factValue !== 'object'
+          ? factValue
+          : JSON.stringify(factValue);
+    }
+    return expanded;
+  } catch {
+    return record;
+  }
+}
+
 function FactGrid({ record }: Readonly<{ record: DataRow }>) {
   return (
     <dl className="fact-grid">
-      {Object.entries(record).map(([key, value]) => (
+      {Object.entries(expandSingleJsonFact(record)).map(([key, value]) => (
         <div key={key}>
           <dt>{key.replace(/([a-z])([A-Z])/gu, '$1 $2').replaceAll('_', ' ')}</dt>
           <dd>{displayValue(value)}</dd>
