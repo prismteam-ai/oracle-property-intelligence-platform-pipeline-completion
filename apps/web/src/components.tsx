@@ -285,10 +285,23 @@ export function EvidenceTable({
 
 const resultColumns: readonly TableColumn[] = [
   { label: 'Property', keys: ['propertyId', 'property_id', 'id'], kind: 'property-link' },
-  { label: 'Address', keys: ['address', 'formattedAddress', 'siteAddress'] },
-  { label: 'Matched value', keys: ['matchedValue', 'value', 'featureValue', 'score'] },
-  { label: 'Evidence state', keys: ['supportState', 'support', 'state'], kind: 'truth' },
-  { label: 'Evidence / source IDs', keys: ['evidenceIds', 'evidenceId', 'sourceIds', 'sourceId'] },
+  {
+    label: 'Address',
+    keys: ['address', 'formattedAddress', 'siteAddress', 'addressStreet', 'address_street'],
+  },
+  {
+    label: 'Matched value',
+    keys: ['matchedValue', 'value', 'featureValue', 'score', 'combined_review_score'],
+  },
+  {
+    label: 'Evidence state',
+    keys: ['supportState', 'support', 'state', 'supportClass'],
+    kind: 'truth',
+  },
+  {
+    label: 'Evidence / coverage',
+    keys: ['evidenceIds', 'evidenceId', 'sourceIds', 'sourceId', 'evidence_coverage'],
+  },
 ];
 
 export function ResultViews({
@@ -339,7 +352,11 @@ export function ResultViews({
               <li key={`${propertyId}-${index}`}>
                 <MapPinned aria-hidden="true" />
                 <div>
-                  <strong>{displayValue(valueFor(row, ['address', 'formattedAddress']))}</strong>
+                  <strong>
+                    {displayValue(
+                      valueFor(row, ['address', 'formattedAddress', 'addressStreet', 'address_street']),
+                    )}
+                  </strong>
                   <span>Property {propertyId}</span>
                 </div>
                 <dl>

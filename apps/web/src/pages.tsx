@@ -291,11 +291,16 @@ export function OverviewPage() {
 }
 
 const pipelineColumns: readonly TableColumn[] = [
-  { label: 'Run / source', keys: ['runId', 'sourceId', 'id', 'name'] },
+  { label: 'Run', keys: ['run_id', 'runId', 'sourceId', 'id', 'name'] },
   { label: 'Status', keys: ['status', 'state'], kind: 'truth' },
-  { label: 'Observed', keys: ['observed', 'observedCount', 'recordCount'] },
-  { label: 'Rejected', keys: ['rejected', 'rejectedCount'] },
-  { label: 'Timestamp', keys: ['completedAt', 'collectedAt', 'timestamp', 'asOf'] },
+  { label: 'Observed', keys: ['observed_count', 'observed', 'observedCount', 'recordCount'] },
+  { label: 'Expected', keys: ['expected_count', 'expected'] },
+  { label: 'Quarantined', keys: ['quarantine_count', 'rejected', 'rejectedCount'] },
+  { label: 'Pipeline', keys: ['pipeline_version', 'version'] },
+  {
+    label: 'Timestamp',
+    keys: ['completed_at', 'started_at', 'completedAt', 'collectedAt', 'timestamp', 'asOf'],
+  },
 ];
 
 export function PipelinePage() {
@@ -312,16 +317,47 @@ export function PipelinePage() {
           <>
             <ReleaseBar envelope={release} />
             <StatePanel state={query} onRetry={query.retry}>
-              {(data) => (
-                <>
-                  <EvidenceTable
-                    caption="Release-bound pipeline runs and stages"
-                    rows={rowsFromData(data.data)}
-                    columns={pipelineColumns}
-                  />
-                  <EnvelopeNotes envelope={data} />
-                </>
-              )}
+              {(data) => {
+                const runs = rowsFromData(data.data);
+                return (
+                  <>
+                    <EvidenceTable
+                      caption="Release-bound pipeline runs and stages"
+                      rows={runs}
+                      columns={pipelineColumns}
+                    />
+                    {runs.map((run, index) => {
+                      const sources = parseJsonStringArray(
+                        valueFor(run, ['source_ids_json', 'sourceIds', 'sourceId']),
+                      );
+                      if (sources.length === 0) return null;
+                      const runLabel = displayValue(
+                        valueFor(run, ['run_id', 'runId', 'id']) ?? index,
+                      );
+                      return (
+                        <section
+                          className="tool-inventory"
+                          key={runLabel}
+                          aria-label={`Sources ingested by run ${runLabel}`}
+                        >
+                          <p className="eyebrow">Sources ingested</p>
+                          <h2>
+                            {sources.length.toLocaleString()} sources in run {runLabel}
+                          </h2>
+                          <ul>
+                            {sources.map((source) => (
+                              <li key={source}>
+                                <Database aria-hidden="true" /> <code>{source}</code>
+                              </li>
+                            ))}
+                          </ul>
+                        </section>
+                      );
+                    })}
+                    <EnvelopeNotes envelope={data} />
+                  </>
+                );
+              }}
             </StatePanel>
           </>
         )}
@@ -345,23 +381,63 @@ export function CoveragePage() {
             <ReleaseBar envelope={release} />
             <StatePanel state={query} onRetry={query.retry}>
               {(data) => {
-                const rows = rowsFromData(data.data);
+                const coverage = isRecord(data.data) ? data.data : {};
+                const sources = Array.isArray(coverage.sources)
+                  ? coverage.sources.filter(isRecord)
+                  : [];
+                const fieldRows = rowsFromData(data.data);
                 return (
                   <>
+                    {sources.length === 0 ? null : (
+                      <EvidenceTable
+                        caption="Total uploaded records by source, with collection timestamps and provenance"
+                        rows={sources}
+                        columns={[
+                          { label: 'Source', keys: ['source_id', 'source', 'name', 'id'] },
+                          { label: 'Scope', keys: ['scope'] },
+                          {
+                            label: 'Support',
+                            keys: ['support_class', 'supportState', 'state', 'status'],
+                            kind: 'truth',
+                          },
+                          {
+                            label: 'Observed records',
+                            keys: ['observed_count', 'observed', 'observedCount'],
+                          },
+                          { label: 'Expected', keys: ['expected_count', 'expected'] },
+                          { label: 'Quarantined', keys: ['quarantine_count', 'quarantined'] },
+                          { label: 'As of', keys: ['as_of', 'asOf', 'collectedAt', 'freshness'] },
+                          {
+                            label: 'Provenance (source SHA-256)',
+                            keys: ['source_sha256', 'sha256', 'checksum'],
+                          },
+                        ]}
+                      />
+                    )}
                     <EvidenceTable
-                      caption="Dataset and source coverage"
-                      rows={rows}
+                      caption="Field and dataset coverage"
+                      rows={fieldRows}
                       columns={[
-                        { label: 'Dataset / source', keys: ['dataset', 'source', 'name', 'id'] },
+                        {
+                          label: 'Relation / dataset',
+                          keys: ['relation_name', 'dataset', 'source', 'name', 'id'],
+                        },
+                        { label: 'Field', keys: ['field_name', 'field'] },
                         {
                           label: 'Support',
-                          keys: ['supportState', 'state', 'status'],
+                          keys: ['support_class', 'supportState', 'state', 'status'],
                           kind: 'truth',
                         },
-                        { label: 'Expected', keys: ['expected', 'expectedCount', 'denominator'] },
-                        { label: 'Observed', keys: ['observed', 'observedCount', 'numerator'] },
-                        { label: 'Linked', keys: ['linked', 'linkedCount'] },
-                        { label: 'As of', keys: ['asOf', 'collectedAt', 'freshness'] },
+                        {
+                          label: 'Supported',
+                          keys: ['numerator', 'observed', 'observedCount'],
+                        },
+                        {
+                          label: 'Denominator',
+                          keys: ['denominator', 'expected', 'expectedCount'],
+                        },
+                        { label: 'Ratio / linked', keys: ['ratio', 'linked', 'linkedCount'] },
+                        { label: 'As of', keys: ['as_of', 'asOf', 'collectedAt', 'freshness'] },
                       ]}
                     />
                     <EnvelopeNotes envelope={data} />
@@ -463,25 +539,44 @@ export function PropertiesPage() {
   );
 }
 
+function parseJsonStringArray(value: unknown): readonly string[] {
+  if (Array.isArray(value)) {
+    return value.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0);
+  }
+  if (typeof value !== 'string' || value.length === 0) return [];
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.filter((entry): entry is string => typeof entry === 'string' && entry.length > 0)
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+// Expands a single-key row into individual facts. Handles both the JSON-string
+// form (e.g. `{ property: "{...}" }`) and the already-parsed object form the
+// query API returns for `get_property` (`data.property` is a nested object).
 function expandSingleJsonFact(record: DataRow): DataRow {
   const entries = Object.entries(record);
   if (entries.length !== 1) return record;
-  const [, value] = entries[0] ?? [];
-  if (typeof value !== 'string' || !value.startsWith('{')) return record;
-  try {
-    const parsed: unknown = JSON.parse(value);
-    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return record;
-    const expanded: Record<string, unknown> = {};
-    for (const [factKey, factValue] of Object.entries(parsed)) {
-      expanded[factKey] =
-        factValue === null || typeof factValue !== 'object'
-          ? factValue
-          : JSON.stringify(factValue);
+  const [, rawValue] = entries[0] ?? [];
+  let value: unknown = rawValue;
+  if (typeof rawValue === 'string') {
+    if (!rawValue.startsWith('{')) return record;
+    try {
+      value = JSON.parse(rawValue);
+    } catch {
+      return record;
     }
-    return expanded;
-  } catch {
-    return record;
   }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return record;
+  const expanded: Record<string, unknown> = {};
+  for (const [factKey, factValue] of Object.entries(value)) {
+    expanded[factKey] =
+      factValue === null || typeof factValue !== 'object' ? factValue : JSON.stringify(factValue);
+  }
+  return expanded;
 }
 
 function FactGrid({ record }: Readonly<{ record: DataRow }>) {
@@ -550,28 +645,57 @@ export function PropertyDetailPage() {
                     {(data) => (
                       <>
                         <ol className="evidence-timeline">
-                          {rowsFromData(data.data).map((row, index) => (
-                            <li key={displayValue(valueFor(row, ['evidenceId', 'id']) ?? index)}>
-                              <span className="timeline-marker" aria-hidden="true" />
-                              <TruthBadge
-                                state={truthStateFrom(valueFor(row, ['supportState', 'state']))}
-                              />
-                              <h3>{displayValue(valueFor(row, ['feature', 'claim', 'type']))}</h3>
-                              <p>
-                                {displayValue(valueFor(row, ['value', 'description', 'summary']))}
-                              </p>
-                              <dl>
-                                <div>
-                                  <dt>Evidence ID</dt>
-                                  <dd>{displayValue(valueFor(row, ['evidenceId', 'id']))}</dd>
-                                </div>
-                                <div>
-                                  <dt>Source identifiers</dt>
-                                  <dd>{displayValue(valueFor(row, ['sourceIds', 'sourceId']))}</dd>
-                                </div>
-                              </dl>
-                            </li>
-                          ))}
+                          {rowsFromData(data.data).map((row, index) => {
+                            const sourceIds = parseJsonStringArray(
+                              valueFor(row, ['source_ids_json', 'sourceIds', 'sourceId']),
+                            );
+                            return (
+                              <li
+                                key={displayValue(
+                                  valueFor(row, ['evidence_id', 'evidenceId', 'id']) ?? index,
+                                )}
+                              >
+                                <span className="timeline-marker" aria-hidden="true" />
+                                <TruthBadge
+                                  state={truthStateFrom(
+                                    valueFor(row, ['support_class', 'supportState', 'state']),
+                                  )}
+                                />
+                                <h3>{displayValue(valueFor(row, ['feature', 'claim', 'type']))}</h3>
+                                <p>
+                                  {displayValue(
+                                    valueFor(row, ['value_json', 'value', 'description', 'summary']),
+                                  )}
+                                </p>
+                                <dl>
+                                  <div>
+                                    <dt>Evidence ID</dt>
+                                    <dd>
+                                      {displayValue(
+                                        valueFor(row, ['evidence_id', 'evidenceId', 'id']),
+                                      )}
+                                    </dd>
+                                  </div>
+                                  <div>
+                                    <dt>Source identifiers</dt>
+                                    <dd>
+                                      {sourceIds.length === 0
+                                        ? displayValue(
+                                            valueFor(row, ['source_ids_json', 'sourceIds', 'sourceId']),
+                                          )
+                                        : sourceIds.join(', ')}
+                                    </dd>
+                                  </div>
+                                  <div>
+                                    <dt>As of</dt>
+                                    <dd>
+                                      {displayValue(valueFor(row, ['as_of', 'asOf', 'collectedAt']))}
+                                    </dd>
+                                  </div>
+                                </dl>
+                              </li>
+                            );
+                          })}
                         </ol>
                         <EnvelopeNotes envelope={data} />
                       </>
@@ -1579,12 +1703,23 @@ export function ArtifactsPage() {
       <PageHeader
         eyebrow="Immutable storage"
         title="Release artifacts and content identifiers"
-        description="Public artifacts expose immutable CIDs, checksums, sizes, row counts, and publication class. Restricted overlays are not expanded here."
+        description="Each public artifact is content-addressed by its own SHA-256 hash. The immutable release as a whole is addressed on IPFS by one manifest CID; there is no separate per-artifact CID."
       />
       <ReleaseGate>
         {(release) => (
           <>
             <ReleaseBar envelope={release} />
+            <div className="architecture-note">
+              <ShieldCheck aria-hidden="true" />
+              <div>
+                <strong>Content addressing</strong>
+                <p>
+                  Every row below is addressed by its per-artifact SHA-256 content hash. The whole
+                  immutable release is addressed on IPFS by the manifest CID{' '}
+                  <code>{release.manifestCid}</code>.
+                </p>
+              </div>
+            </div>
             <StatePanel state={query} onRetry={query.retry}>
               {(data) => (
                 <>
@@ -1592,12 +1727,15 @@ export function ArtifactsPage() {
                     caption="Immutable public release artifacts"
                     rows={rowsFromData(data.data)}
                     columns={[
-                      { label: 'Artifact', keys: ['artifactId', 'name', 'type'] },
-                      { label: 'CID', keys: ['cid', 'manifestCid'] },
-                      { label: 'SHA-256', keys: ['sha256', 'checksum'] },
-                      { label: 'Bytes', keys: ['bytes', 'sizeBytes'] },
-                      { label: 'Rows', keys: ['rowCount', 'rows'] },
-                      { label: 'Publication', keys: ['publicationClass', 'visibility'] },
+                      {
+                        label: 'Artifact relation',
+                        keys: ['relation', 'artifactId', 'name', 'type'],
+                      },
+                      { label: 'Media type', keys: ['media_type', 'mediaType', 'contentType'] },
+                      { label: 'SHA-256 content hash', keys: ['sha256', 'checksum'] },
+                      { label: 'Bytes', keys: ['byte_size', 'bytes', 'sizeBytes'] },
+                      { label: 'Rows', keys: ['row_count', 'rowCount', 'rows'] },
+                      { label: 'Publication', keys: ['visibility', 'publicationClass'] },
                     ]}
                   />
                   <EnvelopeNotes envelope={data} />
