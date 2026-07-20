@@ -354,7 +354,12 @@ export function ResultViews({
                 <div>
                   <strong>
                     {displayValue(
-                      valueFor(row, ['address', 'formattedAddress', 'addressStreet', 'address_street']),
+                      valueFor(row, [
+                        'address',
+                        'formattedAddress',
+                        'addressStreet',
+                        'address_street',
+                      ]),
                     )}
                   </strong>
                   <span>Property {propertyId}</span>

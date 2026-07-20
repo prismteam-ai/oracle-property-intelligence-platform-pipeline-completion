@@ -664,7 +664,12 @@ export function PropertyDetailPage() {
                                 <h3>{displayValue(valueFor(row, ['feature', 'claim', 'type']))}</h3>
                                 <p>
                                   {displayValue(
-                                    valueFor(row, ['value_json', 'value', 'description', 'summary']),
+                                    valueFor(row, [
+                                      'value_json',
+                                      'value',
+                                      'description',
+                                      'summary',
+                                    ]),
                                   )}
                                 </p>
                                 <dl>
@@ -681,7 +686,11 @@ export function PropertyDetailPage() {
                                     <dd>
                                       {sourceIds.length === 0
                                         ? displayValue(
-                                            valueFor(row, ['source_ids_json', 'sourceIds', 'sourceId']),
+                                            valueFor(row, [
+                                              'source_ids_json',
+                                              'sourceIds',
+                                              'sourceId',
+                                            ]),
                                           )
                                         : sourceIds.join(', ')}
                                     </dd>
@@ -689,7 +698,9 @@ export function PropertyDetailPage() {
                                   <div>
                                     <dt>As of</dt>
                                     <dd>
-                                      {displayValue(valueFor(row, ['as_of', 'asOf', 'collectedAt']))}
+                                      {displayValue(
+                                        valueFor(row, ['as_of', 'asOf', 'collectedAt']),
+                                      )}
                                     </dd>
                                   </div>
                                 </dl>

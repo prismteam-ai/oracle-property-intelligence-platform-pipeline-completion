@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "runtime": {
+    "maxConcurrentSources": 8,
+    "maxBufferedRecords": 2000,
+    "maximumPhaseAttempts": 2,
+    "requestTimeoutMs": 60000
+  },
+  "pilot": {
+    "recordCap": 5000,
+    "includeLargeSources": ["sc:source:overture-starbucks"]
+  },
+  "parcels": {
+    "pageSize": 5000
+  },
+  "paloAltoYearBuilt": {
+    "pageSize": 5000
+  }
+}
