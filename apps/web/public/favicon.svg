@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Oracle">
+  <rect width="32" height="32" rx="7" fill="#0b7a4f"/>
+  <g fill="none" stroke="#eafff5" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+    <ellipse cx="16" cy="9.4" rx="7.4" ry="3.1"/>
+    <path d="M8.6 9.4v13.2c0 1.7 3.31 3.1 7.4 3.1s7.4-1.4 7.4-3.1V9.4"/>
+    <path d="M8.6 16c0 1.7 3.31 3.1 7.4 3.1s7.4-1.4 7.4-3.1"/>
+  </g>
+</svg>
