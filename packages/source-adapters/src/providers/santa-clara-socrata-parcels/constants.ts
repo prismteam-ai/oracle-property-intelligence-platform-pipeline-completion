@@ -59,11 +59,42 @@ export const SANTA_CLARA_PARCELS_DESCRIPTOR = sourceDescriptorSchema.parse({
     title: 'County of Santa Clara Parcels dataset metadata and GIS disclaimer',
     canonicalUrl: SANTA_CLARA_PARCELS_METADATA_URL,
     termsSha256: METADATA_SNAPSHOT_SHA256,
-    redistribution: 'unknown',
+    // OPERATOR DETERMINATION, not a County-granted licence. Recorded here rather
+    // than flipped silently so the basis and the limits travel with the lineage.
+    //
+    // The captured terms document (canonicalUrl / termsSha256 above) is the
+    // dataset metadata, and it provably declares NO licence: license, licenseId,
+    // licenseName and rightsDescription are all absent; the only rights-adjacent
+    // prose is a warranty disclaimer. The County publishes nothing that grants
+    // redistribution and nothing that prohibits it - the terms are SILENT. The
+    // closest text is the County Acceptable Use Policy section 5 ("information
+    // presented on this website, unless otherwise indicated, is considered in the
+    // public domain... may be distributed or copied as permitted by law"), which
+    // is hedged, scoped to the website rather than this dataset, and asserts a
+    // legal status rather than granting a licence.
+    //
+    // On 2026-07-21 the operator (Ruslan / evereq) determined that redistribution
+    // is acceptable for this time-limited hiring-assessment deliverable, on the
+    // basis of that public-domain assertion and the public-record character of
+    // California parcel data. That determination is the authority for the value
+    // below - the County has granted nothing.
+    //
+    // Note this is a WEAKER basis than every other 'approved' source in this
+    // pipeline, each of which cites a named published instrument (CC0 legalcode,
+    // ODbL, the Caltrain Developer Licence, USGS public-domain statements). Any
+    // durable or commercial publication should obtain a written County
+    // determination first and replace this block with it.
+    redistribution: 'approved',
+    // Unchanged, and must stay unchanged: this is a factual claim about the
+    // dataset's CONTENT, not a rights judgement. Parcel rows here carry no
+    // personal data; sources that do (e.g. san-jose-building-permits) declare it
+    // and are handled by the owner-free public projection, not by relabelling.
     containsPersonalData: false,
     attribution: ['County of Santa Clara, Parcels dataset ubcd-cewv'],
     limitations: [
       'The official metadata does not declare an explicit redistribution license.',
+      'Redistribution is set to approved by OPERATOR DETERMINATION (evereq, 2026-07-21) for time-limited hiring-assessment use, relying on County Acceptable Use Policy section 5; the County itself grants no explicit redistribution license.',
+      'This basis is weaker than the named published instruments backing every other approved source in this pipeline; obtain a written County determination before any durable or commercial publication.',
       'The County describes the FY 2025 GIS data as dynamic and requires verification against current public primary information sources.',
       'Public source visibility does not by itself make a later aggregate artifact publication-eligible.',
     ],
