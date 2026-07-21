@@ -1,0 +1,46 @@
+{
+  "capabilities": {
+    "ownership_age": {
+      "state": "supported",
+      "supportClasses": ["supported"],
+      "numerator": 10,
+      "denominator": 10,
+      "limitations": []
+    },
+    "regional_owner": {
+      "state": "supported",
+      "supportClasses": ["supported"],
+      "numerator": 10,
+      "denominator": 10,
+      "limitations": []
+    },
+    "roof_age": {
+      "state": "supported",
+      "supportClasses": ["supported"],
+      "numerator": 10,
+      "denominator": 10,
+      "limitations": []
+    },
+    "starbucks_walkability": {
+      "state": "supported",
+      "supportClasses": ["supported"],
+      "numerator": 10,
+      "denominator": 10,
+      "limitations": []
+    },
+    "transit_walkability": {
+      "state": "supported",
+      "supportClasses": ["supported"],
+      "numerator": 10,
+      "denominator": 10,
+      "limitations": []
+    },
+    "water_view_candidate": {
+      "state": "supported",
+      "supportClasses": ["supported"],
+      "numerator": 10,
+      "denominator": 10,
+      "limitations": []
+    }
+  }
+}
