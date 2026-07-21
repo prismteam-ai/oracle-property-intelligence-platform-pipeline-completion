@@ -3114,7 +3114,23 @@ async function materializeFeatureProxyCandidates(
         },
       ] as const) {
         await connection.run(
-          `INSERT INTO feature_proxy_candidate SELECT generation_id, property_id, feature, aggregate_json, longitude, latitude FROM (SELECT property.generation_id, property.entity_id AS property_id, ${sql(specification.feature)} AS feature, entity.aggregate_json, candidate.longitude, candidate.latitude, row_number() OVER (PARTITION BY property.entity_id ORDER BY ((candidate.longitude-property_point.longitude)*(candidate.longitude-property_point.longitude)+(candidate.latitude-property_point.latitude)*(candidate.latitude-property_point.latitude)), candidate.entity_id) AS candidate_rank FROM canonical_entity property JOIN geospatial_candidate property_point ON property_point.generation_id=property.generation_id AND property_point.entity_id=coalesce(json_extract_string(property.entity_json,'$.primaryAddressId'), property.entity_id) JOIN geospatial_candidate candidate ON candidate.generation_id=property.generation_id AND candidate.entity_kind=${sql(specification.entityKind)} AND candidate.longitude BETWEEN property_point.longitude-0.5 AND property_point.longitude+0.5 AND candidate.latitude BETWEEN property_point.latitude-0.5 AND property_point.latitude+0.5 JOIN canonical_entity entity ON entity.generation_id=candidate.generation_id AND entity.entity_id=candidate.entity_id WHERE property.generation_id=${sql(processing.generationId)} AND property.entity_kind='property'${specification.predicate}) ranked WHERE candidate_rank=1`,
+          // The ranking window must carry ONLY ids and coordinates. Selecting
+          // entity.aggregate_json inside the window materialised a full canonical
+          // aggregate blob for every (property, candidate) pair before ranking:
+          // ~5k properties x effectively every candidate (the +/-0.5 degree band is
+          // ~55km, so it is close to a cross join) x 3 feature specs. That spilled
+          // 182.5 GiB to the DuckDB temp directory and aborted with
+          // "failed to offload data block ... max_temp_directory_size".
+          //
+          // This was latent: before properties had a representative point, the
+          // property_point join matched nothing and the whole statement was a no-op,
+          // so the cost never showed. Giving properties a point made it real.
+          //
+          // Rank on the narrow projection, then join canonical_entity once for the
+          // rank-1 winner. Identical output: same partition, same ORDER BY, same
+          // entity_id tiebreak, and the winner's aggregate_json is the same row the
+          // old query would have carried - so artifact hashes are unchanged.
+          `INSERT INTO feature_proxy_candidate SELECT ranked.generation_id, ranked.property_id, ranked.feature, winner.aggregate_json, ranked.longitude, ranked.latitude FROM (SELECT property.generation_id, property.entity_id AS property_id, ${sql(specification.feature)} AS feature, candidate.entity_id AS candidate_entity_id, candidate.longitude, candidate.latitude, row_number() OVER (PARTITION BY property.entity_id ORDER BY ((candidate.longitude-property_point.longitude)*(candidate.longitude-property_point.longitude)+(candidate.latitude-property_point.latitude)*(candidate.latitude-property_point.latitude)), candidate.entity_id) AS candidate_rank FROM canonical_entity property JOIN geospatial_candidate property_point ON property_point.generation_id=property.generation_id AND property_point.entity_id=coalesce(json_extract_string(property.entity_json,'$.primaryAddressId'), property.entity_id) JOIN geospatial_candidate candidate ON candidate.generation_id=property.generation_id AND candidate.entity_kind=${sql(specification.entityKind)} AND candidate.longitude BETWEEN property_point.longitude-0.5 AND property_point.longitude+0.5 AND candidate.latitude BETWEEN property_point.latitude-0.5 AND property_point.latitude+0.5 JOIN canonical_entity entity ON entity.generation_id=candidate.generation_id AND entity.entity_id=candidate.entity_id WHERE property.generation_id=${sql(processing.generationId)} AND property.entity_kind='property'${specification.predicate}) ranked JOIN canonical_entity winner ON winner.generation_id=ranked.generation_id AND winner.entity_id=ranked.candidate_entity_id WHERE ranked.candidate_rank=1`,
         );
       }
     }
