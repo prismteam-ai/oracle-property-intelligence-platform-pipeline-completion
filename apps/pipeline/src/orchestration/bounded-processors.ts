@@ -520,7 +520,8 @@ async function processBoundedCounty(
           try {
             instance?.closeSync();
           } finally {
-            await removeDuckDbTemporaryDirectory(temporaryDirectory);
+            // Best-effort: teardown cleanup must never replace the run's result.
+            await removeDuckDbTemporaryDirectoryBestEffort(temporaryDirectory);
           }
         }
       }
@@ -7251,10 +7252,41 @@ export function boundedDuckDbTemporaryDirectory(
 async function removeDuckDbTemporaryDirectory(path: string): Promise<void> {
   await rm(path, {
     force: true,
-    maxRetries: process.platform === 'win32' ? 5 : 0,
+    // Windows holds DuckDB spill files open transiently - an on-access antivirus
+    // scanner is the usual culprit - and unlink then fails EBUSY/EPERM. The prior
+    // budget (5 x 50ms linear backoff, about 0.75s total) was far too short for a
+    // scanner working through a multi-hundred-MB spill file. Node applies
+    // retryDelay * attempt, so this is roughly 14s of patience.
+    maxRetries: process.platform === 'win32' ? 10 : 0,
     recursive: true,
-    retryDelay: 50,
+    retryDelay: 250,
   });
+}
+
+/**
+ * Cleanup variant for the teardown path, which MUST NOT be able to fail the run.
+ *
+ * removeDuckDbTemporaryDirectory is invoked from a `finally` after the pipeline
+ * has already produced (or failed to produce) its result. A throw there replaces
+ * the real outcome: a transient EBUSY on a temp file could discard the terminal
+ * manifest of a multi-hour county run, or mask the genuine error that caused the
+ * failure. A leftover temp directory is enormously less costly than either, and
+ * the next run removes it up front anyway.
+ *
+ * The pre-open call deliberately keeps the strict variant: if a stale temp
+ * directory cannot be removed BEFORE work starts, that is a real problem and
+ * should stop the run.
+ */
+async function removeDuckDbTemporaryDirectoryBestEffort(path: string): Promise<void> {
+  try {
+    await removeDuckDbTemporaryDirectory(path);
+  } catch (error) {
+    process.stderr.write(
+      `warning: could not remove DuckDB temporary directory ${path}: ${
+        error instanceof Error ? error.message : String(error)
+      }\n`,
+    );
+  }
 }
 
 function confinedChild(root: string, child: string): string {
