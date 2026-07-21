@@ -275,6 +275,7 @@ describe('production API composition', () => {
       limitations: [
         'Production test composition; no fixture selected from environment.',
         'Roof evidence is limited to the immutable public release.',
+        'Agent status reflects configuration readiness only; it does not invoke the model, so a configured agent can still fail at ask time if the model is unreachable.',
       ],
       data: {
         status: 'available',
@@ -283,6 +284,10 @@ describe('production API composition', () => {
         limitations: [
           'Production test composition; no fixture selected from environment.',
           'Roof evidence is limited to the immutable public release.',
+          // agent.status reports configuration readiness and never invokes the
+          // model - asserted here so the distinction cannot be quietly dropped.
+          // modelCall stays 0 below, which is the proof it is not a live probe.
+          'Agent status reflects configuration readiness only; it does not invoke the model, so a configured agent can still fail at ask time if the model is unreachable.',
         ],
       },
     });

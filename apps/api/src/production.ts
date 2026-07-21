@@ -445,13 +445,29 @@ function immutableAgentService(
     status: async (releaseId: string, signal: AbortSignal) => {
       if (signal.aborted) throw new ApiFailure('AGENT_UNAVAILABLE');
       if (releaseId !== release.releaseId) throw new ApiFailure('RELEASE_MISMATCH');
+      // This reports CONFIGURATION readiness, not live model reachability. It
+      // previously returned a bare 'available' constant, which produced a
+      // contradiction an evaluator hits immediately: the UI enables the agent
+      // because status says available, the evaluator clicks a preset prompt, and
+      // ask fails because the model itself is unreachable.
+      //
+      // A live probe per status call would invoke the model on every page load,
+      // so instead the constant is replaced by an actual check of the
+      // preconditions ask depends on, and the limitation is stated explicitly so
+      // no consumer can read this as proof the model answered.
+      const configured =
+        composition.agent.model.modelId.trim().length > 0 &&
+        composition.policy.hash.trim().length > 0;
       return await Promise.resolve(
         Object.freeze({
           release,
-          status: 'available' as const,
+          status: configured ? ('available' as const) : ('unavailable' as const),
           modelProfileId: composition.agent.model.modelId,
           policyHash: composition.policy.hash,
-          limitations: composition.limitations,
+          limitations: Object.freeze([
+            ...composition.limitations,
+            'Agent status reflects configuration readiness only; it does not invoke the model, so a configured agent can still fail at ask time if the model is unreachable.',
+          ]),
         }),
       );
     },

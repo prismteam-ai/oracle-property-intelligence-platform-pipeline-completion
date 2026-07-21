@@ -379,15 +379,27 @@ test('agent shows named-tool trace and exact citations for a release-supported c
 }) => {
   let criterion = 'roof_age';
   if (isHostedTarget()) {
-    const supported = (await releaseCapabilities(request)).filter(
+    // A criterion reaches 'supported' only at 100% field coverage; any real
+    // bounded release lands on 'partial'. Filtering to 'supported' alone meant
+    // this test skipped itself on every release it was written to certify, so
+    // the suite reported green having proven nothing - while the README lists a
+    // cited agent answer as a mandatory acceptance proof.
+    //
+    // 'partial' still carries genuine evidence: the criterion is answerable for
+    // the rows that have it, which is exactly what a cited answer demonstrates.
+    const answerable = (await releaseCapabilities(request)).filter(
       (capability) =>
-        capability.state === 'supported' && criterionPrompts[capability.criterion] !== undefined,
+        (capability.state === 'supported' || capability.state === 'partial') &&
+        criterionPrompts[capability.criterion] !== undefined,
     );
-    test.skip(
-      supported.length === 0,
-      'The deployed serving config reports no supported criterion, so no criterion can produce a cited answer on this release.',
-    );
-    criterion = supported[0]?.criterion ?? criterion;
+    // Deliberately FAIL rather than skip. A release that can answer no criterion
+    // at all cannot satisfy the acceptance requirement, and silently skipping
+    // turns that into a false green.
+    expect(
+      answerable.length,
+      'The deployed serving config reports no supported or partial criterion, so no cited agent answer is possible on this release. This is an acceptance failure, not a skip.',
+    ).toBeGreaterThan(0);
+    criterion = answerable[0]?.criterion ?? criterion;
   }
   const prompt = criterionPrompts[criterion];
   if (prompt === undefined) throw new Error(`No agent prompt is mapped for ${criterion}.`);
