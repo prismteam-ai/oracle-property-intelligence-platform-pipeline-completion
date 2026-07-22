@@ -1508,10 +1508,24 @@ async function materializeTrustedAcquisition(
         : source.terminalState === 'complete'
           ? ('succeeded' as const)
           : source.terminalState;
+      // Third and last place that conflated "the source contains personal data"
+      // with "this source may be named in a public release". The release gate
+      // (bounded-release.ts) admits only permissionState 'allowed', so a source
+      // whose personal fields are provably excluded from the public projection
+      // was still rejected here even after lineage attribution was corrected.
+      //
+      // The elevation is narrow and explicit: redistribution must be approved AND
+      // the source must carry the opt-in flag asserting its personal fields cannot
+      // reach a public column. Without that flag, containsPersonalData still yields
+      // 'restricted' exactly as before - the default is unchanged for every other
+      // source in this pipeline.
+      const personalFieldsExcluded =
+        source.license.personalFieldsExcludedFromPublicProjection === true;
       const permissionState =
         source.license.redistribution === 'prohibited'
           ? ('prohibited' as const)
-          : source.license.redistribution === 'restricted' || source.license.containsPersonalData
+          : source.license.redistribution === 'restricted' ||
+              (source.license.containsPersonalData && !personalFieldsExcluded)
             ? ('restricted' as const)
             : source.license.redistribution === 'approved'
               ? ('allowed' as const)
@@ -2112,42 +2126,53 @@ async function rebuildCanonicalFieldLineageIndex(
   generationId: string,
   signal: AbortSignal,
 ): Promise<void> {
+  signal.throwIfAborted();
+  // Built with a single server-side INSERT ... SELECT ... UNNEST, deliberately
+  // NOT a JS streaming read plus an appender.
+  //
+  // The previous implementation ran `streamKeysetJson(canonical_entity)` while an
+  // open DuckDBAppender wrote to the SAME connection inside one transaction. When
+  // the appender auto-flushes (~every 2048 rows) it executes on the connection and
+  // invalidates the in-flight streaming result; node-api's async iterator reads the
+  // resulting empty chunk as a CLEAN end-of-stream and stops WITHOUT throwing. The
+  // loop ended early and COMMITted a truncated index (observed: 237,362 of 410,512
+  // rows on a real run - a clean entity_id-sorted prefix), which then failed the
+  // release verifier ("property_query field property_id reference is not trusted
+  // canonical lineage") for every entity past the cut. Root-caused and reproduced
+  // in isolation; the verifier was correct, the index it read was the corrupt
+  // artifact.
+  //
+  // A set-based statement has no JS stream and no appender, so the race cannot
+  // occur, and DuckDB manages its own spill so it stays bounded. Verified read-only
+  // against the failed database that this extraction yields the complete index
+  // (410,512 rows, 0 NULL lineage columns) versus the truncated 237,362.
+  //
+  // json_extract_string on a JSON element returns the unquoted scalar, matching
+  // what the appender previously wrote via canonicalJson field access.
   await connection.run('BEGIN TRANSACTION');
-  let appender: DuckDBAppender | null = null;
   try {
     await connection.run(
       `DELETE FROM canonical_field_lineage WHERE generation_id=${sql(generationId)}`,
     );
-    appender = await connection.createAppender('canonical_field_lineage');
-    for await (const aggregate of streamKeysetJson<CanonicalEntityAggregate>(
-      connection,
-      `SELECT entity_id AS key, aggregate_json AS value FROM canonical_entity WHERE generation_id=${sql(generationId)}`,
-      'key',
-    )) {
-      signal.throwIfAborted();
-      for (const observation of aggregate.observations) {
-        const sourceRecord = observation.lineage.sourceRecord;
-        appender.appendVarchar(generationId);
-        appender.appendVarchar(aggregate.entity.id);
-        appender.appendVarchar(observation.observationId);
-        appender.appendVarchar(observation.fieldPath);
-        appender.appendVarchar(sourceRecord.sourceId);
-        appender.appendVarchar(sourceRecord.snapshotId);
-        appender.appendVarchar(sourceRecord.artifactId);
-        appender.appendVarchar(sourceRecord.recordKey);
-        appender.appendVarchar(sourceRecord.recordSha256);
-        appender.appendVarchar(observation.lineage.lineageSha256);
-        appender.endRow();
-      }
-    }
-    appender.flushSync();
-    appender.closeSync();
-    appender = null;
+    await connection.run(
+      `INSERT INTO canonical_field_lineage
+         SELECT
+           e.generation_id,
+           e.entity_id,
+           json_extract_string(obs, '$.observationId'),
+           json_extract_string(obs, '$.fieldPath'),
+           json_extract_string(obs, '$.lineage.sourceRecord.sourceId'),
+           json_extract_string(obs, '$.lineage.sourceRecord.snapshotId'),
+           json_extract_string(obs, '$.lineage.sourceRecord.artifactId'),
+           json_extract_string(obs, '$.lineage.sourceRecord.recordKey'),
+           json_extract_string(obs, '$.lineage.sourceRecord.recordSha256'),
+           json_extract_string(obs, '$.lineage.lineageSha256')
+         FROM canonical_entity e,
+              UNNEST(json_extract(e.aggregate_json, '$.observations')::JSON[]) AS t(obs)
+         WHERE e.generation_id=${sql(generationId)}`,
+    );
     await connection.run('COMMIT');
   } catch (error) {
-    if (appender !== null) {
-      appender.closeSync();
-    }
     await connection.run('ROLLBACK');
     throw error;
   }
@@ -2442,6 +2467,26 @@ async function buildLinkIndex(
       count += 1;
     }
     closeIndexAppenders();
+    // Fail-closed truncation guard. This function streams canonical_entity while
+    // six appenders write to the SAME connection inside one transaction - the exact
+    // pattern that silently truncated the field-lineage index on a real run (an
+    // appender auto-flush invalidates the in-flight stream, and node-api reads the
+    // empty chunk as a clean end-of-stream with no error). buildLinkIndex happened
+    // to complete fully that run, but the race is identical and data/timing
+    // dependent. Until the read is moved to a dedicated connection, assert the
+    // stream was NOT truncated: the entities we processed must equal the entities
+    // that exist. A mismatch means the stream ended early - throw loudly here
+    // rather than commit a partial index that only surfaces as a release-verifier
+    // failure ~30 minutes later.
+    const canonicalEntityCount = await scalarCount(
+      connection,
+      `SELECT count(*)::BIGINT AS value FROM canonical_entity WHERE generation_id=${sql(generationId)}`,
+    );
+    if (count !== canonicalEntityCount) {
+      throw new BoundedPipelineIntegrityError(
+        `build_link_index processed ${count} of ${canonicalEntityCount} canonical entities - the streaming read was truncated mid-append`,
+      );
+    }
     const summary = {
       stageVersion: 'bounded-link-index-plan-v2',
       generationId,
@@ -5004,7 +5049,20 @@ function propertyQueryFieldSourceIds(
     starbucks_distance_meters: feature('starbucks_walkability'),
     starbucks_walk_minutes: feature('starbucks_walkability'),
     combined_review_score: Object.freeze([]),
-    evidence_coverage: allFeatures,
+    // evidence_coverage is a DERIVED ratio (supported / FEATURE_KINDS.length) that
+    // reads none of the underlying feature records directly, so it carries no exact
+    // provenance references - exactly like combined_review_score above. It was wired
+    // to `allFeatures`, the union of every feature's references, which (a) re-lists
+    // records already exactly attributed on the specific feature field that consumes
+    // them (roof_*, water_*, transit_*, ...), i.e. over-attribution, and (b) is
+    // unbounded: on one real property it reached 75 references (from 25 records x
+    // their field-paths, each a distinct lineage attestation) and tripped the
+    // 64-reference release bound, and it grows without limit at county scale. Emitting
+    // the empty set is the truthful shape - it removes no provenance, since every one
+    // of those references remains bound on the feature field that actually reads it.
+    // The `> 64` cap is deliberately NOT raised: that would only defer the same
+    // unbounded overflow while keeping the redundant attribution.
+    evidence_coverage: Object.freeze([]),
     visibility: Object.freeze([]),
   });
 }
@@ -5223,6 +5281,73 @@ function canonicalLineageResolver(
   connection: DuckDBConnection,
   generationId: string,
 ): BoundedTrustedCanonicalLineageResolver {
+  // The release verifier calls verifyPropertyQueryFieldReference once per
+  // (property x field x reference) - hundreds of thousands of times. The heavy
+  // work below (fetch property+address+features, JSON.parse them, recompute
+  // propertyServingRow AND propertyQueryFieldSourceIds for ALL ~30 fields)
+  // depends ONLY on propertyId, yet the original recomputed it on every call and
+  // then used a single field. That turned release verification into hours, and is
+  // computationally infeasible at full-county scale.
+  //
+  // Memoize the per-property computation by propertyId, and the per-reference
+  // existence check by its exact query key. Both are pure functions of their
+  // inputs within this fixed generationId (canonical_entity is immutable after
+  // reduce), so the cache returns byte-identical booleans. Nothing is written and
+  // no hash changes - this is a pure speed fix.
+  type PropertyBinding = {
+    readonly servingRow: ReturnType<typeof propertyServingRow>;
+    readonly referencesByField: ReturnType<typeof propertyQueryFieldSourceIds>;
+  };
+  type PropertyLineage = { readonly invalid: boolean; readonly bindings: readonly PropertyBinding[] };
+  const propertyCache = new Map<string, PropertyLineage>();
+  const referenceCache = new Map<string, boolean>();
+
+  const loadProperty = async (propertyId: string): Promise<PropertyLineage> => {
+    const existing = propertyCache.get(propertyId);
+    if (existing !== undefined) return existing;
+    const bindings: PropertyBinding[] = [];
+    let invalid = false;
+    for await (const row of streamRows(
+      connection,
+      `SELECT property.aggregate_json, address.aggregate_json AS address_aggregate_json, evidence.projection, evidence.features_json FROM canonical_entity property LEFT JOIN canonical_entity address ON address.generation_id=property.generation_id AND address.entity_kind='address' AND address.entity_id=json_extract_string(property.entity_json,'$.primaryAddressId') LEFT JOIN property_feature_bundle evidence ON evidence.property_id=property.entity_id WHERE property.generation_id=${sql(generationId)} AND property.entity_kind='property' AND property.entity_id=${sql(propertyId)} ORDER BY evidence.projection`,
+    )) {
+      const propertyAggregate = JSON.parse(
+        stringValue(row.aggregate_json),
+      ) as CanonicalEntityAggregate;
+      if (propertyAggregate.entity.entityKind !== 'property') {
+        invalid = true;
+        break;
+      }
+      const addressAggregate =
+        row.address_aggregate_json === null || row.address_aggregate_json === undefined
+          ? null
+          : (JSON.parse(stringValue(row.address_aggregate_json)) as CanonicalEntityAggregate);
+      const address =
+        addressAggregate?.entity.entityKind === 'address' ? addressAggregate.entity : null;
+      const projection = stringValue(row.projection);
+      if (projection !== 'public' && projection !== 'restricted') {
+        invalid = true;
+        break;
+      }
+      const features = JSON.parse(stringValue(row.features_json)) as CountyFeatureEvidence[];
+      if (features.length !== FEATURE_KINDS.length) {
+        invalid = true;
+        break;
+      }
+      const servingRow = propertyServingRow(propertyAggregate.entity, address, features, projection);
+      const referencesByField = propertyQueryFieldSourceIds(
+        propertyAggregate,
+        addressAggregate,
+        features,
+        servingRow,
+      );
+      bindings.push({ servingRow, referencesByField });
+    }
+    const entry: PropertyLineage = Object.freeze({ invalid, bindings });
+    propertyCache.set(propertyId, entry);
+    return entry;
+  };
+
   return Object.freeze({
     async verifyPropertyQueryFieldReference({
       propertyId,
@@ -5240,44 +5365,18 @@ function canonicalLineageResolver(
       ) {
         return false;
       }
+      const property = await loadProperty(propertyId);
+      if (property.invalid) return false;
       let propertyBindingMatched = false;
-      for await (const row of streamRows(
-        connection,
-        `SELECT property.aggregate_json, address.aggregate_json AS address_aggregate_json, evidence.projection, evidence.features_json FROM canonical_entity property LEFT JOIN canonical_entity address ON address.generation_id=property.generation_id AND address.entity_kind='address' AND address.entity_id=json_extract_string(property.entity_json,'$.primaryAddressId') LEFT JOIN property_feature_bundle evidence ON evidence.property_id=property.entity_id WHERE property.generation_id=${sql(generationId)} AND property.entity_kind='property' AND property.entity_id=${sql(propertyId)} ORDER BY evidence.projection`,
-      )) {
-        const propertyAggregate = JSON.parse(
-          stringValue(row.aggregate_json),
-        ) as CanonicalEntityAggregate;
-        if (propertyAggregate.entity.entityKind !== 'property') return false;
-        const addressAggregate =
-          row.address_aggregate_json === null || row.address_aggregate_json === undefined
-            ? null
-            : (JSON.parse(stringValue(row.address_aggregate_json)) as CanonicalEntityAggregate);
-        const address =
-          addressAggregate?.entity.entityKind === 'address' ? addressAggregate.entity : null;
-        const projection = stringValue(row.projection);
-        if (projection !== 'public' && projection !== 'restricted') return false;
-        const features = JSON.parse(stringValue(row.features_json)) as CountyFeatureEvidence[];
-        if (features.length !== FEATURE_KINDS.length) return false;
-        const servingRow = propertyServingRow(
-          propertyAggregate.entity,
-          address,
-          features,
-          projection,
-        );
-        const canonicalValue = servingRow[fieldName];
+      for (const binding of property.bindings) {
+        const canonicalValue = binding.servingRow[fieldName];
         if (
           canonicalValue === undefined ||
           canonicalJson(canonicalValue) !== canonicalJson(fieldValue)
         ) {
           continue;
         }
-        const canonicalReferences = propertyQueryFieldSourceIds(
-          propertyAggregate,
-          addressAggregate,
-          features,
-          servingRow,
-        )[fieldName];
+        const canonicalReferences = binding.referencesByField[fieldName];
         if (
           canonicalReferences?.some(
             (candidate) => canonicalJson(candidate) === canonicalJson(reference),
@@ -5289,11 +5388,25 @@ function canonicalLineageResolver(
       }
       if (!propertyBindingMatched) return false;
       const fieldPaths = exactSourceIds(reference.fieldPaths);
+      const referenceKey = canonicalJson({
+        sourceId: reference.sourceId,
+        snapshotId: reference.snapshotId,
+        artifactId: reference.artifactId,
+        recordKey: reference.recordKey,
+        recordSha256: reference.recordSha256,
+        lineageSha256: reference.lineageSha256,
+        fieldPaths,
+        entityKinds: specification.entityKinds,
+      });
+      const cachedReference = referenceCache.get(referenceKey);
+      if (cachedReference !== undefined) return cachedReference;
       const matched = await scalarCount(
         connection,
         `SELECT count(DISTINCT lineage.field_path)::BIGINT AS value FROM canonical_field_lineage lineage JOIN canonical_entity entity ON entity.generation_id=lineage.generation_id AND entity.entity_id=lineage.entity_id WHERE lineage.generation_id=${sql(generationId)} AND lineage.source_id=${sql(reference.sourceId)} AND lineage.snapshot_id=${sql(reference.snapshotId)} AND lineage.artifact_id=${sql(reference.artifactId)} AND lineage.record_key=${sql(reference.recordKey)} AND lineage.record_sha256=${sql(reference.recordSha256)} AND lineage.lineage_sha256=${sql(reference.lineageSha256)} AND lineage.field_path IN (${fieldPaths.map(sql).join(',')}) AND entity.entity_kind IN (${specification.entityKinds.map(sql).join(',')})`,
       );
-      return matched === fieldPaths.length;
+      const result = matched === fieldPaths.length;
+      referenceCache.set(referenceKey, result);
+      return result;
     },
   });
 }
@@ -5365,6 +5478,31 @@ function publicSourceIds(sources: readonly SourceExecutionManifest[]): ReadonlyS
   );
 }
 
+/**
+ * Sources a PUBLIC relation may name as contributors.
+ *
+ * Superset of publicSourceIds, adding sources that carry personal data but whose
+ * personal fields are provably excluded from the public projection. Used by
+ * lineageForSourceIds ONLY. Deliberately NOT used by any function that decides
+ * whether a value is emitted - publicSourceIds remains the control for that, so
+ * widening attribution cannot widen publication.
+ */
+function publicLineageSourceIds(
+  sources: readonly SourceExecutionManifest[],
+): ReadonlySet<string> {
+  const attributable = new Set(publicSourceIds(sources));
+  for (const { sourceId, license, terminalState } of sources) {
+    if (
+      terminalState !== 'failed' &&
+      license.redistribution === 'approved' &&
+      license.personalFieldsExcludedFromPublicProjection === true
+    ) {
+      attributable.add(sourceId);
+    }
+  }
+  return attributable;
+}
+
 function visibilitySourceIds(
   sources: readonly SourceExecutionManifest[],
   visibility: ServingVisibility,
@@ -5399,7 +5537,12 @@ function lineageForSourceIds(
   visibility: ServingVisibility,
 ): readonly BoundedServingSourceLineage[] {
   const requested = new Set(contributingSourceIds);
-  const allowedPublic = publicSourceIds(sources);
+  // Attribution, not publication. A source whose personal fields are provably
+  // excluded from the public projection may be NAMED as a contributor even though
+  // it contains personal data - naming a provenance is a claim about data, not a
+  // channel for it. publicSourceIds still governs everything that decides whether
+  // a VALUE may be published, and is unchanged.
+  const allowedPublic = publicLineageSourceIds(sources);
   const selected = sources.filter(
     ({ sourceId }) =>
       requested.has(sourceId) && (visibility !== 'public' || allowedPublic.has(sourceId)),

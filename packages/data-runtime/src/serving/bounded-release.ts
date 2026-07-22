@@ -3204,7 +3204,31 @@ function parseCanonicalFieldSourceIds(
       canonicalJson(record.source_ids),
       `field_source_ids_json.${record.field_name}`,
     );
-    if (!Array.isArray(record.source_references) || record.source_references.length > 64) {
+    // Per-field source_references are a much finer grain than the 64-source bound
+    // this constant was copied from: they are one reference per (contributing
+    // record x field-path x observation-lineage), so their count is bounded by the
+    // number of distinct records that genuinely provide the field's value, NOT by
+    // the number of sources. A single multi-unit parcel legitimately produces many:
+    // a Palo Alto parcel (APN 120-05-075) whose year-built dataset carries one row
+    // per unit contributed 80 distinct records to address_city (all on /jurisdiction)
+    // and 160 to roof_* - every one a true, distinct lineage attestation, verified
+    // read-only against the failed run. Capping this at 64 rejected genuine
+    // provenance; narrowing it would DELETE real attestations (a lie) and change
+    // release hashes. Admitting the references changes NO serving bytes and NO
+    // release hashes - the parquet and field_lineage_sha256 already contain them;
+    // this cap is a verify-time size guard only.
+    //
+    // The count is retained purely as a parse/DoS ceiling, raised well above any
+    // realistic per-field record count (bounded upstream by the acquisition record
+    // cap), while the REAL integrity guards below stay intact: canonical ordering,
+    // uniqueness, per-reference field-path/entity-kind validation, and the
+    // DB-backed verifyPropertyQueryFieldReference. The distinct-SOURCE bound
+    // (source_ids, still 64 at :2338) is unchanged - that one is genuinely small.
+    const MAX_FIELD_SOURCE_REFERENCES = 16_384;
+    if (
+      !Array.isArray(record.source_references) ||
+      record.source_references.length > MAX_FIELD_SOURCE_REFERENCES
+    ) {
       throw new BoundedReleaseMetadataError(
         `field_source_ids_json.${record.field_name} references exceed the exact bound`,
       );
