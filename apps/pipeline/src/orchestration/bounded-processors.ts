@@ -2252,6 +2252,13 @@ class DuckCanonicalTransaction implements BoundedCanonicalPartitionTransaction {
   private entityAppender: DuckDBAppender | null = null;
   private linkAppender: DuckDBAppender | null = null;
   private artifactAppender: DuckDBAppender | null = null;
+  // artifactId -> canonical record body already written in this partition. A
+  // paged decode (Overture emits one artifact_reference per keyset page of the
+  // same pinned fragment — 264 for the places file) legitimately re-asserts its
+  // backing artifact; the table's (generation_id, artifact_id) primary key
+  // asserts one row per artifact, so identical re-assertions must collapse and
+  // CONFLICTING re-assertions must fail closed rather than race the constraint.
+  private readonly writtenArtifacts = new Map<string, string>();
   public constructor(
     private readonly connection: DuckDBConnection,
     public readonly generationId: string,
@@ -2303,10 +2310,21 @@ class DuckCanonicalTransaction implements BoundedCanonicalPartitionTransaction {
   public writeArtifact(
     value: Parameters<BoundedCanonicalPartitionTransaction['writeArtifact']>[0],
   ): Promise<void> {
+    const body = canonicalJson(value);
+    const prior = this.writtenArtifacts.get(value.artifactId);
+    if (prior !== undefined) {
+      if (prior !== body) {
+        throw new BoundedPipelineIntegrityError(
+          `Conflicting artifact_reference records for ${value.artifactId} in one partition`,
+        );
+      }
+      return Promise.resolve();
+    }
+    this.writtenArtifacts.set(value.artifactId, body);
     const appender = requiredAppender(this.artifactAppender);
     appender.appendVarchar(this.generationId);
     appender.appendVarchar(value.artifactId);
-    appender.appendVarchar(canonicalJson(value));
+    appender.appendVarchar(body);
     appender.endRow();
     return Promise.resolve();
   }
@@ -2323,16 +2341,38 @@ class DuckCanonicalTransaction implements BoundedCanonicalPartitionTransaction {
 
   public async abort(): Promise<void> {
     if (!this.open) return;
-    this.closeAppenders();
-    await this.connection.run('ROLLBACK');
+    // Best-effort teardown: when DuckDB has already auto-aborted the
+    // transaction, flushing an appender's buffered rows throws ("Current
+    // transaction is aborted") — and an abort() that throws REPLACES the
+    // original error that triggered it, hiding the root cause from the
+    // operator. The buffered rows are being rolled back anyway; discard them.
+    this.closeAppenders(true);
+    try {
+      await this.connection.run('ROLLBACK');
+    } catch {
+      // The transaction may already be rolled back; the original error must win.
+    }
     this.open = false;
   }
 
-  private closeAppenders(): void {
+  private closeAppenders(bestEffort = false): void {
     for (const appender of [this.entityAppender, this.linkAppender, this.artifactAppender]) {
       if (appender !== null) {
-        appender.flushSync();
-        appender.closeSync();
+        if (bestEffort) {
+          try {
+            appender.flushSync();
+          } catch {
+            // Discarding buffered rows during abort.
+          }
+          try {
+            appender.closeSync();
+          } catch {
+            // Appender may be unusable after an aborted transaction.
+          }
+        } else {
+          appender.flushSync();
+          appender.closeSync();
+        }
       }
     }
     this.entityAppender = null;

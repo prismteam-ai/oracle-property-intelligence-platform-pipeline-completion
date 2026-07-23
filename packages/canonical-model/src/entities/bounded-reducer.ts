@@ -315,7 +315,11 @@ export async function reduceBoundedCanonicalPartition(
     return summary;
   } catch (error) {
     releaseEntityGroup();
-    await input.transaction.abort(error);
+    try {
+      await input.transaction.abort(error);
+    } catch {
+      // A failing abort must never replace the error that caused it.
+    }
     throw error;
   }
 }

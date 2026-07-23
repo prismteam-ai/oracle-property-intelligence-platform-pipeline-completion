@@ -1501,11 +1501,19 @@ export class OvertureStarbucksAdapter implements StreamingSourceAdapter<
       sequence: record.ordinal * 100 + fields.length + 1,
       emittedAt: record.updateTime,
       visibility: record.visibility,
+      // Artifact-scoped, deliberately NOT entity-bound: every place row in this
+      // snapshot shares the single pinned fragment artifact, and the canonical
+      // artifact table asserts one row per (generation, artifact). Emitting a
+      // per-entity binding here produced 264 conflicting reference records for
+      // one artifact and aborted reduce_canonical on its primary key. Identical
+      // per-record re-assertions collapse idempotently at the reduce
+      // transaction; per-entity provenance is already carried by each field
+      // observation's lineage.
       artifact: {
         artifactId: record.artifactId,
         role: 'raw',
-        entityId,
-        description: `Pinned Overture Places ${record.release} source fragment for GERS ${record.gersId}`,
+        entityId: null,
+        description: `Pinned Overture Places ${record.release} places source fragment`,
       },
     });
   }
