@@ -38,7 +38,7 @@ const navigation = [
   { to: '/inquiries/transit-walkability', label: 'Transit walkability', icon: GitCompareArrows },
   { to: '/inquiries/starbucks-walkability', label: 'Starbucks walkability', icon: Map },
   { to: '/rankings', label: 'Combined ranking', icon: Boxes },
-  { to: '/agent', label: 'Agent trace', icon: Bot },
+  { to: '/agent', label: 'Ask the AI agent', icon: Bot },
   { to: '/query-console', label: 'Query console', icon: TerminalSquare },
   { to: '/artifacts', label: 'Artifacts', icon: Archive },
   { to: '/dictionary', label: 'Data dictionary', icon: BookOpen },

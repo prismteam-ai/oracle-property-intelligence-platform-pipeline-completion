@@ -1171,12 +1171,15 @@ function normalizeRows(
 
 function normalizeRow(row: AnalyticalRow): Record<string, unknown> {
   return Object.fromEntries(
-    Object.entries(row).map(([key, value]) => [
-      key,
-      key.endsWith('_json') && typeof value === 'string'
-        ? parseReleasedJson(value, key)
-        : jsonSafe(value),
-    ]),
+    Object.entries(row).map(([key, value]) => {
+      if (key.endsWith('_json') && typeof value === 'string') {
+        const parsed = parseReleasedJson(value, key);
+        // Strip build-machine paths / raw engine diagnostics from the per-row
+        // limitations that are emitted verbatim inside data.* payloads.
+        return [key, key === 'limitations_json' ? sanitizeLimitationList(parsed) : parsed];
+      }
+      return [key, jsonSafe(value)];
+    }),
   );
 }
 
@@ -1206,6 +1209,34 @@ function safeNumber(value: unknown, label: string): number {
   return number;
 }
 
+// A failed source's raw engine error (with its build-machine temp path) was
+// captured verbatim as a `limitation`; those strings must never reach a public
+// caller. Collapse any limitation that carries an absolute filesystem path or a
+// raw query-engine diagnostic to a single honest, path-free note. Clean
+// limitations (capability notes, source provenance, HTTP-status notes) pass
+// through unchanged. Applied at every point limitations are projected — the
+// per-row `limitations_json` in `data.*` (via normalizeRow) and the top-level
+// `limitations` union (here) — because those are independent serving paths.
+const SANITIZED_LIMITATION_NOTE =
+  'A data source could not be fully processed during this run; the affected criterion is reported as unknown or unavailable.';
+// A Windows drive path (E:\ , C:/) at a boundary — NOT the "s:/" inside a URL
+// scheme like https:// — or a common absolute POSIX temp/system directory.
+const LOCAL_FILESYSTEM_PATH =
+  /(?:^|[\s"'([<])[A-Za-z]:[\\/]|(?:^|[\s"'([<])\/(?:tmp|var|home|root|users|private|asset-input|asset-output|mnt|opt)\//iu;
+const RAW_ENGINE_DIAGNOSTIC =
+  /\b(?:Invalid Input Error|Binder Error|Parser Error|Catalog Error|Conversion Error|Serialization Error|IO Error|Out of Memory Error)\b|read_csv_auto|\bLINE\s+\d+:|sniffing file|CSV parsing dialect|strict_mode/iu;
+
+export function sanitizeLimitationText(value: string): string {
+  return LOCAL_FILESYSTEM_PATH.test(value) || RAW_ENGINE_DIAGNOSTIC.test(value)
+    ? SANITIZED_LIMITATION_NOTE
+    : value;
+}
+
+function sanitizeLimitationList(value: unknown): unknown {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === 'string')) return value;
+  return Object.freeze([...new Set(value.map((item) => sanitizeLimitationText(item)))]);
+}
+
 function mergeLimitations(
   defaults: readonly string[],
   ...rows: readonly Readonly<Record<string, unknown>>[]
@@ -1214,7 +1245,9 @@ function mergeLimitations(
     const value = row.limitations_json;
     return Array.isArray(value) && value.every((item) => typeof item === 'string') ? value : [];
   });
-  return Object.freeze([...new Set([...defaults, ...limitations])]);
+  return Object.freeze([
+    ...new Set([...defaults, ...limitations].map((item) => sanitizeLimitationText(item))),
+  ]);
 }
 
 function requiredSingleRow(rows: readonly AnalyticalRow[], label: string): AnalyticalRow {

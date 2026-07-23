@@ -199,15 +199,25 @@ function ReleaseGate({
   );
 }
 
-function metricsFrom(value: unknown): readonly DataRow[] {
+// The Overview "Verified county metrics" panel must read the scalar totals the
+// API returns in envelope.data (dataset.getInfo), NOT envelope.coverage — that
+// field is the per-criterion capability map whose values are objects, so a
+// primitive filter over it is always empty and the panel never rendered for any
+// release. Whitelist the scalar county totals with human labels.
+function countyMetricsFrom(value: unknown): readonly DataRow[] {
   if (!isRecord(value)) return [];
-  return Object.entries(value)
-    .filter(([, metric]) => ['string', 'number', 'boolean'].includes(typeof metric))
-    .map(([name, metric]) => ({ name, metric }));
+  const fields: readonly (readonly [string, string])[] = [
+    ['propertyCount', 'Properties'],
+    ['sourceCount', 'Sources'],
+    ['pipelineRunCount', 'Pipeline runs'],
+    ['artifactCount', 'Public relations'],
+  ];
+  return fields
+    .filter(([key]) => typeof value[key] === 'number')
+    .map(([key, label]) => ({ name: label, metric: value[key] as number }));
 }
 
 export function OverviewPage() {
-  const coverage = useReleaseQuery('dataset.getCoverage', {});
   return (
     <>
       <PageHeader
@@ -254,25 +264,28 @@ export function OverviewPage() {
               </div>
               <aside className="overview-aside">
                 <p className="eyebrow">Verified county metrics</p>
-                <StatePanel state={coverage} onRetry={coverage.retry}>
-                  {(data) => {
-                    const metrics = metricsFrom(data.coverage);
-                    return metrics.length === 0 ? (
-                      <div className="inline-empty">
-                        No scalar coverage metrics were returned. No totals have been invented.
-                      </div>
-                    ) : (
-                      <dl className="metric-list">
-                        {metrics.map((row) => (
-                          <div key={String(row.name)}>
-                            <dt>{displayValue(row.name)}</dt>
-                            <dd>{displayValue(row.metric)}</dd>
-                          </div>
-                        ))}
-                      </dl>
-                    );
-                  }}
-                </StatePanel>
+                {(() => {
+                  // The release identity envelope (dataset.getInfo, fetched with
+                  // an empty body by the app context) already carries the scalar
+                  // county totals in its data field; read them directly instead of
+                  // issuing a second release-scoped query (dataset.getInfo rejects
+                  // a releaseId argument).
+                  const metrics = countyMetricsFrom(release.data);
+                  return metrics.length === 0 ? (
+                    <div className="inline-empty">
+                      No scalar coverage metrics were returned. No totals have been invented.
+                    </div>
+                  ) : (
+                    <dl className="metric-list">
+                      {metrics.map((row) => (
+                        <div key={String(row.name)}>
+                          <dt>{displayValue(row.name)}</dt>
+                          <dd>{displayValue(row.metric)}</dd>
+                        </div>
+                      ))}
+                    </dl>
+                  );
+                })()}
                 <div className="architecture-note">
                   <ShieldCheck aria-hidden="true" />
                   <div>
