@@ -126,6 +126,16 @@ claim: county completion remains false, and the pilot label is unchanged.
   release ID `santa-clara-70ec78efee5b6c6b664fe8a3`, terminal status `partial`; 18,882 records
   accepted and 0 quarantined; per-capability terminal states across 15 capabilities are 2 succeeded,
   5 partial, 5 blocked, 2 failed, and 1 not_configured.
+  That release was superseded the same week by a run carrying the Overture `theme` fix, the
+  Caltrain GTFS line-ending normalization, the evidence valid-time axis, and the artifact
+  re-assertion idempotency (all below): run ID
+  `sc:run:327bb527f12e3916cb9e9333c358c2202d694647a3977f7721a2369606d5dad4`, generation ID
+  `sc:generation:a337fba4fce92a42f03c4f5726e4ec2b50cdbaaf067035039a8bff2c53b9683f`, release ID
+  `santa-clara-fcb0238187938111e15bb86e` (requested `2026-07-23T14:07:22.000Z`, output
+  `E:/ora-demo/i`), terminal status `partial` with **zero failed sources**; 19,147 records accepted
+  and 6 quarantined; capability tally 3 succeeded, 6 partial, 5 blocked, 1 not_configured; the
+  water-view proxy evidence (3,233 rows) serves end to end and the hosted E2E suite is fully green
+  (61 passed), including the citation-positive bounded agent answer.
 
 ## Unreleased
 

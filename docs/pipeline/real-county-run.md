@@ -163,19 +163,19 @@ node apps/pipeline/dist/cli.js pilot \
 
 This is a bounded pilot, not an uncapped `full` run, and it cannot produce a county-completion claim regardless of outcome.
 
-The reference run was executed on Windows with a short `--output E:/ora-demo/f` root: the DuckDB
+The reference run was executed on Windows with a short `--output E:/ora-demo/i` root: the DuckDB
 native addon ignores the Windows long-path opt-in, so the documented `.cache/oracle-demo-bounded`
 path exceeds MAX_PATH. Every value below is copied from the emitted terminal manifest and release
 evidence:
 
-- run ID: `sc:run:74239e2f3c9beb70c4721c618f31d0d7db9cf472cc5e376d4f5f13fcf0ee98c2`
-- generation ID: `sc:generation:2c8fb9aff0c40c016817f4eddf66236c7773f000ce9f0117f8f4ddd9bd55a2d8`
-- release ID: `santa-clara-70ec78efee5b6c6b664fe8a3`
-- terminal run status: `partial` (a bounded pilot cannot reach `succeeded` while required capabilities remain blocked or failed)
-- accepted / quarantined record counts: 18,882 accepted, 0 quarantined (the expected-record denominator is `null` — the publisher exposes no independent row-count endpoint)
-- per-capability terminal states (15 capabilities): 2 succeeded (`vta_gtfs`, `noaa_shoreline`); 5 partial (`santa_clara_parcels`, `san_jose_permits`, `palo_alto_year_built`, `usgs_hydrography`, `usgs_elevation`); 5 blocked (`ca_sos_businesses`, `cslb_contractors`, `osm_pedestrian_graph`, `ownership_transfers`, `santa_clara_fbn`); 2 failed (`caltrain_gtfs`, `overture_starbucks`); 1 not_configured (`transit_511_fallback`)
-- accepted mart SHA-256: `f05a26cb6a47e7abee942dceca92702129fe861b56302fecb791525fb591cd1c` (public `property_query`, 5,000 rows)
-- requested / completed instants: requested `2026-07-19T12:00:00.000Z`; completed `2026-07-23T05:22:48.425Z`
+- run ID: `sc:run:327bb527f12e3916cb9e9333c358c2202d694647a3977f7721a2369606d5dad4`
+- generation ID: `sc:generation:a337fba4fce92a42f03c4f5726e4ec2b50cdbaaf067035039a8bff2c53b9683f`
+- release ID: `santa-clara-fcb0238187938111e15bb86e`
+- terminal run status: `partial` (a bounded pilot cannot reach `succeeded` while required capabilities remain blocked); **zero failed sources** (3 complete, 7 partial, 4 blocked)
+- accepted / quarantined record counts: 19,147 accepted, 6 quarantined of 19,153 observed (the expected-record denominator is `null` — the publisher exposes no independent row-count endpoint)
+- per-capability terminal states (15 capabilities): 3 succeeded (`vta_gtfs`, `caltrain_gtfs`, `noaa_shoreline`); 6 partial (`santa_clara_parcels`, `san_jose_permits`, `palo_alto_year_built`, `usgs_hydrography`, `usgs_elevation`, `overture_starbucks`); 5 blocked (`ca_sos_businesses`, `cslb_contractors`, `osm_pedestrian_graph`, `ownership_transfers`, `santa_clara_fbn`); 1 not_configured (`transit_511_fallback`)
+- accepted mart SHA-256: `c21c770b3c3c1192534bd19569e1f8f9bd0c43f5279ae27c231cde0edaa5df42` (public `property_query`, 5,000 rows)
+- requested / completed instants: requested `2026-07-23T14:07:22.000Z`; completed `2026-07-23T18:14:56.403Z`
 
 ## Streaming recovery contract (implementation v2)
 

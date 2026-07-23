@@ -246,14 +246,14 @@ The bounded `pilot` run reached a terminal `partial` status and produced a verif
 `partial_county` release bundle. Every value below is copied from `release-manifest.json` and
 `release-evidence.json`:
 
-- release ID: `santa-clara-70ec78efee5b6c6b664fe8a3`
-- run ID: `sc:run:74239e2f3c9beb70c4721c618f31d0d7db9cf472cc5e376d4f5f13fcf0ee98c2`
-- generation ID: `sc:generation:2c8fb9aff0c40c016817f4eddf66236c7773f000ce9f0117f8f4ddd9bd55a2d8`
-- manifest self-hash: `88b1f3a20f2aa5a368b945045c5eab668a73c4f88b0d4be448b67d8bcb33f34a`
-- evidence self-hash: `d04355b0501fefc409cb44401b74a16c3338b429595ad22f0ff241af3d4240f4`
-- accepted / quarantined record counts: 18,882 accepted, 0 quarantined
-- capability state tally and permit-authority fraction: 2 succeeded / 5 partial / 5 blocked / 2 failed / 1 not_configured (15 capabilities); permit-authority coverage 0 of 16 (San Jose permits are partial and jurisdiction-scoped to the City of San Jose, so no property in the pilot slice has an established permit authority)
-- public / restricted artifact and row counts: 7 public relations (property_query 5,000; property_evidence 30,000; data_dictionary 85; field_coverage 27; relation_coverage 9; source_coverage 4; pipeline_runs 1) and 7 restricted relations (property_query 8,940; property_evidence 53,640; data_dictionary 85; field_coverage 27; relation_coverage 9; source_coverage 12; pipeline_runs 1). All release gates passed (license, manifest, parquet, clean-reopen, public/restricted segregation); owner-bearing public values 0; public/restricted value overlap 0.
+- release ID: `santa-clara-fcb0238187938111e15bb86e`
+- run ID: `sc:run:327bb527f12e3916cb9e9333c358c2202d694647a3977f7721a2369606d5dad4`
+- generation ID: `sc:generation:a337fba4fce92a42f03c4f5726e4ec2b50cdbaaf067035039a8bff2c53b9683f`
+- manifest self-hash: `569a8634c2f74c8e45e2ff1187a93470792ae9d6bb32697555a0f42afe3cad5f`
+- evidence self-hash: `5cd01733b213777b886f71a1a4dff331faaa3bd2cefb8d8ce77f08b3e5718ff5`
+- accepted / quarantined record counts: 19,147 accepted, 6 quarantined
+- capability state tally and permit-authority fraction: 3 succeeded / 6 partial / 5 blocked / 1 not_configured (15 capabilities, zero failed); permit-authority coverage 0 of 16 (San Jose permits are partial and jurisdiction-scoped to the City of San Jose, so no property in the pilot slice has an established permit authority)
+- public / restricted artifact and row counts: 7 public relations (property_query 5,000; property_evidence 30,000; data_dictionary 85; field_coverage 27; relation_coverage 9; source_coverage 6; pipeline_runs 1) and 7 restricted relations (property_query 8,940; property_evidence 53,640; data_dictionary 85; field_coverage 27; relation_coverage 9; source_coverage 14; pipeline_runs 1). All release gates passed (license, manifest, parquet, clean-reopen, public/restricted segregation); owner-bearing public values 0; public/restricted value overlap 0.
 
 Nothing here is published. Public IPFS publication, Filebase upload, IPNS mutation, and deployment
 remain separate human-gated actions outside this code, and no CID recorded in this document has
