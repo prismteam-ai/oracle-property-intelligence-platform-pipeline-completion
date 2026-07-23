@@ -1,0 +1,16 @@
+.git
+.assessment
+.config
+cdk.out
+coverage
+dist
+node_modules
+.turbo
+**/.turbo
+**/node_modules
+**/dist
+*.tsbuildinfo
+**/*.tsbuildinfo
+*.env
+.env.*
+!.env.example

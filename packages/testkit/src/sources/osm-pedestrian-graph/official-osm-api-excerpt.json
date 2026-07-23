@@ -1,0 +1,173 @@
+{
+  "attribution": "http://www.openstreetmap.org/copyright",
+  "copyright": "OpenStreetMap and contributors",
+  "elements": [
+    {
+      "id": 1465199670,
+      "lat": 37.3946764,
+      "lon": -122.0767143,
+      "tags": { "barrier": "lift_gate", "foot": "yes" },
+      "timestamp": "2019-07-24T17:22:59Z",
+      "type": "node",
+      "version": 3
+    },
+    {
+      "id": 1465199672,
+      "lat": 37.3946991,
+      "lon": -122.0767001,
+      "tags": { "crossing:barrier": "full", "railway": "crossing" },
+      "timestamp": "2022-08-24T02:57:58Z",
+      "type": "node",
+      "version": 6
+    },
+    {
+      "id": 1465199684,
+      "lat": 37.3947271,
+      "lon": -122.0774701,
+      "timestamp": "2012-03-03T05:33:50Z",
+      "type": "node",
+      "version": 2
+    },
+    {
+      "id": 1465199685,
+      "lat": 37.3947437,
+      "lon": -122.076672,
+      "tags": { "crossing:barrier": "full", "railway": "crossing" },
+      "timestamp": "2022-08-24T02:57:44Z",
+      "type": "node",
+      "version": 4
+    },
+    {
+      "id": 1465199700,
+      "lat": 37.3947907,
+      "lon": -122.0766425,
+      "timestamp": "2019-07-24T17:22:59Z",
+      "type": "node",
+      "version": 2
+    },
+    {
+      "id": 1465199704,
+      "lat": 37.3948196,
+      "lon": -122.0767152,
+      "timestamp": "2019-07-24T17:22:59Z",
+      "type": "node",
+      "version": 2
+    },
+    {
+      "id": 1465199716,
+      "lat": 37.3948612,
+      "lon": -122.076689,
+      "tags": { "crossing:barrier": "gate", "railway": "crossing" },
+      "timestamp": "2022-08-24T02:58:41Z",
+      "type": "node",
+      "version": 6
+    },
+    {
+      "id": 1657109839,
+      "lat": 37.3948773,
+      "lon": -122.0766789,
+      "tags": { "barrier": "gate", "foot": "yes", "locked": "no" },
+      "timestamp": "2026-07-14T08:13:49Z",
+      "type": "node",
+      "version": 4
+    },
+    {
+      "id": 1657111082,
+      "lat": 37.3946654,
+      "lon": -122.0774008,
+      "tags": {
+        "crossing": "uncontrolled",
+        "crossing:island": "no",
+        "crossing:markings": "lines",
+        "highway": "crossing"
+      },
+      "timestamp": "2026-07-11T17:42:33Z",
+      "type": "node",
+      "version": 3
+    },
+    {
+      "id": 5022790651,
+      "lat": 37.3948347,
+      "lon": -122.0767057,
+      "tags": { "barrier": "gate", "foot": "yes", "locked": "no" },
+      "timestamp": "2026-07-14T08:13:49Z",
+      "type": "node",
+      "version": 3
+    },
+    {
+      "id": 5022790652,
+      "lat": 37.3947724,
+      "lon": -122.076654,
+      "tags": { "barrier": "lift_gate", "foot": "yes" },
+      "timestamp": "2019-07-24T17:23:00Z",
+      "type": "node",
+      "version": 2
+    },
+    {
+      "id": 6644366981,
+      "lat": 37.3946314,
+      "lon": -122.0773628,
+      "timestamp": "2019-07-24T17:22:57Z",
+      "type": "node",
+      "version": 1
+    },
+    {
+      "id": 6644407529,
+      "lat": 37.3949451,
+      "lon": -122.0767711,
+      "timestamp": "2019-07-24T17:22:57Z",
+      "type": "node",
+      "version": 1
+    },
+    {
+      "id": 6644407530,
+      "lat": 37.3949024,
+      "lon": -122.0766632,
+      "timestamp": "2019-07-24T17:22:57Z",
+      "type": "node",
+      "version": 1
+    },
+    {
+      "id": 6697261122,
+      "lat": 37.3946607,
+      "lon": -122.0767242,
+      "timestamp": "2026-07-13T08:19:13Z",
+      "type": "node",
+      "version": 2
+    },
+    {
+      "id": 133164448,
+      "nodes": [6697261122, 1465199670, 1465199672, 1465199685, 5022790652, 1465199700],
+      "tags": { "highway": "footway", "lit": "yes", "surface": "concrete" },
+      "timestamp": "2022-08-24T02:58:15Z",
+      "type": "way",
+      "version": 5
+    },
+    {
+      "id": 152943929,
+      "nodes": [1465199700, 1465199704, 5022790651, 1465199716, 1657109839, 6644407530, 6644407529],
+      "tags": { "highway": "footway", "surface": "concrete" },
+      "timestamp": "2026-07-07T06:04:15Z",
+      "type": "way",
+      "version": 5
+    },
+    {
+      "id": 152945039,
+      "nodes": [1465199684, 1657111082, 6644366981],
+      "tags": {
+        "crossing": "uncontrolled",
+        "crossing:island": "no",
+        "crossing:markings": "lines",
+        "footway": "crossing",
+        "highway": "footway",
+        "surface": "asphalt",
+        "tactile_paving": "no"
+      },
+      "timestamp": "2026-07-13T08:19:13Z",
+      "type": "way",
+      "version": 4
+    }
+  ],
+  "license": "http://opendatacommons.org/licenses/odbl/1-0/",
+  "version": "0.6"
+}

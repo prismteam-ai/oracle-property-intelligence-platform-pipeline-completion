@@ -1,0 +1,46 @@
+{
+  "capabilities": {
+    "ownership_age": {
+      "state": "blocked",
+      "supportClasses": ["unsupported"],
+      "numerator": 0,
+      "denominator": 19,
+      "limitations": ["No redistributable ownership-transfer evidence."]
+    },
+    "regional_owner": {
+      "state": "partial",
+      "supportClasses": ["proxy", "unknown"],
+      "numerator": 4,
+      "denominator": 19,
+      "limitations": ["Owner region derived from mailing address only."]
+    },
+    "roof_age": {
+      "state": "supported",
+      "supportClasses": ["supported"],
+      "numerator": 19,
+      "denominator": 19,
+      "limitations": []
+    },
+    "starbucks_walkability": {
+      "state": "partial",
+      "supportClasses": ["proxy"],
+      "numerator": 7,
+      "denominator": 19,
+      "limitations": ["Straight-line distance proxy, not network walk time."]
+    },
+    "transit_walkability": {
+      "state": "supported",
+      "supportClasses": ["supported"],
+      "numerator": 19,
+      "denominator": 19,
+      "limitations": []
+    },
+    "water_view_candidate": {
+      "state": "partial",
+      "supportClasses": ["proxy", "unknown"],
+      "numerator": 3,
+      "denominator": 19,
+      "limitations": ["Candidate flag only; no visual confirmation."]
+    }
+  }
+}

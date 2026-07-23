@@ -1,0 +1,31 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "id": 71993,
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [
+          [-121.78138163850775, 37.165783014304225],
+          [-121.78082717136495, 37.16581254778653],
+          [-121.78039303804603, 37.165936614629921]
+        ]
+      },
+      "properties": {
+        "OBJECTID": 71993,
+        "id3dhp": "11JSF",
+        "featuredate": 1694649600000,
+        "gnisid": null,
+        "gnisidlabel": null,
+        "featuretypelabel": "Waterbody Connector",
+        "lengthkm": 0.090000000000000011,
+        "flowdirectionlabel": "Flow direction is in digitized direction, and z-values on vertices flow downslope",
+        "onsurfacelabel": "Feature is on the land surface",
+        "workunitid": "NHD"
+      }
+    }
+  ],
+  "exceededTransferLimit": true,
+  "properties": { "exceededTransferLimit": true }
+}

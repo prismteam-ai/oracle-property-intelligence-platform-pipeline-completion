@@ -1,0 +1,34 @@
+{
+  "name": "@oracle/agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./dist/index.js"
+    },
+    "./*": {
+      "types": "./src/*.ts",
+      "default": "./dist/*.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint src",
+    "test": "vitest run src",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@oracle/contracts": "workspace:*",
+    "@oracle/model-gateway": "workspace:*",
+    "@oracle/query-core": "workspace:*",
+    "ai": "6.0.230",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@oracle/tsconfig": "workspace:*",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

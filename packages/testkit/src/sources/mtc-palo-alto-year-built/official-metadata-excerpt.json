@@ -1,0 +1,36 @@
+{
+  "id": "c252-zdg8",
+  "name": "Assessor's Parcel",
+  "provenance": "official",
+  "publicationStage": "published",
+  "rowsUpdatedAt": 1783342000,
+  "columns": [
+    { "name": "the_geom", "dataTypeName": "multipolygon", "fieldName": "the_geom" },
+    { "name": "FID", "dataTypeName": "number", "fieldName": "objectid" },
+    { "name": "GID", "dataTypeName": "number", "fieldName": "gid" },
+    { "name": "APN", "dataTypeName": "text", "fieldName": "apn" },
+    { "name": "Year Built SCCA", "dataTypeName": "number", "fieldName": "yearbuilt" },
+    {
+      "name": "Effective Year Built SCCA",
+      "dataTypeName": "number",
+      "fieldName": "effectiveyearbuilt"
+    },
+    { "name": "Zoning District", "dataTypeName": "text", "fieldName": "zonegis" },
+    { "name": "FLOODZONE", "dataTypeName": "text", "fieldName": "floodzone" },
+    {
+      "name": "Near Creek Feature",
+      "dataTypeName": "text",
+      "fieldName": "nearcreekfeature"
+    },
+    { "name": "Label X", "dataTypeName": "number", "fieldName": "x" },
+    { "name": "Label Y", "dataTypeName": "number", "fieldName": "y" },
+    { "name": "Address", "dataTypeName": "text", "fieldName": "addressdescription" },
+    { "name": "Modified Date", "dataTypeName": "date", "fieldName": "modifieddate" }
+  ],
+  "metadata": {
+    "arcgis_connection": {
+      "url": "https://services6.arcgis.com/evmyRZRrsopdeog7/ArcGIS/rest/services/AssessorsParcels/FeatureServer/0"
+    }
+  },
+  "rights": ["read"]
+}

@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "taskId": "ORA-008",
+  "state": "implemented",
+  "branch": "assessment/oracle-santa-clara",
+  "baseHead": "877fb036491af8c8a8ac71e31de9ae0f40b921a6",
+  "nativeChild": "/root/metagross",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol",
+  "reasoning": "ultra",
+  "files": [
+    "config/team-kit-applicability/registry.json",
+    "config/team-kit-applicability/schema.json",
+    "config/team-kit-applicability/self-test.mjs",
+    "config/team-kit-applicability/validate.mjs",
+    "docs/operations/integration-exceptions/README.md"
+  ],
+  "verification": {
+    "nodeBinary": "E:\\nvm\\v22.18.0\\node.exe",
+    "moduleSyntaxChecks": "pass",
+    "registryValidation": {
+      "status": "pass",
+      "entryCount": 10,
+      "requiredIntegrationCount": 8,
+      "liveClaimCount": 0
+    },
+    "registrySelfTest": {
+      "status": "pass",
+      "assertions": 10
+    }
+  },
+  "dispositionCounts": {
+    "adopted": 1,
+    "adapted": 2,
+    "not_applicable": 2,
+    "exception_pending": 5
+  },
+  "review": {
+    "reviewer": "/root/metagross",
+    "model": "gpt-5.6-sol",
+    "reasoning": "ultra",
+    "status": "pass",
+    "checks": [
+      "every entry has exactly one allowed disposition",
+      "operational status is independent from applicability state",
+      "pending and not-applicable entries cannot claim live operation",
+      "all eight required integration decisions have owners, triggers, data-handling impacts, and release consequences",
+      "Oracle dispositions match the approved Team Kit operating model"
+    ],
+    "openMaterialFindings": []
+  },
+  "pendingEntries": [
+    "aws-oidc",
+    "langsmith",
+    "lexicon",
+    "main-dashboard",
+    "pagerduty"
+  ],
+  "releaseDisposition": "pending entries remain blocking to their exact registry consequences; no unavailable integration is claimed live or conformant",
+  "safety": {
+    "liveIntegrationClaims": 0,
+    "networkAccess": false,
+    "providerMutation": false,
+    "awsMutation": false,
+    "externalEffectsPerformed": false,
+    "commitPerformed": false
+  }
+}

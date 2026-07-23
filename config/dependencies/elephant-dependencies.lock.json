@@ -1,0 +1,291 @@
+{
+  "schemaVersion": 1,
+  "lockId": "oracle-elephant-upstreams",
+  "verification": {
+    "observedAt": "2026-07-17",
+    "method": "git_ls_remote_symref_head",
+    "evidenceId": "oracle-upstream-pin-live-verification-2026-07-17",
+    "networkAccessInThisWave": false
+  },
+  "boundary": {
+    "activeState": "exact_upstream_pin_plus_assessment_owned_adapter",
+    "currentWaveState": "identity_only_no_materialization",
+    "assessmentAdapterOwner": "oracle-assessment",
+    "upstreamSourceCopied": false,
+    "upstreamSourceInstalled": false,
+    "upstreamSourceExecuted": false,
+    "futureModificationForms": [
+      {
+        "kind": "hash_bound_vendored_patch_apply_manifest",
+        "requirements": [
+          "canonicalHttpsUrl",
+          "exactUpstreamBaseSha",
+          "patchSha256",
+          "deterministicApplyCommand",
+          "resultTreeHash",
+          "approvalEvidence"
+        ]
+      },
+      {
+        "kind": "approved_reachable_fork_sha",
+        "requirements": [
+          "canonicalHttpsUrl",
+          "fullCommitSha",
+          "exactUpstreamBaseSha",
+          "baseRelationshipEvidence",
+          "approvalEvidence"
+        ]
+      }
+    ],
+    "prohibitedForms": [
+      "moving_branch_ref",
+      "moving_tag_ref",
+      "workstation_path",
+      "unhashed_patch",
+      "unapproved_source_copy",
+      "unreachable_fork_commit"
+    ]
+  },
+  "sources": [
+    {
+      "repository": "elephant-xyz/skills",
+      "canonicalUrl": "https://github.com/elephant-xyz/skills.git",
+      "observedDefaultBranch": "main",
+      "commitSha": "8ce93b3a162e7cdf16e1be89953fb488f8c025b4",
+      "pinnedRef": "8ce93b3a162e7cdf16e1be89953fb488f8c025b4",
+      "intendedUse": "Reference the established county-stage skill contracts and orchestration sequence when building assessment-owned Santa Clara adapters.",
+      "consumptionMode": "exact_pin_reference_for_assessment_owned_adapter",
+      "dependencyState": "identity_locked",
+      "materializationState": "not_copied_installed_or_executed",
+      "ownershipBoundary": {
+        "state": "explicit_split",
+        "upstreamOwner": "elephant-xyz",
+        "assessmentIntegrationOwner": "oracle-assessment",
+        "modificationBoundary": "assessment_owned_adapter",
+        "upstreamRuntimeResourcesAssumed": false
+      },
+      "license": {
+        "state": "not_verified_in_this_wave",
+        "identifier": null,
+        "evidence": "Repository identity was verified; license text was not evaluated by ORA-003."
+      },
+      "redistribution": {
+        "state": "not_approved",
+        "claim": "none",
+        "approvalAuthority": null,
+        "approvalEvidence": null
+      },
+      "securityExposure": {
+        "state": "not_runtime_exposed",
+        "note": "This pin is contract evidence only in ORA-003 and is not installed or executed."
+      },
+      "verificationCommand": "git ls-remote --symref https://github.com/elephant-xyz/skills.git HEAD",
+      "driftPolicy": {
+        "state": "fail_closed",
+        "defaultBranchHeadChange": "open_review_and_repin",
+        "pinnedCommitUnavailable": "block_consumption",
+        "lockUpdate": "review_new_exact_identity"
+      }
+    },
+    {
+      "repository": "elephant-xyz/oracle-node",
+      "canonicalUrl": "https://github.com/elephant-xyz/oracle-node.git",
+      "observedDefaultBranch": "main",
+      "commitSha": "e79b9ced2b3be52f7292e006cf906b0c4802b722",
+      "pinnedRef": "e79b9ced2b3be52f7292e006cf906b0c4802b722",
+      "intendedUse": "Reference existing Oracle ingestion and orchestration integration points without assuming access to upstream-owned runtime resources.",
+      "consumptionMode": "exact_pin_reference_for_assessment_owned_adapter",
+      "dependencyState": "identity_locked",
+      "materializationState": "not_copied_installed_or_executed",
+      "ownershipBoundary": {
+        "state": "explicit_split",
+        "upstreamOwner": "elephant-xyz",
+        "assessmentIntegrationOwner": "oracle-assessment",
+        "modificationBoundary": "assessment_owned_adapter",
+        "upstreamRuntimeResourcesAssumed": false
+      },
+      "license": {
+        "state": "not_verified_in_this_wave",
+        "identifier": null,
+        "evidence": "Repository identity was verified; license text was not evaluated by ORA-003."
+      },
+      "redistribution": {
+        "state": "not_approved",
+        "claim": "none",
+        "approvalAuthority": null,
+        "approvalEvidence": null
+      },
+      "securityExposure": {
+        "state": "not_runtime_exposed",
+        "note": "This pin is contract evidence only in ORA-003 and is not installed or executed."
+      },
+      "verificationCommand": "git ls-remote --symref https://github.com/elephant-xyz/oracle-node.git HEAD",
+      "driftPolicy": {
+        "state": "fail_closed",
+        "defaultBranchHeadChange": "open_review_and_repin",
+        "pinnedCommitUnavailable": "block_consumption",
+        "lockUpdate": "review_new_exact_identity"
+      }
+    },
+    {
+      "repository": "elephant-xyz/elephant-query-db",
+      "canonicalUrl": "https://github.com/elephant-xyz/elephant-query-db.git",
+      "observedDefaultBranch": "main",
+      "commitSha": "51690ee86a82144c372e7456c57d4b008984ec5f",
+      "pinnedRef": "51690ee86a82144c372e7456c57d4b008984ec5f",
+      "intendedUse": "Reference reconciliation, query-table, and publication contracts while keeping the assessment serving plane portable and candidate-owned.",
+      "consumptionMode": "exact_pin_reference_for_assessment_owned_adapter",
+      "dependencyState": "identity_locked",
+      "materializationState": "not_copied_installed_or_executed",
+      "ownershipBoundary": {
+        "state": "explicit_split",
+        "upstreamOwner": "elephant-xyz",
+        "assessmentIntegrationOwner": "oracle-assessment",
+        "modificationBoundary": "assessment_owned_adapter",
+        "upstreamRuntimeResourcesAssumed": false
+      },
+      "license": {
+        "state": "not_verified_in_this_wave",
+        "identifier": null,
+        "evidence": "Repository identity was verified; license text was not evaluated by ORA-003."
+      },
+      "redistribution": {
+        "state": "not_approved",
+        "claim": "none",
+        "approvalAuthority": null,
+        "approvalEvidence": null
+      },
+      "securityExposure": {
+        "state": "not_runtime_exposed",
+        "note": "This pin is contract evidence only in ORA-003 and is not installed or executed."
+      },
+      "verificationCommand": "git ls-remote --symref https://github.com/elephant-xyz/elephant-query-db.git HEAD",
+      "driftPolicy": {
+        "state": "fail_closed",
+        "defaultBranchHeadChange": "open_review_and_repin",
+        "pinnedCommitUnavailable": "block_consumption",
+        "lockUpdate": "review_new_exact_identity"
+      }
+    },
+    {
+      "repository": "elephant-xyz/Counties-trasform-scripts",
+      "canonicalUrl": "https://github.com/elephant-xyz/Counties-trasform-scripts.git",
+      "observedDefaultBranch": "main",
+      "commitSha": "655b78563d38538e9cf6d2d7dc80ccb65b350952",
+      "pinnedRef": "655b78563d38538e9cf6d2d7dc80ccb65b350952",
+      "intendedUse": "Reference county transform examples and handler conventions for deterministic Santa Clara source mappings.",
+      "consumptionMode": "exact_pin_reference_for_assessment_owned_adapter",
+      "dependencyState": "identity_locked",
+      "materializationState": "not_copied_installed_or_executed",
+      "ownershipBoundary": {
+        "state": "explicit_split",
+        "upstreamOwner": "elephant-xyz",
+        "assessmentIntegrationOwner": "oracle-assessment",
+        "modificationBoundary": "assessment_owned_adapter",
+        "upstreamRuntimeResourcesAssumed": false
+      },
+      "license": {
+        "state": "not_verified_in_this_wave",
+        "identifier": null,
+        "evidence": "Repository identity was verified; license text was not evaluated by ORA-003."
+      },
+      "redistribution": {
+        "state": "not_approved",
+        "claim": "none",
+        "approvalAuthority": null,
+        "approvalEvidence": null
+      },
+      "securityExposure": {
+        "state": "not_runtime_exposed",
+        "note": "This pin is contract evidence only in ORA-003 and is not installed or executed."
+      },
+      "verificationCommand": "git ls-remote --symref https://github.com/elephant-xyz/Counties-trasform-scripts.git HEAD",
+      "driftPolicy": {
+        "state": "fail_closed",
+        "defaultBranchHeadChange": "open_review_and_repin",
+        "pinnedCommitUnavailable": "block_consumption",
+        "lockUpdate": "review_new_exact_identity"
+      }
+    },
+    {
+      "repository": "elephant-xyz/elephant-cli",
+      "canonicalUrl": "https://github.com/elephant-xyz/elephant-cli.git",
+      "observedDefaultBranch": "main",
+      "commitSha": "8dd5f01f78d97bfed24065d69f31801613faca2f",
+      "pinnedRef": "8dd5f01f78d97bfed24065d69f31801613faca2f",
+      "intendedUse": "Reference prepare, transform, and validation command contracts without executing the upstream CLI in this wave.",
+      "consumptionMode": "exact_pin_reference_for_assessment_owned_adapter",
+      "dependencyState": "identity_locked",
+      "materializationState": "not_copied_installed_or_executed",
+      "ownershipBoundary": {
+        "state": "explicit_split",
+        "upstreamOwner": "elephant-xyz",
+        "assessmentIntegrationOwner": "oracle-assessment",
+        "modificationBoundary": "assessment_owned_adapter",
+        "upstreamRuntimeResourcesAssumed": false
+      },
+      "license": {
+        "state": "not_verified_in_this_wave",
+        "identifier": null,
+        "evidence": "Repository identity was verified; license text was not evaluated by ORA-003."
+      },
+      "redistribution": {
+        "state": "not_approved",
+        "claim": "none",
+        "approvalAuthority": null,
+        "approvalEvidence": null
+      },
+      "securityExposure": {
+        "state": "not_runtime_exposed",
+        "note": "This pin is contract evidence only in ORA-003 and is not installed or executed."
+      },
+      "verificationCommand": "git ls-remote --symref https://github.com/elephant-xyz/elephant-cli.git HEAD",
+      "driftPolicy": {
+        "state": "fail_closed",
+        "defaultBranchHeadChange": "open_review_and_repin",
+        "pinnedCommitUnavailable": "block_consumption",
+        "lockUpdate": "review_new_exact_identity"
+      }
+    },
+    {
+      "repository": "elephant-xyz/elephant-mcp",
+      "canonicalUrl": "https://github.com/elephant-xyz/elephant-mcp.git",
+      "observedDefaultBranch": "main",
+      "commitSha": "0aa1ede8406819e341a58d3abcb3593e5cd3ba94",
+      "pinnedRef": "0aa1ede8406819e341a58d3abcb3593e5cd3ba94",
+      "intendedUse": "Preserve the official unmodified MCP identity for isolated compatibility evidence; direct caller-authored SQL remains blocked pending separate certification.",
+      "consumptionMode": "exact_pin_reference_for_assessment_owned_adapter",
+      "dependencyState": "identity_locked",
+      "materializationState": "not_copied_installed_or_executed",
+      "ownershipBoundary": {
+        "state": "explicit_split",
+        "upstreamOwner": "elephant-xyz",
+        "assessmentIntegrationOwner": "oracle-assessment",
+        "modificationBoundary": "assessment_owned_adapter",
+        "upstreamRuntimeResourcesAssumed": false
+      },
+      "license": {
+        "state": "not_verified_in_this_wave",
+        "identifier": null,
+        "evidence": "Repository identity was verified; license text was not evaluated by ORA-003."
+      },
+      "redistribution": {
+        "state": "not_approved",
+        "claim": "none",
+        "approvalAuthority": null,
+        "approvalEvidence": null
+      },
+      "securityExposure": {
+        "state": "compatibility_evidence_only_caller_sql_blocked",
+        "note": "Keep the pin unmodified for ORA-026 evidence. Do not route queryProperties or queryPermits to its direct caller-SQL executor before ORA-069 certification of an approved replacement path."
+      },
+      "verificationCommand": "git ls-remote --symref https://github.com/elephant-xyz/elephant-mcp.git HEAD",
+      "driftPolicy": {
+        "state": "fail_closed",
+        "defaultBranchHeadChange": "open_review_and_repin",
+        "pinnedCommitUnavailable": "block_consumption",
+        "lockUpdate": "review_new_exact_identity"
+      }
+    }
+  ]
+}

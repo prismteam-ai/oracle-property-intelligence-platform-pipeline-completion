@@ -1,0 +1,95 @@
+{
+  "schemaVersion": "1.0.0",
+  "source": {
+    "authority": "California Contractors State License Board",
+    "portalUrl": "https://web.cslb.ca.gov/onlineservices/dataportal/ContractorList",
+    "apiDocumentationUrl": "https://www.cslb.ca.gov/onlineservices/DataPortalAPI/GetbyClassification.asmx?op=GetMasterFile",
+    "snapshotAsOf": "2026-07-17",
+    "boundedPrefixRetrievalStartedAt": "2026-07-17T14:47:56.001Z",
+    "lastVerifiedAt": "2026-07-17T14:48:01.014Z",
+    "route": "Official no-cost License Master CSV selected through the public CSLB Data Portal",
+    "boundedPrefixBytes": 1048576,
+    "boundedPrefixSha256": "85aee63a6f2de0d9be3a37316fb94d90f84f26192e4beb5399e1d5bbfad8da3e",
+    "fullSnapshotDownloadedForFixture": false
+  },
+  "derivation": {
+    "kind": "safe-field projection of real organization records from a bounded official response prefix",
+    "removedFields": [
+      "MailingAddress",
+      "BusinessPhone",
+      "WCInsuranceCompany",
+      "WCPolicyNumber",
+      "CBNumber",
+      "NAME-TP-2"
+    ],
+    "selection": "First two records in the bounded prefix whose official BusinessType was Corporation and whose business name was clearly organizational",
+    "safeProjectionHashFieldsInOrder": [
+      "LicenseNo",
+      "BusinessName",
+      "BusinessType",
+      "City",
+      "State",
+      "County",
+      "ZIPCode",
+      "IssueDate",
+      "ExpirationDate",
+      "PrimaryStatus",
+      "SecondaryStatus",
+      "Classifications(s)",
+      "WorkersCompCoverageType",
+      "CBSuretyCompany",
+      "CBEffectiveDate",
+      "CBAmount"
+    ],
+    "limitations": [
+      "This fixture is not a complete CSLB snapshot and cannot support source-count claims.",
+      "The bounded prefix was not committed; its exact byte length, retrieval window, and SHA-256 bind the official response bytes used for source-shape verification.",
+      "Projected values preserve the official snapshot values but deliberately omit street, phone, policy, bond-number, and personnel-like fields.",
+      "CSLB status can change after the source snapshot date."
+    ]
+  },
+  "records": [
+    {
+      "LicenseNo": "1000012",
+      "LastUpdate": "07/10/2026",
+      "BusinessName": "INSTABUILT CONSTRUCTION INC",
+      "FullBusinessName": "",
+      "City": "PASADENA",
+      "State": "CA",
+      "County": "Los Angeles",
+      "ZIPCode": "91104",
+      "BusinessType": "Corporation",
+      "IssueDate": "01/10/2015",
+      "ExpirationDate": "01/31/2027",
+      "PrimaryStatus": "CLEAR",
+      "SecondaryStatus": "",
+      "Classifications(s)": "B",
+      "WorkersCompCoverageType": "Workers' Compensation Insurance",
+      "CBSuretyCompany": "HUDSON INSURANCE COMPANY",
+      "CBEffectiveDate": "07/25/2023",
+      "CBAmount": "25000",
+      "safeProjectionSha256": "b14c9156e3537d5c001a37798bf83fd7fd65e2ae04569ea988f03bf9861057d6"
+    },
+    {
+      "LicenseNo": "1000013",
+      "LastUpdate": "02/12/2026",
+      "BusinessName": "DESERT ELITE ELECTRIC & CONSTRUCTION INC",
+      "FullBusinessName": "",
+      "City": "PALM DESERT",
+      "State": "CA",
+      "County": "Riverside",
+      "ZIPCode": "92201",
+      "BusinessType": "Corporation",
+      "IssueDate": "01/10/2015",
+      "ExpirationDate": "03/31/2028",
+      "PrimaryStatus": "CLEAR",
+      "SecondaryStatus": "",
+      "Classifications(s)": "A| B| C10| C36",
+      "WorkersCompCoverageType": "Workers' Compensation Insurance",
+      "CBSuretyCompany": "MERCHANTS BONDING COMPANY (MUTUAL)",
+      "CBEffectiveDate": "08/17/2025",
+      "CBAmount": "25000",
+      "safeProjectionSha256": "abe8fbd559e157a9e6d579cdbe842f6edd29c6efa3ceea3caccf5d753984c427"
+    }
+  ]
+}

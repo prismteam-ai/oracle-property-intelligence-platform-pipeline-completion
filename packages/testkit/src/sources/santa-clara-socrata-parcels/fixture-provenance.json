@@ -1,0 +1,42 @@
+{
+  "schemaVersion": "1.0.0",
+  "authority": {
+    "organization": "County of Santa Clara",
+    "datasetName": "Parcels",
+    "datasetId": "ubcd-cewv",
+    "provenance": "official",
+    "catalogUrl": "https://data.sccgov.org/Government/Parcels/ubcd-cewv/about_data",
+    "backingArcGisUrl": "https://maps.santaclaracounty.gov/server/rest/services/property/SCCProperty/MapServer/0"
+  },
+  "request": {
+    "method": "GET",
+    "exactUrl": "https://data.sccgov.org/resource/ubcd-cewv.geojson?%24where=apn%3D%2712769001%27&%24order=objectid&%24limit=2",
+    "query": "$where=apn='12769001'&$order=objectid&$limit=2",
+    "anonymous": true
+  },
+  "retrievedAt": "2026-07-17T12:59:10.000Z",
+  "sourceAsOf": {
+    "basis": "HTTP Last-Modified and X-SODA2-Truth-Last-Modified",
+    "at": "2026-03-23T07:08:59.000Z"
+  },
+  "originalArtifact": {
+    "sha256": "83a182ad224c9ac67b034cec242f22aca8d4ff73f9d3d103f34a102c910444b8",
+    "byteSize": 2536,
+    "mediaType": "application/vnd.geo+json; charset=UTF-8",
+    "etag": "\"aW5kaWEuMTg5ODcxXzFfMjZOVzVjXzV0VEZJNUo0WWJHeF9JZ1EzbTg0RlU---gzipDmtWJdm5kRpFJd6i-2xm53q9h4Q--gzip--gzip\""
+  },
+  "committedFixture": {
+    "path": "duplicate-apn.geojson",
+    "sha256": "5a6579c59fbe93034334ed8f4ff16b75851369b31b2bada7fcdebd7b3b2de433",
+    "byteSize": 3699
+  },
+  "extractionMethod": "The complete two-feature official response was parsed and deterministically pretty-printed; no JSON value, object-key order, array order, feature, or coordinate was changed.",
+  "sourceSemantics": {
+    "rawRowKey": "objectid",
+    "apnRole": "APN normalization and property reconciliation input; not a unique raw-row key",
+    "geometryRole": "Cadastral parcel boundary in CRS84; not a rooftop, building entrance, or address point",
+    "duplicateEvidence": "Both official features have APN 12769001 but distinct objectid values and geometries",
+    "subset": "Both rows are Palo Alto examples; Palo Alto remains a subset of the county denominator",
+    "redistribution": "The official metadata exposes public read access but declares no explicit redistribution license; later publication eligibility remains a separate decision"
+  }
+}

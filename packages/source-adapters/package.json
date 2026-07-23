@@ -1,0 +1,43 @@
+{
+  "name": "@oracle/source-adapters",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./registry": {
+      "types": "./dist/registry.d.ts",
+      "default": "./dist/registry.js"
+    },
+    "./spi": {
+      "types": "./dist/spi/index.d.ts",
+      "default": "./dist/spi/index.js"
+    },
+    "./spi/*": {
+      "types": "./dist/spi/*.d.ts",
+      "default": "./dist/spi/*.js"
+    },
+    "./providers/*": {
+      "types": "./dist/providers/*.d.ts",
+      "default": "./dist/providers/*.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint src",
+    "test": "vitest run src",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@oracle/artifacts": "workspace:*",
+    "@oracle/contracts": "workspace:*",
+    "@oracle/data-runtime": "workspace:*",
+    "csv-parse": "7.0.1",
+    "fflate": "0.8.3",
+    "geotiff": "3.0.5"
+  },
+  "devDependencies": {
+    "@oracle/tsconfig": "workspace:*",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "releaseId": "santa-clara-pilot-2026-07-17",
+  "runId": "sc:run:serving-pilot-20260717",
+  "generatedAt": "2026-07-17T12:00:00.000Z",
+  "sourceIds": ["sc:source:mtc-palo-alto-year-built", "sc:source:santa-clara-socrata-parcels"],
+  "sourceSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "schemaSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "properties": [
+    {
+      "propertyId": "sc:entity:property:13238069-a",
+      "parcelIdentifier": "132-38-069",
+      "addressStreet": "411 Acacia Av",
+      "addressCity": "Palo Alto",
+      "addressZip": "94306",
+      "latitude": 37.42192,
+      "longitude": -122.14302,
+      "builtYear": 1950,
+      "roofAgeYears": 18,
+      "roofReferenceDate": "2008-01-10T00:00:00.000Z",
+      "evidenceId": "sc:evidence:roof-age:13238069-a",
+      "sourceRecordKey": "objectid:2732310"
+    },
+    {
+      "propertyId": "sc:entity:property:13238069-b",
+      "parcelIdentifier": "132-38-069",
+      "addressStreet": "429 Acacia Av",
+      "addressCity": "Palo Alto",
+      "addressZip": "94306",
+      "latitude": 37.4218,
+      "longitude": -122.1427,
+      "builtYear": 1952,
+      "roofAgeYears": null,
+      "roofReferenceDate": null,
+      "evidenceId": "sc:evidence:roof-age:13238069-b",
+      "sourceRecordKey": "objectid:2732311"
+    }
+  ],
+  "provenance": {
+    "fixtureSource": "packages/testkit/src/sources/mtc-palo-alto-year-built/official-socrata-duplicate-apn.json",
+    "purpose": "Networkless serving-release pilot preserving two distinct source rows that share one APN.",
+    "limitations": [
+      "Coordinates are deterministic fixture points for query-path testing and are not asserted as rooftop or entrance locations.",
+      "Roof evidence is a deterministic serving test signal and is not production county evidence."
+    ]
+  }
+}

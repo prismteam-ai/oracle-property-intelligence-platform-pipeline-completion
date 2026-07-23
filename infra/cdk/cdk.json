@@ -1,0 +1,4 @@
+{
+  "app": "node dist/bin/app.js",
+  "output": "cdk.out"
+}

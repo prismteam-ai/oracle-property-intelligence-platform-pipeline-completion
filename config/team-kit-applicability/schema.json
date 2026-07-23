@@ -1,0 +1,193 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://oracle-assessment.invalid/schemas/team-kit-applicability.schema.json",
+  "title": "Oracle Team Kit applicability registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "assessment",
+    "decisionScope",
+    "sourcePins",
+    "allowedStates",
+    "entries"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "./schema.json"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "assessment": {
+      "const": "oracle-property-intelligence-platform-pipeline-completion"
+    },
+    "decisionScope": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sourcePins": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "teamKitCommit",
+        "operatingModel",
+        "oracleTasks"
+      ],
+      "properties": {
+        "teamKitCommit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "operatingModel": {
+          "type": "string",
+          "minLength": 1
+        },
+        "oracleTasks": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "allowedStates": {
+      "const": [
+        "adopted",
+        "adapted",
+        "not_applicable",
+        "exception_pending"
+      ]
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 8,
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    }
+  },
+  "$defs": {
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "sourceContract",
+        "state",
+        "operationalStatus",
+        "liveClaim",
+        "owner",
+        "evidenceOrTrigger",
+        "dataHandlingImpact",
+        "releaseConsequence"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]+$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sourceContract": {
+          "type": "string",
+          "minLength": 1
+        },
+        "state": {
+          "enum": [
+            "adopted",
+            "adapted",
+            "not_applicable",
+            "exception_pending"
+          ]
+        },
+        "operationalStatus": {
+          "enum": [
+            "not_started",
+            "locally_verified",
+            "live_verified",
+            "unverified_external",
+            "not_used"
+          ]
+        },
+        "liveClaim": {
+          "type": "boolean"
+        },
+        "owner": {
+          "type": "string",
+          "minLength": 1
+        },
+        "evidenceOrTrigger": {
+          "type": "string",
+          "minLength": 1
+        },
+        "dataHandlingImpact": {
+          "type": "string",
+          "minLength": 1
+        },
+        "releaseConsequence": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "exception_pending"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "operationalStatus": {
+                "const": "unverified_external"
+              },
+              "liveClaim": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "not_applicable"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "operationalStatus": {
+                "const": "not_used"
+              },
+              "liveClaim": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "liveClaim": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "operationalStatus": {
+                "const": "live_verified"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

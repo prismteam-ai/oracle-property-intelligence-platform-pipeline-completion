@@ -1,0 +1,18 @@
+{
+  "name": "@oracle/e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "eslint playwright.config.ts support tests",
+    "test": "playwright test",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@oracle/tsconfig": "workspace:*",
+    "@playwright/test": "1.61.1",
+    "@types/node": "22.19.17",
+    "typescript": "5.9.3"
+  }
+}

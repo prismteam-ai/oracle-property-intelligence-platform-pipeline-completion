@@ -1,0 +1,32 @@
+{
+  "name": "@oracle/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./dist/handler.js"
+  },
+  "scripts": {
+    "build": "esbuild src/handler.ts --bundle --format=esm --platform=node --target=node22 --sourcemap --external:@oracle/query-core/serving/index --banner:js=\"import { createRequire } from 'node:module';const require=createRequire(import.meta.url);\" --outfile=dist/handler.js && node --input-type=module -e \"await import('./dist/handler.js')\"",
+    "lint": "eslint src",
+    "test": "vitest run src",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@oracle/agent": "workspace:*",
+    "@oracle/artifacts": "workspace:*",
+    "@oracle/contracts": "workspace:*",
+    "@oracle/data-runtime": "workspace:*",
+    "@oracle/features": "workspace:*",
+    "@oracle/observability": "workspace:*",
+    "@oracle/query-core": "workspace:*",
+    "@trpc/server": "11.18.0"
+  },
+  "devDependencies": {
+    "@oracle/tsconfig": "workspace:*",
+    "@types/aws-lambda": "8.10.162",
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

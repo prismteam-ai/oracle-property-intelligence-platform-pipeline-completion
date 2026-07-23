@@ -1,0 +1,155 @@
+{
+  "type": "FeatureCollection",
+  "overture": {
+    "release": "2026-06-17.0",
+    "schemaVersion": "1.17.0",
+    "theme": "places",
+    "featureType": "place"
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "id": "08a87f75-fe95-455d-ab8f-42f37424a70a",
+      "geometry": { "type": "Point", "coordinates": [-121.92410278320312, 37.364715576171875] },
+      "properties": {
+        "version": 5,
+        "names": { "primary": "Starbucks", "common": {}, "rules": [] },
+        "categories": { "primary": "coffee_shop", "alternate": [] },
+        "confidence": 0.77,
+        "brand": null,
+        "addresses": [
+          {
+            "freeform": "Terminal B, Arrivals",
+            "locality": "San Jose",
+            "postcode": "95110",
+            "region": "CA",
+            "country": "US"
+          }
+        ],
+        "sources": [
+          {
+            "property": "",
+            "dataset": "Foursquare",
+            "license": "Apache-2.0",
+            "record_id": "4bbdeb678a4fb713d2873d9d",
+            "update_time": "2026-02-23T00:00:00.000Z",
+            "confidence": 0.77
+          }
+        ],
+        "operating_status": null,
+        "basic_category": "coffee_shop",
+        "taxonomy": {
+          "primary": "coffee_shop",
+          "hierarchy": ["food_and_drink", "non_alcoholic_beverage_venue", "coffee_shop"],
+          "alternates": []
+        }
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "346ea5cb-3d37-4661-9001-7d0b0ea36a5a",
+      "geometry": { "type": "Point", "coordinates": [-121.94251251220703, 37.32512664794922] },
+      "properties": {
+        "version": 3,
+        "names": {
+          "primary": "Starbucks",
+          "common": {},
+          "rules": [{ "variant": "official", "language": null, "value": "Starbucks Coffee" }]
+        },
+        "categories": { "primary": "coffee_shop", "alternate": ["cafe", "coffee_roastery"] },
+        "confidence": 0.8,
+        "brand": {
+          "wikidata": "Q37158",
+          "names": { "primary": "Starbucks", "common": {}, "rules": [] }
+        },
+        "addresses": [
+          {
+            "freeform": "2801 Stevens Creek Blvd",
+            "locality": "Santa Clara",
+            "postcode": "95050",
+            "region": "CA",
+            "country": "US"
+          }
+        ],
+        "sources": [
+          {
+            "property": "",
+            "dataset": "AllThePlaces",
+            "license": "CC0-1.0",
+            "record_id": "_KAUKPPiDyy9xxFd-XWG7Y_AqNU=",
+            "update_time": "2026-06-02T15:18:54.000Z",
+            "confidence": 0.8
+          },
+          {
+            "property": "/properties/confidence",
+            "dataset": "Overture",
+            "license": "CDLA-Permissive-2.0",
+            "record_id": null,
+            "update_time": "2026-06-11T11:57:15Z",
+            "confidence": null
+          }
+        ],
+        "operating_status": null,
+        "basic_category": "coffee_shop",
+        "taxonomy": {
+          "primary": "coffee_shop",
+          "hierarchy": ["food_and_drink", "non_alcoholic_beverage_venue", "coffee_shop"],
+          "alternates": []
+        }
+      }
+    },
+    {
+      "type": "Feature",
+      "id": "8fce41a2-c2b5-40f4-b90d-c39f2fa2ec7d",
+      "geometry": { "type": "Point", "coordinates": [-121.97418212890625, 37.39634704589844] },
+      "properties": {
+        "version": 1,
+        "names": {
+          "primary": "Starbucks",
+          "common": {},
+          "rules": [{ "variant": "official", "language": null, "value": "Starbucks Coffee" }]
+        },
+        "categories": { "primary": "coffee_shop", "alternate": ["cafe", "coffee_roastery"] },
+        "confidence": 0.8,
+        "brand": {
+          "wikidata": "Q37158",
+          "names": { "primary": "Starbucks", "common": {}, "rules": [] }
+        },
+        "addresses": [
+          {
+            "freeform": "2401 Agnew Dr",
+            "locality": "Santa Clara",
+            "postcode": "95054",
+            "region": "CA",
+            "country": "US"
+          }
+        ],
+        "sources": [
+          {
+            "property": "",
+            "dataset": "AllThePlaces",
+            "license": "CC0-1.0",
+            "record_id": "6e-v2kQXcJsSwHvmhvmOMvdU_yc=",
+            "update_time": "2026-06-02T15:18:54.000Z",
+            "confidence": 0.8
+          },
+          {
+            "property": "/properties/confidence",
+            "dataset": "Overture",
+            "license": "CDLA-Permissive-2.0",
+            "record_id": null,
+            "update_time": "2026-06-11T11:57:15Z",
+            "confidence": null
+          }
+        ],
+        "operating_status": null,
+        "basic_category": "coffee_shop",
+        "taxonomy": {
+          "primary": "coffee_shop",
+          "hierarchy": ["food_and_drink", "non_alcoholic_beverage_venue", "coffee_shop"],
+          "alternates": []
+        }
+      }
+    }
+  ]
+}

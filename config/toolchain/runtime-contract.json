@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "node": "22.18.0",
+  "corepack": "0.34.6",
+  "pnpm": "10.33.0",
+  "typescript": "5.9.3",
+  "moduleSystem": "ESM",
+  "moduleResolution": "NodeNext",
+  "lambdaRuntime": "nodejs22.x",
+  "target": "ES2022",
+  "verificationImage": "node:22.18.0-bookworm-slim@sha256:752ea8a2f758c34002a0461bd9f1cee4f9a3c36d48494586f60ffce1fc708e0e"
+}

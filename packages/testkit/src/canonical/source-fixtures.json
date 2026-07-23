@@ -1,0 +1,59 @@
+{
+  "fixtureVersion": "1.0.0",
+  "provenance": {
+    "basis": "Wave 1 official Santa Clara County Parcels excerpt",
+    "repositoryPath": "packages/testkit/src/sources/santa-clara-socrata-parcels/duplicate-apn.geojson",
+    "provenancePath": "packages/testkit/src/sources/santa-clara-socrata-parcels/fixture-provenance.json",
+    "originalUri": "https://data.sccgov.org/resource/ubcd-cewv.geojson?%24where=apn%3D%2712769001%27&%24order=objectid&%24limit=2",
+    "sourceHash": "5a6579c59fbe93034334ed8f4ff16b75851369b31b2bada7fcdebd7b3b2de433",
+    "extractionProcedure": "Select official feature objectid 10649; format the existing situs address fields without changing their values; normalize APN only in the canonical normalizer; omit the large geometry from this derived test input because the complete unchanged geometry remains in the referenced Wave 1 fixture.",
+    "classification": "small legally safe deterministic test-only derivation; parcel/address evidence only, not ownership, occupancy, building, roof, or view evidence"
+  },
+  "parcel": {
+    "apn": "12769001",
+    "jurisdiction": "PALO ALTO",
+    "address": {
+      "line1": "899 CHARLESTON RD",
+      "line2": null,
+      "locality": "PALO ALTO",
+      "postalCode": "94303",
+      "location": null
+    },
+    "parcelGeometry": null,
+    "landAreaSquareMeters": null
+  },
+  "permitFixtureProvenance": {
+    "classification": "synthetic adversarial semantic cases",
+    "purpose": "Prove that applied, issued, finaled, and expired timestamps remain distinct and that issued/expired work is never promoted to completed work.",
+    "notClaimed": "These permit identifiers and dates are not represented as official source records."
+  },
+  "permitSemanticCases": [
+    {
+      "case": "issued_only",
+      "permitNumber": "TEST-ISSUED-1",
+      "status": "Issued",
+      "appliedAt": "2020-01-01T00:00:00.000Z",
+      "issuedAt": "2020-02-01T00:00:00.000Z",
+      "finaledAt": null,
+      "expiredAt": null
+    },
+    {
+      "case": "finaled",
+      "permitNumber": "TEST-FINALED-1",
+      "status": "Finaled",
+      "appliedAt": "2019-01-01T00:00:00.000Z",
+      "issuedAt": "2019-02-01T00:00:00.000Z",
+      "finaledAt": "2019-08-01T00:00:00.000Z",
+      "expiredAt": null
+    },
+    {
+      "case": "expired_not_completed",
+      "permitNumber": "TEST-EXPIRED-1",
+      "status": "Expired",
+      "appliedAt": "2018-01-01T00:00:00.000Z",
+      "issuedAt": "2018-02-01T00:00:00.000Z",
+      "finaledAt": null,
+      "expiredAt": "2019-02-01T00:00:00.000Z"
+    }
+  ]
+}

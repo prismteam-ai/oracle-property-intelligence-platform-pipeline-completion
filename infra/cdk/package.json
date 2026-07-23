@@ -1,0 +1,28 @@
+{
+  "name": "@oracle/infra-cdk",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint src",
+    "synth": "pnpm build && cdk synth --app \"node dist/bin/app.js\" --no-lookups",
+    "test": "vitest run src",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.261.0",
+    "constructs": "10.7.0"
+  },
+  "devDependencies": {
+    "@oracle/api": "workspace:*",
+    "@oracle/mcp": "workspace:*",
+    "@oracle/tsconfig": "workspace:*",
+    "@oracle/web": "workspace:*",
+    "@types/node": "22.19.17",
+    "aws-cdk": "2.1131.0",
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

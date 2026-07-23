@@ -1,0 +1,125 @@
+{
+  "schemaVersion": 1,
+  "taskId": "ORA-006",
+  "state": "corrected",
+  "correctionId": "ORA-006-correction-01",
+  "branch": "assessment/oracle-santa-clara",
+  "baseHead": "877fb036491af8c8a8ac71e31de9ae0f40b921a6",
+  "nativeChild": "/root/metagross",
+  "provider": "openai-codex",
+  "model": "gpt-5.6-sol",
+  "reasoning": "ultra",
+  "sandbox": "danger-full-access",
+  "approval": "never",
+  "files": [
+    ".env.example",
+    ".gitignore",
+    ".gitleaks.toml",
+    "docs/operations/credential-ingress.md",
+    "tools/secret-policy/README.md",
+    "tools/secret-policy/ingress-variables.json",
+    "tools/secret-policy/ingress.mjs",
+    "tools/secret-policy/lib.mjs",
+    "tools/secret-policy/policy.json",
+    "tools/secret-policy/scan.mjs",
+    "tools/secret-policy/self-test.mjs",
+    "tools/secret-policy/validate-ingress.mjs"
+  ],
+  "changedFiles": [
+    ".assessment/changes/ORA-006.json",
+    ".gitignore",
+    ".gitleaks.toml",
+    "docs/operations/credential-ingress.md",
+    "tools/secret-policy/README.md",
+    "tools/secret-policy/self-test.mjs"
+  ],
+  "verification": {
+    "nodeBinary": "E:\\nvm\\v22.18.0\\node.exe",
+    "gitVisibleFiles": 31,
+    "moduleSyntaxChecks": {
+      "status": "pass",
+      "files": 7
+    },
+    "secretPolicySelfTest": {
+      "status": "pass",
+      "assertions": 163,
+      "fixtureLocation": "operating-system-temporary-directory-only",
+      "valuesPrinted": false
+    },
+    "gitignoreContract": {
+      "status": "pass",
+      "selfTestIgnoredCases": 5,
+      "selfTestVisibleCases": 5,
+      "explicitRequiredIgnoredCases": 5,
+      "explicitRequiredVisibleCases": 1,
+      "trackedProhibitedPathEnumerated": true,
+      "trackedProhibitedPathRejectedBeforeStatOrRead": true
+    },
+    "repositoryScanner": {
+      "status": "pass",
+      "filesEnumerated": 31,
+      "contentFilesScanned": 31,
+      "findings": 0,
+      "errors": 0
+    },
+    "jsonParsing": {
+      "status": "pass",
+      "files": 12,
+      "hiddenDirectoryFiles": 6
+    },
+    "gitleaks": {
+      "status": "pass",
+      "dockerVersion": "29.5.3",
+      "version": "v8.30.1",
+      "image": "ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f",
+      "digest": "sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f",
+      "command": "gitleaks dir /repo --config /repo/.gitleaks.toml --redact --no-banner --exit-code 1",
+      "exit": 0,
+      "findings": 0,
+      "repositoryMountReadOnly": true,
+      "networkDisabled": true,
+      "imagePulled": false
+    },
+    "gitleaksGoogleSignatureProbes": {
+      "status": "pass",
+      "syntheticHexLengths": [
+        64,
+        1025
+      ],
+      "expectedFindingExit": 1,
+      "actualExits": [
+        1,
+        1
+      ],
+      "valuesPrinted": false
+    },
+    "gitDiffCheck": "pass"
+  },
+  "review": {
+    "reviewer": "/root/metagross",
+    "model": "gpt-5.6-sol",
+    "reasoning": "ultra",
+    "scope": "every changed byte across the six-path correction allowlist",
+    "status": "pass",
+    "fixedFindings": [
+      "replaced the unsupported RE2 repeat maximum without changing the AWS or CDN branches",
+      "closed five narrow repository-root ignore misses while keeping .env.example and non-credential evidence visible",
+      "added executable ignored-file enumeration and tracked-prohibited pre-read boundary proofs"
+    ],
+    "openMaterialFindings": []
+  },
+  "safety": {
+    "secretValuesRead": false,
+    "secretValuesPrinted": false,
+    "ignoredCredentialFilesRead": false,
+    "workspaceRootConfigRead": false,
+    "providerConfigurationRead": false,
+    "networkAccess": false,
+    "packagesInstalled": false,
+    "sourceDownloaded": false,
+    "externalEffectsPerformed": false,
+    "assessmentGitMutatingCommandRun": false,
+    "commitPerformed": false,
+    "pushOrPullRequestPerformed": false
+  }
+}

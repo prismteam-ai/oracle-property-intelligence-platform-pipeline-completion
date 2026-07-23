@@ -1,0 +1,36 @@
+{
+  "name": "@oracle/pipeline",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "oracle-pipeline": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "esbuild src/cli.ts --bundle --format=esm --platform=node --target=node22 --external:@duckdb/node-api --sourcemap --banner:js=\"#!/usr/bin/env node\" --outfile=dist/cli.js",
+    "check": "node dist/cli.js --check",
+    "lint": "eslint src",
+    "stress:bounded-county": "esbuild src/orchestration/bounded-county-stress.ts --bundle --format=esm --platform=node --target=node22 --external:@duckdb/node-api --outfile=dist/bounded-county-stress.js && node --max-old-space-size=256 dist/bounded-county-stress.js",
+    "stress:streaming-ledger": "esbuild src/orchestration/streaming-stress.ts --bundle --format=esm --platform=node --target=node22 --external:@duckdb/node-api --outfile=dist/streaming-stress.js && node --max-old-space-size=128 dist/streaming-stress.js",
+    "test": "vitest run src",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "1.4.5-r.1",
+    "@oracle/artifacts": "workspace:*",
+    "@oracle/canonical-model": "workspace:*",
+    "@oracle/contracts": "workspace:*",
+    "@oracle/data-runtime": "workspace:*",
+    "@oracle/features": "workspace:*",
+    "@oracle/query-core": "workspace:*",
+    "@oracle/reconciliation": "workspace:*",
+    "@oracle/source-adapters": "workspace:*",
+    "@oracle/testkit": "workspace:*"
+  },
+  "devDependencies": {
+    "@oracle/tsconfig": "workspace:*",
+    "esbuild": "0.28.1",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

@@ -1,0 +1,31 @@
+{
+  "name": "@oracle/testkit",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./shared/*": {
+      "types": "./dist/shared/*.d.ts",
+      "default": "./dist/shared/*.js"
+    },
+    "./sources/*": {
+      "types": "./dist/sources/*.d.ts",
+      "default": "./dist/sources/*.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint src",
+    "test": "vitest run src",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@oracle/contracts": "workspace:*",
+    "fast-check": "4.9.0"
+  },
+  "devDependencies": {
+    "@oracle/tsconfig": "workspace:*",
+    "typescript": "5.9.3",
+    "vitest": "4.1.10"
+  }
+}

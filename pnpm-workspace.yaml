@@ -1,0 +1,12 @@
+packages:
+  - apps/*
+  - packages/*
+  - infra/*
+
+catalogMode: strict
+
+cleanupUnusedCatalogs: true
+
+engineStrict: true
+
+strictPeerDependencies: true
