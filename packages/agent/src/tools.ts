@@ -118,7 +118,13 @@ export function createNamedEvidenceTools(
       const result = tool({
         description: `Read immutable Oracle evidence using ${name}. This tool is read-only and release-bound.`,
         inputSchema: bedrockCompatibleInputSchema(inputSchema),
-        strict: true,
+        // strict mode makes Bedrock compile a constrained decoding grammar over the
+        // union of all active tool schemas, which caps total optional parameters at
+        // 24; the evidence tools exceed that and Bedrock either rejects the request
+        // or, for mid-sized active-tool sets, hangs attempting the compilation. The
+        // tool contract is still enforced: execute() runs inputSchema.parse(input)
+        // and rejects any non-conforming argument before touching the release.
+        strict: false,
         execute: async (input, options) => {
           const ledger = invocationLedger(options.experimental_context);
           ledger.calls += 1;

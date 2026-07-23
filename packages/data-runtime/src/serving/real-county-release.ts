@@ -674,12 +674,30 @@ export async function buildBoundedPublicServingClosure(
       projectionRoot,
       sourceManifest.artifacts,
     );
+    // The public projection drops the restricted artifacts, so it must also drop
+    // the sources that only those artifacts cited. The manifest's sourceIds are a
+    // claim about what the bundle contains, and the immutable-release verifier
+    // (packages/artifacts release manifest) fails closed unless sourceIds equals
+    // the union of the present artifacts' lineage exactly. Copying the operator
+    // manifest's full source list would declare sources whose data is absent from
+    // every public artifact - both untrue and rejected at load. Recompute it from
+    // the public artifacts actually being published.
+    const publicSourceIds = Object.freeze(
+      [
+        ...new Set(
+          deploymentArtifacts.flatMap((artifact) =>
+            artifact.sourceLineage.map((lineage) => lineage.sourceId),
+          ),
+        ),
+      ].sort((left, right) => left.localeCompare(right)),
+    );
     const publicManifestPayload = Object.freeze({
       ...Object.fromEntries(
         Object.entries(sourceManifest).filter(
-          ([key]) => key !== 'artifacts' && key !== 'manifestSha256',
+          ([key]) => key !== 'artifacts' && key !== 'manifestSha256' && key !== 'sourceIds',
         ),
       ),
+      sourceIds: publicSourceIds,
       artifacts: Object.freeze(deploymentArtifacts),
     });
     const manifest = Object.freeze({

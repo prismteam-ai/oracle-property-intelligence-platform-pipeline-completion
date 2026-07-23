@@ -150,6 +150,15 @@ describe('generic bounded public serving closure', () => {
     expect(manifest.releaseId).toBe(RELEASE_ID);
     expect(manifest.artifacts).toHaveLength(7);
     expect(manifest.artifacts.every(({ visibility }) => visibility === 'public')).toBe(true);
+    // The public manifest must declare exactly the sources cited by its public
+    // artifacts, never the operator manifest's full source list. The immutable
+    // release verifier fails closed when a declared source is absent from every
+    // artifact's lineage, which is what rejected the first real bounded release at
+    // load once its restricted-only sources were dropped from the public bundle.
+    const publicLineageSourceIds = [
+      ...new Set(manifest.artifacts.flatMap((artifact) => artifact.sourceLineage.map((lineage) => lineage.sourceId))),
+    ].sort();
+    expect([...manifest.sourceIds].sort()).toEqual(publicLineageSourceIds);
     const propertyArtifact = manifest.artifacts.find(
       ({ relation }) => relation === 'property_query',
     );
