@@ -39,7 +39,16 @@ node apps/pipeline/dist/cli.js full `
 
 `full` means uncapped acquisition, not an automatic county-completion claim. A full configuration is rejected unless its required capability set exactly matches the 14 production lanes in this runbook; 511 remains optional. The manifest claims county completion only when that complete inventory reaches `complete`. A missing, unexpected, blocked, failed, partial, or discovery-only required lane makes the run partial, blocked, or ineligible. San Jose permit coverage is one city authority and is not countywide permit coverage.
 
-The current orchestration implementation materializes acquired source bytes and normalized mutations in memory before global reconciliation. A live uncapped run on 2026-07-17 preserved roughly 119.8 MB of immutable artifacts/checkpoints, then reached Node's heap limit near 4.14 GB during concurrent parcel/San Jose processing before `build_marts`. Treat that run as resumable resource-blocker evidence, not a full release. Do not blindly raise the heap and resume: complete full execution requires a bounded streaming/spill architecture for decode, normalization, and global reconciliation.
+Historic, superseded: the orchestration implementation used to materialize acquired source bytes and normalized mutations in memory before global reconciliation. A live uncapped run on 2026-07-17 (`f1`) preserved roughly 119.8 MB of immutable artifacts/checkpoints, then reached Node's heap limit near 4.14 GB during concurrent parcel/San Jose processing before `build_marts`. That run remains resumable resource-blocker evidence, not a full release. The in-memory path is no longer what `pilot`, `full`, or `incremental` execute: `usesBoundedPipelineProcessors` (`apps/pipeline/src/commands/run.ts:829-831`) selects the `bounded_streaming_v2` processors for every non-fixture production profile, and the in-memory `small_run_only_v1` processors are now reached only by the fixture pilot. Bounded execution has its own resource ceilings; see "Operator execution ceilings" below.
+
+### Operator execution ceilings
+
+Bounded compute stages enforce a single budget object validated as a set by `boundedProcessingBudgetSchema` (`maxBufferedBytes + duckdbMemoryBytes + runtimeReserveBytes <= maxRssBytes`). Two operator overrides raise only the enforcement ceilings — they do not enter policy objects, policy hashes, or generation identity, so an overridden run produces the same generation identity as a default run:
+
+- `ORACLE_PIPELINE_DUCKDB_MEMORY_BYTES`
+- `ORACLE_PIPELINE_MAX_RSS_BYTES`
+
+Raise them together. Raising the DuckDB ceiling alone does not help and actively guarantees failure, because DuckDB allocation counts toward process RSS: a run configured that way aborted `reduce_canonical` after 112 minutes at 1138 MB RSS. Both now flow through `applyOperatorCeilings()` and an unbalanced pair is rejected at startup in under a second rather than mid-compute. Evidence records continue to report the true observed DuckDB-memory and process-RSS peaks.
 
 ## Profile semantics
 
@@ -71,7 +80,15 @@ Overture, CSLB, configured CA SOS bulk data, and configured OSM are discovery-on
 | Ownership transfers           | Capability adapter                                                           | Official access is currently blocked; no no-transfer or owner-region fact is inferred                                                     |
 | Santa Clara FBN               | Capability adapter                                                           | Public bulk acquisition is currently blocked and owner-bearing output is prohibited from public release                                   |
 
-The canonical mutations currently provide property and permit inputs sufficient for roof evidence only. Transit distance, pedestrian walk time, shoreline/hydrography distance, elevation-derived visibility, and Starbucks proximity remain `unknown`/`null` in the portable property mart until the canonical composition supplies property coordinates plus graph/raster/service topology. Acquiring those sources does not by itself justify a supported feature value.
+The canonical mutations provide property and permit inputs sufficient for roof evidence. Roof evidence is the only criterion that can reach a measured, non-proxy value from the currently composed sources.
+
+Spatial criteria — transit walkability, water view, and Starbucks proximity — are emitted with support class `proxy`, never `measured`. Properties now carry a representative point (a real vertex of the real parcel geometry; before this the spatial join could never match, so every proximity feature was structurally empty), which makes proximity candidate ranking produce rows for the first time. What those rows are is bounded by what is actually configured:
+
+- there is no pedestrian network — the OSM lane is blocked by default — so "walkability" is a coordinate-band proximity proxy, **not** a pedestrian walk time or route distance, and must not be described as one;
+- shoreline/hydrography distance and elevation-derived visibility are likewise proxied from candidate proximity, not from raster geometry or a viewshed;
+- a Starbucks candidate match is not proof a store is open.
+
+Acquiring those sources does not by itself justify a `measured` feature value, and a proxy value does not become a measured one by being non-null. Consumers see the `proxy` support class on the response and should not upgrade it.
 
 ## Source configuration
 
@@ -131,7 +148,34 @@ The accepted final-code bounded pilot is `p7` under `.cache/oracle-real-county/`
 
 `p5` is immutable but superseded because its 30-second live NOAA request timed out before acquisition. `p6` is immutable but superseded because its operator-supplied `requestedAt` was later than its wall-clock completion. `p7` used the same pilot item/record bounds with a secret-free 120-second request timeout. Its requested instant, `2026-07-17T21:29:36.037Z`, precedes its completion at `2026-07-17T21:30:33.928Z`. The NOAA lane completed with 50 accepted records and the same source aggregate hash proven in `p6`. The exact previously preserved NOAA archive also passed the corrected strict CRS decoder with 1,880 unique clipped features.
 
-The uncapped `f1` evidence remains the terminal full-run resource result: it ended before `build_marts` with a fatal Node heap OOM near 4.14 GB. It has no full mart, portable release, or county-completion claim.
+The uncapped `f1` evidence remains the terminal full-run resource result under the superseded in-memory orchestration: it ended before `build_marts` with a fatal Node heap OOM near 4.14 GB. It has no full mart, portable release, or county-completion claim.
+
+### In-flight bounded demo run
+
+A bounded `pilot` run is executing at the time of writing under the `bounded_streaming_v2` processors:
+
+```text
+node apps/pipeline/dist/cli.js pilot \
+  --source-config config/source/assessment-pilot-demo.json \
+  --requested-at 2026-07-19T12:00:00.000Z \
+  --output .cache/oracle-demo-bounded
+```
+
+This is a bounded pilot, not an uncapped `full` run, and it cannot produce a county-completion claim regardless of outcome.
+
+The reference run was executed on Windows with a short `--output E:/ora-demo/f` root: the DuckDB
+native addon ignores the Windows long-path opt-in, so the documented `.cache/oracle-demo-bounded`
+path exceeds MAX_PATH. Every value below is copied from the emitted terminal manifest and release
+evidence:
+
+- run ID: `sc:run:74239e2f3c9beb70c4721c618f31d0d7db9cf472cc5e376d4f5f13fcf0ee98c2`
+- generation ID: `sc:generation:2c8fb9aff0c40c016817f4eddf66236c7773f000ce9f0117f8f4ddd9bd55a2d8`
+- release ID: `santa-clara-70ec78efee5b6c6b664fe8a3`
+- terminal run status: `partial` (a bounded pilot cannot reach `succeeded` while required capabilities remain blocked or failed)
+- accepted / quarantined record counts: 18,882 accepted, 0 quarantined (the expected-record denominator is `null` — the publisher exposes no independent row-count endpoint)
+- per-capability terminal states (15 capabilities): 2 succeeded (`vta_gtfs`, `noaa_shoreline`); 5 partial (`santa_clara_parcels`, `san_jose_permits`, `palo_alto_year_built`, `usgs_hydrography`, `usgs_elevation`); 5 blocked (`ca_sos_businesses`, `cslb_contractors`, `osm_pedestrian_graph`, `ownership_transfers`, `santa_clara_fbn`); 2 failed (`caltrain_gtfs`, `overture_starbucks`); 1 not_configured (`transit_511_fallback`)
+- accepted mart SHA-256: `f05a26cb6a47e7abee942dceca92702129fe861b56302fecb791525fb591cd1c` (public `property_query`, 5,000 rows)
+- requested / completed instants: requested `2026-07-19T12:00:00.000Z`; completed `2026-07-23T05:22:48.425Z`
 
 ## Streaming recovery contract (implementation v2)
 
@@ -176,11 +220,19 @@ only that verified length, validates its SHA-256 and operation scan budgets, and
 verifies every listed query-data artifact by URI, byte length, and SHA-256 before its confined
 physical URI is passed to DuckDB.
 
-The current default reducer/linker/feature/mart processor is explicitly marked
-`small_run_only_v1`. A `full` profile stops with `UNBOUNDED_COUNTY_PHASE` before reconciliation
-unless composition supplies a `bounded_streaming_v2` processor. This is a truthful safety gate, not
-a county-completion result. It preserves the existing pilot behavior while the partitioned
-reconciliation and downstream county processor are completed.
+The partitioned bounded reducer/linker/feature/mart processor is now composed and is what production
+profiles execute. `usesBoundedPipelineProcessors` (`apps/pipeline/src/commands/run.ts:829-831`)
+selects `bounded_streaming_v2` for `full`, `incremental`, and non-fixture `pilot`; the
+`small_run_only_v1` processor in `default-processors.ts` remains only for the fixture pilot.
+`assertCountyProcessorProfile` still refuses a `full` or `incremental` profile backed by
+`small_run_only_v1`, failing with `UNBOUNDED_COUNTY_PHASE` before reconciliation. That gate is
+retained as a guard against a mis-composed runtime, not as a description of the default path.
+Bounded `incremental` is separately fail-closed until existing county artifacts can be verified and
+merged (`apps/pipeline/src/orchestration/bounded-processors.ts:287-290`).
+
+Neither of these changes any release claim. A bounded processor makes county-scale execution
+possible; it does not make a run complete, and county completion is still asserted only when the
+full required capability inventory reaches `complete`.
 
 The full generated streaming-v2 runner stress was run on 2026-07-18 with
 `node --max-old-space-size=512`. It completed 1,000,000 decoded records, 1,000,000 normalized

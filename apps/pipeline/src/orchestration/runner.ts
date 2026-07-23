@@ -955,6 +955,10 @@ function sourceManifest(
     license: Object.freeze({
       redistribution: input.source.adapter.describe().license.redistribution,
       containsPersonalData: input.source.adapter.describe().license.containsPersonalData,
+      // Normalised to a strict boolean: an absent flag must read as false, never
+      // as undefined leaking into an attribution decision.
+      personalFieldsExcludedFromPublicProjection:
+        input.source.adapter.describe().license.personalFieldsExcludedFromPublicProjection === true,
       defaultVisibility: input.source.adapter.describe().defaultVisibility,
     }),
     schemaHashes: Object.freeze(

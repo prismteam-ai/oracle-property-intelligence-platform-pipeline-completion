@@ -110,6 +110,12 @@ export type SourceExecutionManifest = Readonly<{
   license: Readonly<{
     redistribution: 'approved' | 'restricted' | 'prohibited' | 'unknown';
     containsPersonalData: boolean;
+    /**
+     * Lineage attribution only; never gates whether a value may be published.
+     * Optional so absence is indistinguishable from false - a source is
+     * attributable only by explicit opt-in, never by omission.
+     */
+    personalFieldsExcludedFromPublicProjection?: boolean;
     defaultVisibility: 'public' | 'restricted' | 'prohibited_public' | 'authenticated';
   }>;
   schemaHashes: readonly string[];

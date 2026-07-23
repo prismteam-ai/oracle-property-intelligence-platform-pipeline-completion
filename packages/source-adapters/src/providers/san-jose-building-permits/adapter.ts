@@ -115,6 +115,19 @@ const DESCRIPTOR: SourceDescriptor = sourceDescriptorSchema.parse({
     termsSha256: 'a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499',
     redistribution: 'approved',
     containsPersonalData: true,
+    // Verified structurally, not by filter: no public serving column can carry
+    // applicant/owner/contractor text. featureServingRow emits a closed
+    // RoofAgeValue (its `classification` is an enum derived from the description,
+    // never the description), source id strings, and source references whose
+    // strictObject schema carries fieldPaths - paths, not values. The raw prose is
+    // present in memory on observation.fields.value, but no serving-row constructor
+    // ever reads it. propertyServingRow emits typed scalars only.
+    // Residual, documented rather than hidden: field_source_ids_json publishes
+    // recordSha256, hashed over the whole raw CSV row. Not plaintext and not a
+    // practical recovery vector - the preimage is all 18 columns, so testing a
+    // candidate name requires already holding the row from San Jose's public CC0
+    // dataset. A confirmation oracle for someone who already has the data.
+    personalFieldsExcludedFromPublicProjection: true,
     attribution: ['City of San Jose Open Data'],
     limitations: [
       'Free-form applicant, owner, and contractor text can contain personal names.',

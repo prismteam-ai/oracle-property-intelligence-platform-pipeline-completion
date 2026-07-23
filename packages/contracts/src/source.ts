@@ -40,6 +40,27 @@ export const licenseSnapshotSchema = z.strictObject({
   termsSha256: sha256Schema,
   redistribution: z.enum(['approved', 'restricted', 'prohibited', 'unknown']),
   containsPersonalData: z.boolean(),
+  /**
+   * The source contains personal data AND its public projection provably emits
+   * no field carrying it.
+   *
+   * Governs LINEAGE ATTRIBUTION only - whether a public relation may name this
+   * source as a contributor. It never governs whether a value may be published;
+   * that remains controlled by containsPersonalData, the visibility gates, and
+   * the owner-free projection.
+   *
+   * Exists because publicSourceIds conflated two independent axes - "may we
+   * redistribute" and "does the source contain personal data" - and applied the
+   * conjunction to provenance, which is a claim ABOUT data rather than a channel
+   * FOR it. The rest of this codebase already separates them: publicProjectionPermission
+   * derives from redistribution alone, and owner-bearing content is blocked at public
+   * visibility only for contentClass 'source_data', deliberately exempting derived data.
+   *
+   * Optional rather than defaulted, so absence is indistinguishable from false at
+   * the type level: a source is attributable only by explicit, justified opt-in,
+   * never by omission. Consumers must test `=== true`.
+   */
+  personalFieldsExcludedFromPublicProjection: z.boolean().optional(),
   attribution: z.array(nonEmptyStringSchema),
   limitations: z.array(nonEmptyStringSchema),
 });

@@ -214,9 +214,14 @@ out-of-memory condition near 4.14 GB. It therefore produced no accepted mart and
 checkpoint/artifact evidence remains under `.cache/oracle-real-county/f1/`.
 
 Do not relabel the pilot bundle as county completion. A blind larger-heap resume is not an accepted
-remedy. The incomplete v1 run now fails before reacquisition, and the v2 full profile stops before
-the still-unbounded reconciliation/feature/mart processor until a bounded replacement is composed
-and verified.
+remedy. Incomplete orchestration-v1 checkpoints, including `f1`, still fail with
+`LEGACY_INCOMPLETE_CHECKPOINT` before reacquisition.
+
+Superseded as of 2026-07-21: the bounded reconciliation/feature/mart replacement is now composed
+and is what production profiles execute, so the `full` profile no longer stops before that phase
+for want of a bounded processor. The `UNBOUNDED_COUNTY_PHASE` guard is retained against a
+mis-composed runtime. This removes a resource blocker only. It does not produce, and must not be
+read as producing, a `partial_county` or `full_county` bundle: no such bundle exists.
 
 The 2026-07-18 streaming foundation adds verified logical-key orphan recovery, bounded acquired
 artifact readers, per-yield durable acquisition replay, fresh-process finalization, one shared
@@ -228,9 +233,31 @@ The combined high-water equaled the configured 1,000 permits (active records 1, 
 logical SHA-256 was `3c4381a7677cacc314aec5ab3ad489c46afd41cc5ff0365759d5d33cca195ffb`.
 This foundation does not alter, regenerate, or supersede p8. The accepted p8 manifest hashes,
 CID, row counts, privacy result, partial-pilot label, and no-county-completion result above remain
-exactly unchanged. The default county reconciliation/feature/mart processor is still guarded as
-small-run-only, so an uncapped full release remains blocked before that unbounded phase until a
-bounded streaming processor is composed and verified.
+exactly unchanged — including by the 2026-07-21 bounded-run fixes, which changed enforcement
+ceilings, query shape, and routing but no accepted artifact.
+
+## Pending bounded release
+
+A bounded `pilot` run (requested-at `2026-07-19T12:00:00.000Z`, output `.cache/oracle-demo-bounded`)
+is executing at the time of writing. It is a bounded pilot: its scope can only be `pilot`, its
+completion claim is false, and it cannot be labelled `partial_county` or `full_county`.
+
+The bounded `pilot` run reached a terminal `partial` status and produced a verified
+`partial_county` release bundle. Every value below is copied from `release-manifest.json` and
+`release-evidence.json`:
+
+- release ID: `santa-clara-70ec78efee5b6c6b664fe8a3`
+- run ID: `sc:run:74239e2f3c9beb70c4721c618f31d0d7db9cf472cc5e376d4f5f13fcf0ee98c2`
+- generation ID: `sc:generation:2c8fb9aff0c40c016817f4eddf66236c7773f000ce9f0117f8f4ddd9bd55a2d8`
+- manifest self-hash: `88b1f3a20f2aa5a368b945045c5eab668a73c4f88b0d4be448b67d8bcb33f34a`
+- evidence self-hash: `d04355b0501fefc409cb44401b74a16c3338b429595ad22f0ff241af3d4240f4`
+- accepted / quarantined record counts: 18,882 accepted, 0 quarantined
+- capability state tally and permit-authority fraction: 2 succeeded / 5 partial / 5 blocked / 2 failed / 1 not_configured (15 capabilities); permit-authority coverage 0 of 16 (San Jose permits are partial and jurisdiction-scoped to the City of San Jose, so no property in the pilot slice has an established permit authority)
+- public / restricted artifact and row counts: 7 public relations (property_query 5,000; property_evidence 30,000; data_dictionary 85; field_coverage 27; relation_coverage 9; source_coverage 4; pipeline_runs 1) and 7 restricted relations (property_query 8,940; property_evidence 53,640; data_dictionary 85; field_coverage 27; relation_coverage 9; source_coverage 12; pipeline_runs 1). All release gates passed (license, manifest, parquet, clean-reopen, public/restricted segregation); owner-bearing public values 0; public/restricted value overlap 0.
+
+Nothing here is published. Public IPFS publication, Filebase upload, IPNS mutation, and deployment
+remain separate human-gated actions outside this code, and no CID recorded in this document has
+been published or pinned.
 
 ## Reproducible verification
 
