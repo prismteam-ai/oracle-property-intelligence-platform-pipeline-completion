@@ -28,6 +28,14 @@ export const OVERTURE_PLACES_FRAGMENT_LAST_MODIFIED = '2026-06-17T17:24:40.000Z'
 export const OVERTURE_PLACES_FRAGMENT_SHA256 =
   '565c44c3900d7700998d38962d70c2d53acece8446e0dd23aa54878a80d0c659';
 
+// theme/type are NOT columns inside Overture places parquet files — they are
+// Hive partition path segments (theme=places/type=place/) of the official
+// distribution URL. The pipeline reads the pinned fragment from its
+// content-addressed artifact store, whose physical path carries no key=value
+// segments, so DuckDB cannot synthesize them and a bare `theme` reference fails
+// with a binder error. The pinned fragment lives under theme=places/type=place,
+// so every row is by construction theme='places', type='place' — select the
+// literals the downstream row guard expects.
 export const OVERTURE_STARBUCKS_QUERY = `SELECT
   id,
   version,
@@ -42,8 +50,8 @@ export const OVERTURE_STARBUCKS_QUERY = `SELECT
   taxonomy,
   bbox.xmin AS longitude,
   bbox.ymin AS latitude,
-  theme,
-  type
+  'places' AS theme,
+  'place' AS type
 FROM read_parquet(?)
 WHERE bbox.xmin BETWEEN ? AND ?
   AND bbox.ymin BETWEEN ? AND ?

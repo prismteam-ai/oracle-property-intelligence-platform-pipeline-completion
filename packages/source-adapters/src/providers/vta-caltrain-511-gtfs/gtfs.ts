@@ -2,7 +2,7 @@
 /* eslint-disable @typescript-eslint/dot-notation */
 import { createHash } from 'node:crypto';
 import { closeSync, createReadStream, openSync, writeSync } from 'node:fs';
-import { mkdir, open, readFile, stat } from 'node:fs/promises';
+import { mkdir, open, readFile, stat, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 
 import { parse } from 'csv-parse/sync';
@@ -53,6 +53,50 @@ function normalizeEntryPath(path: string): string {
     throw new Error(`Unsafe GTFS ZIP member path: ${path}`);
   }
   return normalized;
+}
+
+/**
+ * Collapse runs of two or more carriage returns before a line feed to a single
+ * CR (\r\r\n -> \r\n). Everything else — lone CRs, clean CRLF, bare LF — passes
+ * through byte-identical, and when nothing needs collapsing the ORIGINAL buffer
+ * is returned so callers can cheaply detect "unchanged" by identity.
+ */
+function collapseCarriageReturnRuns(bytes: Buffer): Buffer {
+  const CR = 0x0d;
+  const LF = 0x0a;
+  let needsRewrite = false;
+  for (let index = 2; index < bytes.length; index += 1) {
+    if (bytes[index] === LF && bytes[index - 1] === CR && bytes[index - 2] === CR) {
+      needsRewrite = true;
+      break;
+    }
+  }
+  if (!needsRewrite) return bytes;
+  const output = Buffer.allocUnsafe(bytes.length);
+  let written = 0;
+  let pendingCarriageReturns = 0;
+  for (const byte of bytes) {
+    if (byte === CR) {
+      pendingCarriageReturns += 1;
+      continue;
+    }
+    if (byte === LF) {
+      if (pendingCarriageReturns > 0) output[written++] = CR;
+      pendingCarriageReturns = 0;
+      output[written++] = LF;
+      continue;
+    }
+    while (pendingCarriageReturns > 0) {
+      output[written++] = CR;
+      pendingCarriageReturns -= 1;
+    }
+    output[written++] = byte;
+  }
+  while (pendingCarriageReturns > 0) {
+    output[written++] = CR;
+    pendingCarriageReturns -= 1;
+  }
+  return output.subarray(0, written);
 }
 
 export function parseGtfsCsv(bytes: Uint8Array, memberName: string): readonly GtfsRow[] {
@@ -436,6 +480,22 @@ export async function decodeGtfsZipStream(
     unzip.push(previous ?? new Uint8Array(), true);
     if (streamError !== undefined) {
       throw streamError;
+    }
+    // Caltrain's published GTFS ships trips.txt with malformed \r\r\n line
+    // endings. csv-parse tolerates them (the stray CR contaminates only the last
+    // column), but DuckDB's strict CSV reader in the normalize stage refuses the
+    // dialect, so the source dies late instead of at validation. Collapse runs of
+    // CR before LF to a single CR here, before validation and persistence, so the
+    // durable member bytes are well-formed. Clean CRLF/LF members (every VTA
+    // member, every other Caltrain member) are byte-identical under this rewrite
+    // and keep their original hashes.
+    for (const [memberName, memberPath] of retained) {
+      const original = await readFile(memberPath);
+      const normalized = collapseCarriageReturnRuns(original);
+      if (normalized !== original) {
+        await writeFile(memberPath, normalized);
+        retainedHashes.set(memberName, createHash('sha256').update(normalized).digest('hex'));
+      }
     }
     const validationIssues = await validateStreamingMembers(
       retained,

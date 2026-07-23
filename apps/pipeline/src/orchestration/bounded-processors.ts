@@ -1876,7 +1876,7 @@ function createProcessingInput(
       reduce_canonical: 'bounded-canonical-reduction-v1',
       build_link_index: 'bounded-link-index-plan-v2',
       reconcile_links: 'bounded-reconciliation-v1',
-      derive_features: 'bounded-feature-stage-v1',
+      derive_features: 'bounded-feature-stage-v2',
       build_marts: 'bounded-serving-release-v1',
       finalize_release: 'bounded-serving-finalize-v1',
     },
@@ -3408,7 +3408,13 @@ function roofFeatureWork(
   const property = aggregate.entity;
   return Object.freeze({
     propertyId: property.id,
-    asOf: property.recordedAt,
+    // Valid time, not system time: recordedAt is the acquisition wall-clock,
+    // which for freshly acquired data always postdates the release asOf
+    // (= requestedAt), so evidence stamped with it can never be served — the
+    // serving layer fail-closes on evidenceAsOf > releaseAsOf. validFrom is the
+    // earliest observed validity of the entity's data, which is what a derived
+    // fact's as-of actually asserts.
+    asOf: property.validFrom,
     permits: Object.freeze(permits),
     buildingAge: buildingAgeObservations(aggregate),
     permitCoverage: permitCoverage(property, permits, sources),
@@ -3586,8 +3592,8 @@ function permitCoverage(
         : ('partial' as const),
     jurisdiction: property.jurisdiction,
     windowStart: null,
-    windowEnd: property.recordedAt,
-    measuredAt: property.recordedAt,
+    windowEnd: property.validFrom,
+    measuredAt: property.validFrom,
     sourceIds: Object.freeze(actualSourceIds),
     limitations: Object.freeze([
       'Committed source manifests do not prove a complete bounded permit-history window for this property; permit absence is not a negative fact.',
@@ -3725,6 +3731,10 @@ function geospatialProxy(
           propertyPointBasis: propertyPoint.basis,
           candidateEntityId: aggregate.entity.id,
         });
+  // A proximity fact derives from two entities; its valid time is the later of
+  // the property's and the candidate's valid times. Instants are canonical
+  // fixed-length ISO-8601 UTC strings, so lexicographic max is chronological.
+  const proxyAsOf = work.asOf > aggregate.entity.validFrom ? work.asOf : aggregate.entity.validFrom;
   return buildInquiryResult({
     propertyId: work.propertyId,
     feature,
@@ -3744,13 +3754,13 @@ function geospatialProxy(
         walkingMetersPerSecond: feature === 'water_view_candidate' ? 0 : 1.34,
       }),
     }),
-    asOf: work.asOf,
+    asOf: proxyAsOf,
     coverage: Object.freeze({
       state: 'partial' as const,
       jurisdiction: 'Santa Clara, CA',
       windowStart: null,
-      windowEnd: work.asOf,
-      measuredAt: work.asOf,
+      windowEnd: proxyAsOf,
+      measuredAt: proxyAsOf,
       sourceIds: Object.freeze(sourceIds),
       limitations: Object.freeze(limitations),
       observations: Object.freeze([]),
