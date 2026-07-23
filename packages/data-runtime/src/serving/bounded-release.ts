@@ -131,6 +131,19 @@ export const BOUNDED_COUNTY_SERVING_RELATIONS = Object.freeze([
   'pipeline_runs',
 ] as const satisfies readonly ServingRelationName[]);
 
+// Parse/DoS ceiling for REFERENCE-count arrays (source_references), as distinct
+// from the 64 bound on distinct-SOURCE arrays (source_ids). A reference is one
+// attestation per contributing (record x field-path x observation-lineage), so its
+// count is bounded by the number of records that genuinely provide a value, NOT by
+// the number of sources - a multi-unit parcel legitimately yields hundreds. 64 is
+// right for sources (a county has dozens) and wrong for references; this ceiling is
+// generous over any realistic per-row/per-field record count (bounded upstream by
+// the acquisition record cap) while still guarding against an unbounded artifact.
+// The real integrity guards (canonical/unique ordering, per-reference field-path and
+// trusted-acquired-evidence validation, DB-backed lineage verification) are
+// unaffected, and admitting the references changes no serving bytes or release hashes.
+const MAX_EXACT_SOURCE_REFERENCES = 16_384;
+
 export const BOUNDED_COUNTY_OUTPUT_RELATIONS = Object.freeze([
   ...BOUNDED_COUNTY_SERVING_RELATIONS,
   'data_dictionary',
@@ -2348,7 +2361,11 @@ class RelationContributorVerifier {
           throw new BoundedReleaseMetadataError('source_references_json is required');
         }
         const rawReferences = parseCanonicalJsonArray(references, 'source_references_json');
-        if (rawReferences.length > 64) {
+        // Row-level twin of the per-field references cap: references are per
+        // contributing record, not per source, so the 64-source bound is mis-scoped
+        // here. See MAX_EXACT_SOURCE_REFERENCES. Each reference is still validated by
+        // observeTrustedReference below against trusted acquired evidence.
+        if (rawReferences.length > MAX_EXACT_SOURCE_REFERENCES) {
           throw new BoundedReleaseMetadataError('source_references_json exceeds the source bound');
         }
         const referenceSourceIds: string[] = [];
@@ -3224,10 +3241,9 @@ function parseCanonicalFieldSourceIds(
     // uniqueness, per-reference field-path/entity-kind validation, and the
     // DB-backed verifyPropertyQueryFieldReference. The distinct-SOURCE bound
     // (source_ids, still 64 at :2338) is unchanged - that one is genuinely small.
-    const MAX_FIELD_SOURCE_REFERENCES = 16_384;
     if (
       !Array.isArray(record.source_references) ||
-      record.source_references.length > MAX_FIELD_SOURCE_REFERENCES
+      record.source_references.length > MAX_EXACT_SOURCE_REFERENCES
     ) {
       throw new BoundedReleaseMetadataError(
         `field_source_ids_json.${record.field_name} references exceed the exact bound`,
